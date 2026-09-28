@@ -1,0 +1,52 @@
+version: 2
+
+builds:
+  - id: kbtool
+    main: .
+    binary: kbtool
+    env:
+      - CGO_ENABLED=0
+    # NOTE: no windows — kbtool.go uses Unix-only syscalls (syscall.Flock,
+    # Setsid, Umask, Kill); GOOS=windows fails to compile.
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - 386
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: 386
+      - goos: darwin
+        goarch: arm
+    ldflags:
+      # -s -w: strip symbols/DWARF.
+      # -X main.appVer: inject the tag (goreleaser strips the leading "v")
+      # so `kbtool version` on a release binary reports its own version.
+      - -s -w -X main.appVer={{ .Version }}
+
+archives:
+  - id: kbtool
+    formats:
+      - binary
+    name_template: >-
+      kbtool-{{ .Os }}-{{ if eq .Arch "amd64" }}amd64{{ else if eq .Arch "386" }}i386{{ else if eq .Arch "arm" }}armv{{ .Arm }}{{ else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

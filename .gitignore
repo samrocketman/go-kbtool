@@ -1,0 +1,4 @@
+/kbtool
+
+# goreleaser output
+dist/
