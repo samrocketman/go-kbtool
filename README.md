@@ -105,6 +105,8 @@ See [docs/message-board-simple.md](docs/message-board-simple.md).
 
 - [`build`](docs/build-simple.md) — index one or more source dirs into the local KB (full options: [build.md](docs/build.md))
 - [`query` / `search`](docs/query-simple.md) — hybrid search the index (full options: [query.md](docs/query.md))
+- [`terms`](docs/terms-simple.md) — exact identifier/string census: presence/absence as a citable result (full options: [terms.md](docs/terms.md))
+- [`bundle`](docs/bundle-simple.md) — context-bundle expansion of a location or a query's hits (full options: [bundle.md](docs/bundle.md))
 - [`bench`](docs/bench-simple.md) — in-process query-latency benchmark (full options: [bench.md](docs/bench.md))
 - [`tools`](docs/tools-simple.md) — print the MCP tool schemas (full options: [tools.md](docs/tools.md))
 - [`call`](docs/call-simple.md) — call one tool from the shell, incl. message board (full options: [call.md](docs/call.md))

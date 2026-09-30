@@ -26,6 +26,7 @@ package main
 //  22. documentation link consistency (README + docs/)
 //  23. CLI versioning (`kbtool version`)
 //  24. single-command buildability (hard requirement)
+//  25. terms census + context bundle (plans/context-bundle-plan.md)
 //
 // All tests use only the standard library and run hermetically (temp dirs,
 // no network). Git-dependent tests are skipped when git is absent.
@@ -37,6 +38,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2643,8 +2645,8 @@ func TestQwenToolsShape(t *testing.T) {
 
 func TestToolSchemasWellFormed(t *testing.T) {
 	tools := toolSchemas()
-	if len(tools) != 14 {
-		t.Fatalf("got %d tools, want 14", len(tools))
+	if len(tools) != 16 {
+		t.Fatalf("got %d tools, want 16", len(tools))
 	}
 	seen := map[string]bool{}
 	for _, tool := range tools {
@@ -2657,7 +2659,7 @@ func TestToolSchemasWellFormed(t *testing.T) {
 		seen[tool.Name] = true
 	}
 	// Required tools present.
-	for _, want := range []string{"search_codebase", "board_signup", "board_read", "git_blame", "git_log", "kb_status"} {
+	for _, want := range []string{"search_codebase", "board_signup", "board_read", "git_blame", "git_log", "kb_status", "kb_terms", "kb_bundle"} {
 		if !seen[want] {
 			t.Fatalf("missing tool %s", want)
 		}
@@ -4083,7 +4085,7 @@ func TestWeightedFuseZeroScores(t *testing.T) {
 
 // ---------- 22. documentation link consistency (README + docs/) ----------
 
-var docSubcommands = []string{"build", "query", "bench", "tools", "call", "mcp", "daemon", "mtls", "client", "status"}
+var docSubcommands = []string{"build", "query", "terms", "bundle", "bench", "tools", "call", "mcp", "daemon", "mtls", "client", "status"}
 
 // mdLinks extracts the relative markdown link targets of a doc. Fenced code
 // blocks are stripped first (shell/JSON examples must not count as links);
@@ -4294,5 +4296,648 @@ func TestSingleCommandBuild(t *testing.T) {
 	}
 	if fi, err := os.Stat(out); err != nil || fi.Size() == 0 {
 		t.Fatalf("expected a non-empty binary at %s (err=%v)", out, err)
+	}
+}
+
+// ---------- 25. terms census + context bundle (plans/context-bundle-plan.md) ----------
+
+// buildTermsFixture builds a small multi-language repo (Go, Java, Python, JS)
+// under a temp dir and returns an in-memory DB over it. Shared by the group-25
+// tests: the fixture encodes every scenario the feature must handle (constructed
+// URL strings, internal/external imports per language, test-file naming).
+func buildTermsFixture(t *testing.T) *DB {
+	t.Helper()
+	t.Setenv("KB_EMBED_URL", "")
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Go: internal package import (in-tree) + stdlib (external) + a URL built by
+	// format verbs (the stable-fragment case).
+	write("repo/src/foo/bar.go", `package foo
+
+import (
+	"fmt"
+
+	"acme/repo/src/bar"
+)
+
+func EncodeEcosystem(name string) string {
+	url := "https://nvd.nist.gov/feeds/json/cves/2.0/nvdcve-2.0-%s.json.gz".formatted(name)
+	return fmt.Sprintf("%s / %s", bar.Name(), url)
+}
+`)
+	write("repo/src/bar/bar.go", `package bar
+
+func Name() string { return "bar" }
+`)
+	// Go test file sharing the identifier with bar.go.
+	write("repo/src/foo/bar_test.go", `package foo
+
+import "testing"
+
+func TestEncodeEcosystem(t *testing.T) {
+	if EncodeEcosystem("pip") == "" {
+		t.Fatal("empty")
+	}
+}
+`)
+	// Java: internal import (Helper.java present) + external (Missing absent).
+	write("repo/com/example/Foo.java", `package com.example;
+
+import com.example.Helper;
+import com.example.Missing;
+
+public class Foo {
+  public String feed() { return "nvdcve-2.0"; }
+}
+`)
+	write("repo/com/example/Helper.java", `package com.example;
+
+public class Helper {
+  public static int one() { return 1; }
+}
+`)
+	write("repo/com/example/FooTest.java", `package com.example;
+
+public class FooTest {
+  public void check() { new Foo().feed(); }
+}
+`)
+	// Python: relative + wildcard (unresolved) + absolute internal + stdlib.
+	write("repo/pkg/mod.py", `from .relative import thing
+from pkg.util import helper
+from os import *
+import json
+
+def run():
+    return helper()
+`)
+	write("repo/pkg/util.py", `def helper():
+    return 42
+`)
+	// JS: relative internal + bare external.
+	write("repo/web/app.js", `import { widget } from "./widget";
+import lodash from "lodash";
+
+export function render() { return widget() + lodash; }
+`)
+	write("repo/web/widget.js", `export function widget() { return "w"; }
+`)
+	db, err := buildDB(BuildOpts{
+		Sources: []string{dir},
+		Dim:     testDim,
+		Chunk:   48,
+		Overlap: 0,
+		MaxKB:   512,
+		Embed:   localEmbed,
+		KWPath:  boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("buildDB: %v", err)
+	}
+	return db
+}
+
+// findChunkByPath returns the first chunk whose (slash-normalized) path equals
+// or ends with the given rel — the leading source label is a temp-dir basename
+// and must not matter to the test.
+func findChunkByPath(t *testing.T, db *DB, rel string) Chunk {
+	t.Helper()
+	rel = strings.ReplaceAll(rel, "\\", "/")
+	for i := range db.Chunks {
+		p := strings.ReplaceAll(db.Chunks[i].Path, "\\", "/")
+		if p == rel || strings.HasSuffix(p, "/"+rel) {
+			return db.Chunks[i]
+		}
+	}
+	t.Fatalf("no chunk for %s (have %d chunks)", rel, len(db.Chunks))
+	return Chunk{}
+}
+
+// 1. Census correctness: the identifier exists in exactly N files and the
+// census reports exactly those N with exact per-file counts — and a nowhere
+// identifier reports the distinct ABSENT result. This pins the feature's
+// reason to exist: absence as a citable, complete result.
+func TestTermsCensusCorrectness(t *testing.T) {
+	db := buildTermsFixture(t)
+	// EncodeEcosystem appears in exactly 2 files (bar.go x1, bar_test.go x2).
+	r := termsCensus(db, "EncodeEcosystem", 0)
+	if !r.Present {
+		t.Fatalf("expected present, got: %+v", r)
+	}
+	if r.FileCount != 2 {
+		t.Fatalf("FileCount = %d, want 2 (%+v)", r.FileCount, r.Files)
+	}
+	want := map[string]int{
+		"repo/src/foo/bar.go":      1,
+		"repo/src/foo/bar_test.go": 2,
+	}
+	if r.Occurrences != 3 {
+		t.Fatalf("Occurrences = %d, want 3", r.Occurrences)
+	}
+	// The leading path segment is the source label (a temp-dir basename) — strip it.
+	stripLabel := func(p string) string {
+		if i := strings.IndexByte(p, '/'); i > 0 {
+			return p[i+1:]
+		}
+		return p
+	}
+	for _, f := range r.Files {
+		p := stripLabel(f.Path)
+		w, ok := want[p]
+		if !ok {
+			t.Fatalf("unexpected file %q in census: %+v", f.Path, r.Files)
+		}
+		if f.Count != w {
+			t.Fatalf("%s count = %d, want %d", f.Path, f.Count, w)
+		}
+		if len(f.Lines) == 0 {
+			t.Fatalf("%s has no representative lines", f.Path)
+		}
+		delete(want, p)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing files: %v", want)
+	}
+
+	// Absent: distinct, unambiguous, citable.
+	r2 := termsCensus(db, "noSuchIdentifierZZZ", 0)
+	if r2.Present || r2.Occurrences != 0 || r2.FileCount != 0 || len(r2.Files) != 0 {
+		t.Fatalf("absent census must be empty: %+v", r2)
+	}
+	out := renderTerms(r2)
+	if !containsLine(out, "ABSENT in indexed sources") {
+		t.Fatalf("absent rendering must carry the ABSENT line: %q", out)
+	}
+	if !containsLine(renderTerms(r), "occurrence") {
+		t.Fatalf("present rendering: %q", out)
+	}
+}
+
+func containsLine(s, sub string) bool { return strings.Contains(s, sub) }
+
+// "Present but didn't rank" must NOT be confused with absent: an identifier
+// that is not in the top-k of a hybrid search still shows up in the census.
+// This is the exact failure mode the feedback session hit ("NVD api key …"
+// query returned 0 relevant hits, but the identifier did exist).
+func TestTermsPresentButNotRanked(t *testing.T) {
+	db := buildTermsFixture(t)
+	// "EncodeEcosystem" is a rare token; a hybrid query about the general topic
+	// with a small k may not surface the chunk containing it — but the census
+	// must still report it present in exactly the files that contain it.
+	res, err := db.Search("bar naming", 2, "", "", 0, false, ModeHybrid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rankedHas := false
+	for _, x := range res {
+		if strings.Contains(x.C.Text, "EncodeEcosystem") {
+			rankedHas = true
+		}
+	}
+	r := termsCensus(db, "EncodeEcosystem", 0)
+	if !r.Present || r.FileCount != 2 {
+		t.Fatalf("census must be present/2 regardless of ranking: rankedHas=%v census=%+v", rankedHas, r)
+	}
+	// The point of the feature: the two answers are independent.
+	_ = rankedHas
+}
+
+// 2. Fragment propagation: a URL built with a format verb is found tree-wide by
+// its stable fragment, and the REPORTED fragment is the one a human can judge.
+func TestBundleFragmentPropagation(t *testing.T) {
+	db := buildTermsFixture(t)
+	c := findChunkByPath(t, db, "repo/src/foo/bar.go")
+	out := bundleChunk(db, newBundleFiles(db), c)
+	// The constructed literal must propagate via a stable fragment.
+	if !strings.Contains(out, `fragment "nvdcve-2.0"`) {
+		t.Fatalf("expected stable fragment \"nvdcve-2.0\" in propagation:\n%s", out)
+	}
+	// ...and it must surface the OTHER file that contains that fragment (Foo.java).
+	if !strings.Contains(out, "repo/com/example/Foo.java") {
+		t.Fatalf("fragment must surface Foo.java:\n%s", out)
+	}
+	// The full constructed string (with the %s verb) must NOT be the reported
+	// fragment — only stable pieces.
+	if strings.Contains(out, `fragment "https://nvd.nist.gov/feeds/json/cves/2.0/nvdcve-2.0-%s.json.gz"`) {
+		t.Fatalf("constructed literal must be searched by fragments, not whole:\n%s", out)
+	}
+}
+
+// stableFragments unit: split on format verbs / non-word runs, min length,
+// longest-first, deduped, capped.
+func TestStableFragments(t *testing.T) {
+	f := stableFragments("https://nvd.nist.gov/feeds/json/cves/2.0/nvdcve-2.0-%s.json.gz")
+	joined := strings.Join(f, "\n")
+	if !strings.Contains(joined, "nvdcve-2.0") || !strings.Contains(joined, "json.gz") {
+		t.Fatalf("fragments missing expected stable pieces: %v", f)
+	}
+	for _, frag := range f {
+		if strings.Contains(frag, "%") {
+			t.Fatalf("fragment must not contain a format verb: %q", frag)
+		}
+		if len(frag) < bundleFragMinLen {
+			t.Fatalf("fragment too short: %q", frag)
+		}
+	}
+	if len(f) > bundleFragMax {
+		t.Fatalf("too many fragments: %d", len(f))
+	}
+	// longest first
+	for i := 1; i < len(f); i++ {
+		if len(f[i]) > len(f[i-1]) {
+			t.Fatalf("fragments not longest-first: %v", f)
+		}
+	}
+	// pure identifier yields itself
+	if got := stableFragments("EncodeEcosystem"); len(got) != 1 || got[0] != "EncodeEcosystem" {
+		t.Fatalf("pure identifier fragments = %v", got)
+	}
+	// short candidate yields nothing
+	if got := stableFragments("ab"); len(got) != 0 {
+		t.Fatalf("short input should yield no fragments: %v", got)
+	}
+}
+
+// 3. Import verdicts: per-language fixtures. Internal resolves to the in-tree
+// path; absent is external (not-in-tree); ambiguous (Python relative, wildcard)
+// is unresolved — never a wrong verdict.
+func TestBundleImportVerdicts(t *testing.T) {
+	db := buildTermsFixture(t)
+	bf := newBundleFiles(db)
+
+	// Go: internal (in-tree package) + external (stdlib fmt).
+	goOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/src/foo/bar.go"))
+	if !strings.Contains(goOut, "acme/repo/src/bar") || !strings.Contains(goOut, "internal") {
+		t.Fatalf("Go internal import missing:\n%s", goOut)
+	}
+	if !strings.Contains(goOut, "fmt") || !strings.Contains(goOut, "external") {
+		t.Fatalf("Go external import (fmt) missing:\n%s", goOut)
+	}
+	// The internal Go import must point at the in-tree bar package.
+	if !strings.Contains(goOut, "repo/src/bar/bar.go") {
+		t.Fatalf("Go internal import must resolve to in-tree path:\n%s", goOut)
+	}
+
+	// Java: internal (Helper.java present) + external (Missing absent).
+	jaOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/com/example/Foo.java"))
+	if !strings.Contains(jaOut, "com.example.Helper") || !strings.Contains(jaOut, "Helper.java") {
+		t.Fatalf("Java internal import missing:\n%s", jaOut)
+	}
+	if !strings.Contains(jaOut, "com.example.Missing") {
+		t.Fatalf("Java external import missing:\n%s", jaOut)
+	}
+	// Missing must be external, not internal.
+	if m := regexp.MustCompile(`com\.example\.Missing\s*->\s*(\w+)`).FindStringSubmatch(jaOut); m == nil || m[1] != "external" {
+		t.Fatalf("Java absent import must be external, got:\n%s", jaOut)
+	}
+
+	// Python: relative + wildcard = unresolved; absolute internal = internal.
+	pyOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/pkg/mod.py"))
+	if !strings.Contains(pyOut, "unresolved") || !strings.Contains(pyOut, "relative import") {
+		t.Fatalf("Python relative import must be unresolved:\n%s", pyOut)
+	}
+	if !strings.Contains(pyOut, "wildcard import") {
+		t.Fatalf("Python wildcard import must be unresolved:\n%s", pyOut)
+	}
+	if !strings.Contains(pyOut, "from pkg.util import helper") || !strings.Contains(pyOut, "util.py") {
+		t.Fatalf("Python absolute internal import missing:\n%s", pyOut)
+	}
+	if m := regexp.MustCompile(`import json\s*->\s*(\w+)`).FindStringSubmatch(pyOut); m == nil || m[1] != "external" {
+		t.Fatalf("Python stdlib import must be external:\n%s", pyOut)
+	}
+
+	// JS: relative internal + bare external.
+	jsOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/web/app.js"))
+	if !strings.Contains(jsOut, `./widget`) || !strings.Contains(jsOut, "widget.js") {
+		t.Fatalf("JS relative internal import missing:\n%s", jsOut)
+	}
+	if m := regexp.MustCompile(`lodash\s*->\s*(\w+)`).FindStringSubmatch(jsOut); m == nil || m[1] != "external" {
+		t.Fatalf("JS bare import must be external:\n%s", jsOut)
+	}
+}
+
+// 4. Neighborhood + test pairing: a hit lists its siblings (with one-line
+// summaries) and picks up the test file(s) sharing identifiers — Go *_test.go
+// and Java *Test.java conventions both.
+func TestBundleNeighborhoodAndTestPairing(t *testing.T) {
+	db := buildTermsFixture(t)
+	bf := newBundleFiles(db)
+
+	// Go: bar.go hit -> bar_test.go is in the neighborhood AND in tests, sharing
+	// EncodeEcosystem.
+	goOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/src/foo/bar.go"))
+	if !strings.Contains(goOut, "neighborhood") {
+		t.Fatalf("neighborhood section missing:\n%s", goOut)
+	}
+	if !strings.Contains(goOut, "bar_test.go") {
+		t.Fatalf("bar_test.go not found in neighborhood/tests:\n%s", goOut)
+	}
+	if m := regexp.MustCompile(`tests:.*bar_test\.go — shared:.*EncodeEcosystem`).FindString(goOut); m == "" {
+		if !strings.Contains(goOut, "bar_test.go") || !strings.Contains(goOut, "EncodeEcosystem") {
+			t.Fatalf("bar_test.go must pair sharing EncodeEcosystem:\n%s", goOut)
+		}
+	}
+
+	// Java: Foo.java hit -> FooTest.java pairs (shares Foo).
+	jaOut := bundleChunk(db, bf, findChunkByPath(t, db, "repo/com/example/Foo.java"))
+	if !strings.Contains(jaOut, "FooTest.java") {
+		t.Fatalf("FooTest.java must pair with Foo.java:\n%s", jaOut)
+	}
+	// Neighborhood must include the sibling Helper.java.
+	if !strings.Contains(jaOut, "Helper.java") {
+		t.Fatalf("neighborhood must include Helper.java:\n%s", jaOut)
+	}
+}
+
+// isTestFile unit: the naming conventions, and nothing else.
+func TestIsTestFile(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"repo/com/example/FooTest.java", true},
+		{"repo/src/foo/bar_test.go", true},
+		{"repo/web/app.test.js", true},
+		{"repo/web/app.spec.ts", true},
+		{"repo/pkg/test_mod.py", true},
+		{"repo/com/example/Foo.java", false},
+		{"repo/src/foo/bar.go", false},
+		{"repo/web/app.js", false},
+		{"repo/pkg/mod.py", false},
+		{"repo/src/foo/mytests.go", false}, // not *_test.go
+	}
+	for _, c := range cases {
+		if got := isTestFile(c.path); got != c.want {
+			t.Fatalf("isTestFile(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+}
+
+// 5. Caps / truncation: a synthetic large directory produces bounded output with
+// the explicit truncation marker, so large repos never flood the terminal.
+func TestBundleTruncation(t *testing.T) {
+	t.Setenv("KB_EMBED_URL", "")
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "repo", "big")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// 30 sibling files -> neighborhood must cap at bundleNeighborhood + marker.
+	for i := 0; i < 30; i++ {
+		name := fmt.Sprintf("f%02d.go", i)
+		body := fmt.Sprintf("package big\n\nfunc F%02d() int { return %d }\n", i, i)
+		if err := os.WriteFile(filepath.Join(sub, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := buildDB(BuildOpts{
+		Sources: []string{dir}, Dim: testDim, Chunk: 48, Overlap: 0, MaxKB: 512,
+		Embed: localEmbed, KWPath: boolPtr(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := findChunkByPath(t, db, "repo/big/f00.go")
+	out := bundleChunk(db, newBundleFiles(db), c)
+	if !strings.Contains(out, "…truncated") {
+		t.Fatalf("expected explicit truncation marker in a 30-file dir:\n%s", out)
+	}
+	// Bounded: the neighborhood section must not list all 30 files.
+	n := strings.Count(out, ".go  ")
+	if n > bundleNeighborhood+2 { // +2 tolerance for hit marker / other mentions
+		t.Fatalf("neighborhood not bounded; %d file lines (cap %d)\n%s", n, bundleNeighborhood, out)
+	}
+}
+
+// 6. Encrypted store: terms + bundle against a store written with a key produce
+// the SAME results as the plain store (the at-rest shape must be transparent).
+func TestTermsBundleEncryptedStore(t *testing.T) {
+	t.Setenv("KB_EMBED_URL", "")
+	plain := buildTermsFixture(t)
+
+	mkCensus := func(db *DB) *termsResult { return termsCensus(db, "EncodeEcosystem", 0) }
+	mkBundle := func(db *DB) string {
+		c := findChunkByPath(t, db, "repo/src/foo/bar.go")
+		return bundleChunk(db, newBundleFiles(db), c)
+	}
+	baseCensus := mkCensus(plain)
+	baseBundle := mkBundle(plain)
+
+	// Write the SAME db to an encrypted store (key = the -db-key-file content),
+	// read it back, and compare.
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "key")
+	if err := os.WriteFile(keyFile, []byte("s3cret-key\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	key, have, err := resolveKey("", keyFile, false)
+	if err != nil || !have {
+		t.Fatalf("resolveKey: %v %v", have, err)
+	}
+	dbPath := filepath.Join(dir, "kb.db")
+	st, err := openKBStore(dbPath, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.enc {
+		t.Fatal("store should be encrypted with a key")
+	}
+	if err := st.saveDB(plain); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := fileMagic(dbPath); m != bundleMagic {
+		t.Fatalf("magic = %q, want %q", m, bundleMagic)
+	}
+	// Reopen with the key file (as -db-key-file does) and verify.
+	st2, err := openStore(dbPath, "", keyFile, false, true)
+	if err != nil {
+		t.Fatalf("openStore with key file: %v", err)
+	}
+	got, err := st2.db()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Chunks) != len(plain.Chunks) {
+		t.Fatalf("chunk count %d != %d", len(got.Chunks), len(plain.Chunks))
+	}
+	// Same census + bundle from the encrypted store.
+	if c := mkCensus(got); !reflect.DeepEqual(c, baseCensus) {
+		t.Fatalf("encrypted census differs:\nenc=%+v\nplain=%+v", c, baseCensus)
+	}
+	if b := mkBundle(got); b != baseBundle {
+		t.Fatalf("encrypted bundle differs:\nenc=%s\nplain=%s", b, baseBundle)
+	}
+	// Wrong key must fail (fail closed).
+	if _, err := openKBStore(dbPath, []byte("wrong")); err == nil {
+		t.Fatal("wrong key should be refused")
+	}
+}
+
+// 7. Daemon parity: identical results via the daemon socket vs direct DB.
+// Builds the real binary, serves it with `daemon run` on a temp unix socket, and
+// compares `terms` + `bundle` output over the socket against the one-shot local
+// (direct-DB) path. Skipped when the go toolchain is unavailable.
+func TestTermsBundleDaemonParity(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary for daemon parity")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	build := exec.Command(goBin, "build", "-o", bin, "kbtool.go")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if b, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+
+	// Build a fixture DB on disk (plain) in an isolated state dir.
+	stDir := filepath.Join(work, "state")
+	if err := os.MkdirAll(stDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(stDir, "kb.db")
+	env := append(os.Environ(), "KBTOOL_DIR="+stDir, "KBTOOL_DB="+dbPath, "KB_EMBED_URL=")
+	// Reuse the in-process fixture layout by writing the same files directly.
+	fx := filepath.Join(work, "fx")
+	mk := func(rel, content string) {
+		p := filepath.Join(fx, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("repo/src/foo/bar.go", `package foo
+
+import (
+	"fmt"
+
+	"acme/repo/src/bar"
+)
+
+func EncodeEcosystem(name string) string {
+	url := "https://nvd.nist.gov/feeds/json/cves/2.0/nvdcve-2.0-%s.json.gz".formatted(name)
+	return fmt.Sprintf("%s / %s", bar.Name(), url)
+}
+`)
+	mk("repo/src/bar/bar.go", `package bar
+
+func Name() string { return "bar" }
+`)
+	mk("repo/src/foo/bar_test.go", `package foo
+
+import "testing"
+
+func TestEncodeEcosystem(t *testing.T) {
+	if EncodeEcosystem("pip") == "" {
+		t.Fatal("empty")
+	}
+}
+`)
+	buildCmd := exec.Command(bin, "build", "-db", dbPath, fx)
+	buildCmd.Env = env
+	if b, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("kbtool build: %v\n%s", err, b)
+	}
+
+	run := func(args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Env = env
+		b, err := c.CombinedOutput()
+		return string(b), err
+	}
+
+	// Direct-DB (daemon down) baseline.
+	termsLocal, err := run("terms", "EncodeEcosystem")
+	if err != nil {
+		t.Fatalf("terms (local): %v\n%s", err, termsLocal)
+	}
+	bundleLocal, err := run("bundle", "repo/src/foo/bar.go:7")
+	if err != nil {
+		t.Fatalf("bundle (local): %v\n%s", err, bundleLocal)
+	}
+	if !strings.Contains(termsLocal, "ABSENT") && !strings.Contains(termsLocal, "occurrence") {
+		t.Fatalf("unexpected terms output: %s", termsLocal)
+	}
+
+	// Start the daemon on a temp socket.
+	sock := filepath.Join(stDir, "daemon.sock")
+	daemon := exec.Command(bin, "daemon", "run", "-db", dbPath)
+	daemon.Env = append(env, "KBTOOL_SOCKET="+sock)
+	var logBuf bytes.Buffer
+	daemon.Stdout = &logBuf
+	daemon.Stderr = &logBuf
+	if err := daemon.Start(); err != nil {
+		t.Fatalf("daemon start: %v", err)
+	}
+	defer func() {
+		_ = daemon.Process.Kill()
+		_, _ = daemon.Process.Wait()
+	}()
+	// Wait for the socket to come up.
+	deadline := time.Now().Add(10 * time.Second)
+	up := false
+	for time.Now().Before(deadline) {
+		if c, err := net.Dial("unix", sock); err == nil {
+			_ = c.Close()
+			up = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !up {
+		_ = daemon.Process.Kill()
+		t.Fatalf("daemon socket never came up; log:\n%s", logBuf.String())
+	}
+	dEnv := append(os.Environ(), "KBTOOL_DIR="+stDir, "KBTOOL_DB="+dbPath, "KBTOOL_SOCKET="+sock, "KB_EMBED_URL=")
+	runDaemon := func(args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Env = dEnv
+		b, err := c.CombinedOutput()
+		return string(b), err
+	}
+
+	termsDaemon, err := runDaemon("terms", "EncodeEcosystem")
+	if err != nil {
+		t.Fatalf("terms (daemon): %v\n%s", err, termsDaemon)
+	}
+	// Same target, same expected result — the socket path must not change the answer.
+	bundleDaemon, err := runDaemon("bundle", "repo/src/foo/bar.go:7")
+	if err != nil {
+		t.Fatalf("bundle (daemon): %v\n%s", err, bundleDaemon)
+	}
+	// Absence must be identical over the socket too (and keep its own exit code).
+	absDaemon, err := runDaemon("terms", "noSuchIdentifierZZZ")
+	if err == nil {
+		t.Fatalf("absent terms over daemon should exit non-zero: %s", absDaemon)
+	}
+	if !strings.Contains(absDaemon, "ABSENT in indexed sources") {
+		t.Fatalf("absent terms over daemon: %s", absDaemon)
+	}
+	// Strip the "(via daemon: …)" stderr line, then require identical results.
+	stripDaemon := func(s string) string {
+		var out []string
+		for _, ln := range strings.Split(s, "\n") {
+			if strings.Contains(ln, "(via daemon:") {
+				continue
+			}
+			out = append(out, ln)
+		}
+		return strings.Join(out, "\n")
+	}
+	if got, want := stripDaemon(termsDaemon), termsLocal; got != want {
+		t.Fatalf("daemon/local terms mismatch:\ndaemon=\n%s\nlocal=\n%s", got, want)
+	}
+	if got, want := stripDaemon(bundleDaemon), bundleLocal; got != want {
+		t.Fatalf("daemon/local bundle mismatch:\ndaemon=\n%s\nlocal=\n%s", got, want)
 	}
 }
