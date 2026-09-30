@@ -48,6 +48,12 @@ kbtool daemon status                            # pid + socket
 | `-crlrefresh` | off | Periodically re-load the CRL file. Default (off): the file is **watched** for changes. |
 | `-crlinterval SEC` | 60 | CRL reload period when `-crlrefresh`. |
 
+> **Shared client certificates are allowed by design.** Many clients may
+> present the same `client.crt`/`client.key` (one exported bundle authorizes a
+> dozen+ concurrent clients) — TLS and the daemon enforce no per-certificate
+> uniqueness. The CRL is the kill switch for a shared identity: revoking the
+> certificate revokes **every** holder of it.
+
 ## Behavior
 
 - **Precedence:** explicit flag > `config.json` > default — for every option,

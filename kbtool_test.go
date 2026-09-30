@@ -27,15 +27,21 @@ package main
 //  23. CLI versioning (`kbtool version`)
 //  24. single-command buildability (hard requirement)
 //  25. terms census + context bundle (plans/context-bundle-plan.md)
+//  26. mTLS IP connectivity: SAN parsing/verification, error surfacing,
+//     multi-host failover, shared client certs (plans/mtls-ip-connectivity-fix-plan.md)
 //
 // All tests use only the standard library and run hermetically (temp dirs,
 // no network). Git-dependent tests are skipped when git is absent.
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"math"
 	"net"
@@ -47,6 +53,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -4940,4 +4947,446 @@ func TestEncodeEcosystem(t *testing.T) {
 	if got, want := stripDaemon(bundleDaemon), bundleLocal; got != want {
 		t.Fatalf("daemon/local bundle mismatch:\ndaemon=\n%s\nlocal=\n%s", got, want)
 	}
+}
+
+// ---------- 26. mTLS IP connectivity (plans/mtls-ip-connectivity-fix-plan.md) ----------
+//
+// Regression context: `kbtool mtls -ip A B -dns n` used to silently issue a cert
+// missing B and n (flag.Parse stops at the first bare token), so clients could
+// connect by DNS but not by IP — and the CLI hid the x509 mismatch behind
+// "no daemon running and no db". This group pins: SAN parsing (nothing dropped),
+// SAN self-verification of the issued cert, visible connection failures with a
+// SAN hint, multi-host failover, and many clients sharing one client cert.
+
+// TestMtlsSANArgParsing pins D1: every requested SAN entry must survive parsing,
+// in any flag order, comma- or space-separated, with flags after bare tokens
+// (the old parser silently dropped everything from the first bare token on).
+func TestMtlsSANArgParsing(t *testing.T) {
+	cases := []struct {
+		name  string
+		args  []string
+		ips   []string
+		names []string
+		exp   time.Duration
+		want  string // required substring when err is non-empty
+	}{
+		{"comma lists", []string{"-ip", "10.0.0.1,10.0.0.2", "-dns", "a.b,c.d"}, []string{"10.0.0.1", "10.0.0.2"}, []string{"a.b", "c.d"}, 24 * time.Hour, ""},
+		{"space-separated lists (regression)", []string{"-ip", "10.0.0.1", "10.0.0.2", "-dns", "a.b"}, []string{"10.0.0.1", "10.0.0.2"}, []string{"a.b"}, 24 * time.Hour, ""},
+		{"flags after bare tokens (regression)", []string{"-dns", "a.b", "10.0.0.1", "-expire", "72h"}, []string{"10.0.0.1"}, []string{"a.b"}, 72 * time.Hour, ""},
+		{"bare tokens classify", []string{"10.0.0.1", "svc.local"}, []string{"10.0.0.1"}, []string{"svc.local"}, 24 * time.Hour, ""},
+		{"flag=value form", []string{"-ip=10.0.0.9", "-dns=zz.test", "-expire=48h"}, []string{"10.0.0.9"}, []string{"zz.test"}, 48 * time.Hour, ""},
+		{"duplicates dedup", []string{"-ip", "10.0.0.1,10.0.0.1", "10.0.0.1"}, []string{"10.0.0.1"}, nil, 24 * time.Hour, ""},
+		{"-ip with a name errors", []string{"-ip", "notanip"}, nil, nil, 0, "not an IP address"},
+		{"-dns with an IP errors", []string{"-dns", "10.0.0.1"}, nil, nil, 0, "is an IP address"},
+		{"bad dns name errors", []string{"-dns", "-leading"}, nil, nil, 0, "DNS name"},
+		{"unknown flag errors", []string{"-bogus", "x"}, nil, nil, 0, "unknown flag"},
+		{"-expire without value errors", []string{"-ip", "10.0.0.1", "-expire"}, nil, nil, 0, "needs a value"},
+		{"bad duration errors", []string{"-ip", "10.0.0.1", "-expire", "soon"}, nil, nil, 0, "duration"},
+		{"no SANs errors", []string{}, nil, nil, 0, "at least one"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sa, err := parseMtlsArgs(c.args)
+			if c.want != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got none (sa=%+v)", c.want, sa)
+				}
+				if !strings.Contains(err.Error(), c.want) {
+					t.Fatalf("error %q does not contain %q", err, c.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(sa.ips, c.ips) {
+				t.Errorf("ips = %v, want %v", sa.ips, c.ips)
+			}
+			if !reflect.DeepEqual(sa.names, c.names) {
+				t.Errorf("names = %v, want %v", sa.names, c.names)
+			}
+			if sa.expire != c.exp {
+				t.Errorf("expire = %v, want %v", sa.expire, c.exp)
+			}
+		})
+	}
+}
+
+// TestMtlsCertSANSelfCheck pins D2: verifyCertSANs must accept a cert carrying
+// every requested SAN and reject one missing any IP or DNS entry (the guard
+// against issuing a PKI that drops a requested SAN).
+func TestMtlsCertSANSelfCheck(t *testing.T) {
+	caKey, caCert := cryptoGenerateCA("test CA", time.Hour)
+	_, srv := cryptoGenerateLeaf(caKey, caCert, "srv",
+		[]net.IP{net.ParseIP("10.0.0.1"), net.ParseIP("2001:db8::1")},
+		[]string{"a.b"}, time.Hour)
+	if err := verifyCertSANs(srv, []string{"10.0.0.1", "2001:db8::1"}, []string{"a.b"}); err != nil {
+		t.Fatalf("all-present must pass (IPv4+IPv6+DNS): %v", err)
+	}
+	if err := verifyCertSANs(srv, []string{"10.0.0.3"}, nil); err == nil {
+		t.Fatal("missing IP SAN must be rejected")
+	}
+	if err := verifyCertSANs(srv, nil, []string{"zzz.other"}); err == nil {
+		t.Fatal("missing DNS SAN must be rejected")
+	}
+}
+
+// writeTestPEM writes PEM bytes into a test dir (helper for group 26).
+func writeTestPEM(t *testing.T, dir, name string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// freePort returns a localhost TCP port that is free at call time.
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return p
+}
+
+// startTestTLSHTTPServer starts an mTLS HTTP server (healthz) on 127.0.0.1 with
+// the given server cert/key + client CA; returns the port and a stop func.
+func startTestTLSHTTPServer(t *testing.T, srvCert *x509.Certificate, srvKey *ecdsa.PrivateKey, caPool *x509.CertPool) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvCert.Raw}, PrivateKey: srvKey}},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+	srv := &http.Server{Handler: mux, TLSConfig: tlsCfg}
+	// ServeTLS wraps the RAW listener in TLS itself (a pre-wrapped listener
+	// double-encrypts and breaks the handshake).
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	return port, func() { _ = srv.Close() }
+}
+
+// TestLiveDaemonSurfacesTLSNameMismatch pins D5: when the dialed IP is not in
+// the server cert's SANs, liveDaemon must RETURN the x509 mismatch (not swallow
+// it) and daemonConnHint must turn it into the actionable "regenerate with
+// kbtool mtls -ip …" hint — the user-facing fix for the "no daemon running"
+// confusion.
+func TestLiveDaemonSurfacesTLSNameMismatch(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	caKey, caCert := cryptoGenerateCA("test CA", time.Hour)
+	// Server cert for 192.0.2.99 ONLY (NOT 127.0.0.1) — dialing 127.0.0.1 must
+	// fail hostname verification.
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("192.0.2.99")}, nil, time.Hour)
+	cliKey, cliCert := cryptoGenerateLeaf(caKey, caCert, "cli", nil, nil, time.Hour)
+	writeTestPEM(t, dir, "ca.crt", cryptoPEMCert(caCert))
+	writeTestPEM(t, dir, "client.crt", cryptoPEMCert(cliCert))
+	writeTestPEM(t, dir, "client.key", cryptoPEMKey(cliKey))
+
+	// Server cert for 192.0.2.99 only; the client dials 127.0.0.1 → SAN mismatch.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(cryptoPEMCert(caCert))
+	tlsLn := tls.NewListener(ln, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvCert.Raw}, PrivateKey: srvKey}},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	})
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		for {
+			c, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				if tc, ok := c.(*tls.Conn); ok {
+					_ = tc.Handshake() // drive the lazy handshake so the client gets a proper x509 failure
+				}
+				_ = c.Close()
+			}(c)
+		}
+	}()
+	defer func() { _ = tlsLn.Close(); <-acceptDone }()
+
+	cc := &clientConfig{Host: "127.0.0.1", Port: port, TLS: true,
+		CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+	if err := saveClientConfig(cc); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, ok, err := liveDaemon()
+	if ok {
+		t.Fatal("must not report a live daemon (the SAN does not cover 127.0.0.1)")
+	}
+	if err == nil || !strings.Contains(err.Error(), "not 127.0.0.1") {
+		t.Fatalf("x509 SAN mismatch not surfaced: %v", err)
+	}
+	if h := daemonConnHint(err); !strings.Contains(h, "kbtool mtls -ip") {
+		t.Fatalf("missing SAN-mismatch hint: %q", h)
+	}
+}
+
+// TestLiveDaemonSurfacesDeadPort pins D5's other half: plain connection failures
+// (nothing listening) must also be surfaced with the endpoint URL, so a mis-set
+// host/port is diagnosable instead of reading as "no daemon".
+func TestLiveDaemonSurfacesDeadPort(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	caKey, caCert := cryptoGenerateCA("test CA", time.Hour)
+	cliKey, cliCert := cryptoGenerateLeaf(caKey, caCert, "cli", nil, nil, time.Hour)
+	writeTestPEM(t, dir, "ca.crt", cryptoPEMCert(caCert))
+	writeTestPEM(t, dir, "client.crt", cryptoPEMCert(cliCert))
+	writeTestPEM(t, dir, "client.key", cryptoPEMKey(cliKey))
+	deadPort := freePort(t) // free ⇒ nothing listening
+
+	cc := &clientConfig{Host: "127.0.0.1", Port: deadPort, TLS: true,
+		CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+	if err := saveClientConfig(cc); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ok, err := liveDaemon()
+	if ok {
+		t.Fatal("must not report a live daemon")
+	}
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("127.0.0.1:%d", deadPort)) {
+		t.Fatalf("dead-endpoint failure not surfaced: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected a connection-refused detail: %v", err)
+	}
+}
+
+// TestClientConfigHostsFailover pins D3+D4: a client.json with a dead primary
+// host plus a hosts[] list must fail over to the live endpoint; an empty host
+// with hosts[] set (the old "multi-IP, no DNS" bug) must still yield a usable
+// endpoint.
+func TestClientConfigHostsFailover(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	caKey, caCert := cryptoGenerateCA("test CA", time.Hour)
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	cliKey, cliCert := cryptoGenerateLeaf(caKey, caCert, "cli", nil, nil, time.Hour)
+	writeTestPEM(t, dir, "ca.crt", cryptoPEMCert(caCert))
+	writeTestPEM(t, dir, "client.crt", cryptoPEMCert(cliCert))
+	writeTestPEM(t, dir, "client.key", cryptoPEMKey(cliKey))
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(cryptoPEMCert(caCert))
+	port, stop := startTestTLSHTTPServer(t, srvCert, srvKey, pool)
+	defer stop()
+
+	// Scenario 1: dead primary, live secondary in hosts[1].
+	cc := &clientConfig{Host: "127.0.0.9", Hosts: []string{"127.0.0.9", "127.0.0.1"},
+		Port: port, TLS: true, CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+	if err := saveClientConfig(cc); err != nil {
+		t.Fatal(err)
+	}
+	_, desc, ok, err := liveDaemon()
+	if !ok {
+		t.Fatalf("expected failover to the live host, got: %v", err)
+	}
+	if !strings.Contains(desc, "127.0.0.1") {
+		t.Fatalf("expected the live endpoint, got %q", desc)
+	}
+
+	// Scenario 2 (D3 regression): empty host + hosts set ⇒ still usable.
+	cc2 := &clientConfig{Hosts: []string{"127.0.0.9", "127.0.0.1"},
+		Port: port, TLS: true, CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+	if err := saveClientConfig(cc2); err != nil {
+		t.Fatal(err)
+	}
+	_, desc2, ok2, err2 := liveDaemon()
+	if !ok2 {
+		t.Fatalf("empty-host config must fall back to hosts[0]+, got: %v", err2)
+	}
+	if !strings.Contains(desc2, "127.0.0.1") {
+		t.Fatalf("expected the live endpoint, got %q", desc2)
+	}
+
+	// Scenario 3: all hosts dead ⇒ failure surfaced, not a silent false.
+	cc3 := &clientConfig{Host: "127.0.0.9", Hosts: []string{"127.0.0.9"},
+		Port: freePort(t), TLS: true, CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+	if err := saveClientConfig(cc3); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok3, err3 := liveDaemon(); ok3 {
+		t.Fatal("all-dead hosts must not report live")
+	} else if err3 == nil {
+		t.Fatal("all-dead hosts must return a connection error")
+	}
+}
+
+// TestMtlsSharedClientCertE2E is the user's scenario end-to-end (built binary,
+// loopback only, skipped without the go toolchain):
+//   - `mtls` with a space-separated multi-SAN list issues a cert carrying ALL of
+//     them (D1) and a usable client.json (D3/D4);
+//   - a client-only state dir (bundle import, no DB) connects to the mTLS
+//     daemon BY IP;
+//   - twelve concurrent clients sharing the SAME client cert all succeed (D6:
+//     sharing is allowed by design — TLS has no per-cert uniqueness).
+func TestMtlsSharedClientCertE2E(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary for the mTLS E2E")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	run := func(env []string, args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Env = env
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+
+	srvDir := filepath.Join(work, "srv")
+	cliDir := filepath.Join(work, "cli")
+	os.MkdirAll(srvDir, 0755)
+	os.MkdirAll(cliDir, 0755)
+	srvEnv := append(os.Environ(), "KBTOOL_DIR="+srvDir, "KB_EMBED_URL=")
+	cliEnv := append(os.Environ(), "KBTOOL_DIR="+cliDir, "KB_EMBED_URL=")
+
+	// D1 regression: space-separated SAN list (would have silently dropped
+	// 127.0.0.2 and -dns under the old parser).
+	if out, err := run(srvEnv, "mtls", "-ip", "127.0.0.1", "127.0.0.2", "-dns", "kbtool.test"); err != nil {
+		t.Fatalf("mtls: %v\n%s", err, out)
+	}
+	// The ISSUED cert must carry every requested SAN (D2's guard, through the CLI).
+	b, err := os.ReadFile(filepath.Join(srvDir, "server.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blk, _ := pem.Decode(b)
+	if blk == nil || blk.Type != "CERTIFICATE" {
+		t.Fatal("no CERTIFICATE block in server.crt")
+	}
+	cert, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCertSANs(cert, []string{"127.0.0.1", "127.0.0.2"}, []string{"kbtool.test"}); err != nil {
+		t.Fatalf("issued cert missing requested SANs: %v", err)
+	}
+	// client.json must be usable: non-empty host + every SAN endpoint (D3/D4).
+	cj := clientConfig{}
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "client.json")), &cj); err != nil {
+		t.Fatal(err)
+	}
+	if cj.Host == "" || len(cj.Hosts) != 3 || !cj.TLS {
+		t.Fatalf("client.json not usable: %+v", cj)
+	}
+
+	// Fixture DB so the daemon has something to serve.
+	fx := filepath.Join(work, "fx")
+	os.MkdirAll(filepath.Join(fx, "repo"), 0755)
+	os.WriteFile(filepath.Join(fx, "repo", "hello.go"), []byte("package repo\n\nfunc Hello() string { return \"hello mTLS\" }\n"), 0644)
+	dbPath := filepath.Join(srvDir, "kb.db")
+	if out, err := run(srvEnv, "build", "-db", dbPath, fx); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	// Server daemon on a chosen port (all-interface bind: -mtls default).
+	port := freePort(t)
+	daemon := exec.Command(bin, "daemon", "run", "-http", "-mtls", "-bind", fmt.Sprintf("127.0.0.1:%d", port), "-db", dbPath)
+	daemon.Env = srvEnv
+	var logBuf bytes.Buffer
+	daemon.Stdout = &logBuf
+	daemon.Stderr = &logBuf
+	if err := daemon.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = daemon.Process.Kill(); _, _ = daemon.Process.Wait() }()
+	// Wait for the TLS port to accept.
+	up := false
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
+			_ = c.Close()
+			up = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !up {
+		_ = daemon.Process.Kill()
+		t.Fatalf("daemon port never came up; log:\n%s", logBuf.String())
+	}
+
+	// Friend's machine: client-only dir (no DB), bundle import.
+	bundle := filepath.Join(work, "client.kbx")
+	if out, err := run(srvEnv, "client", "-export", bundle, "-key", "e2e-key"); err != nil {
+		t.Fatalf("export: %v\n%s", err, out)
+	}
+	if out, err := run(cliEnv, "client", "-import", bundle, "-key", "e2e-key"); err != nil {
+		t.Fatalf("import: %v\n%s", err, out)
+	}
+	// Friend connects BY IP (the reported failing case): point the import at the IP.
+	cjPath := filepath.Join(cliDir, "client.json")
+	var cliCfg clientConfig
+	if err := json.Unmarshal(mustReadFile(t, cjPath), &cliCfg); err != nil {
+		t.Fatal(err)
+	}
+	cliCfg.Host = "127.0.0.1"
+	cliCfg.Port = port
+	cliCfg.Hosts = []string{"127.0.0.1"}
+	cb, _ := json.Marshal(&cliCfg)
+	os.WriteFile(cjPath, cb, 0644)
+
+	call := func() (string, error) {
+		return run(cliEnv, "call", "list_files")
+	}
+	// [1] single client by IP must reach the daemon (D5's happy path).
+	if out, err := call(); err != nil || !strings.Contains(out, "(via daemon: https://127.0.0.1:") || !strings.Contains(out, "hello.go") {
+		t.Fatalf("by-IP connect failed:\n%s\nerr=%v", out, err)
+	}
+	// [2] twelve concurrent clients with the SAME client cert (D6).
+	var wg sync.WaitGroup
+	errs := make([]error, 12)
+	outs := make([]string, 12)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outs[i], errs[i] = call()
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil || !strings.Contains(outs[i], "hello.go") || !strings.Contains(outs[i], "(via daemon: https://127.0.0.1:") {
+			t.Fatalf("shared-cert client %d failed (12-way same cert):\n%s\nerr=%v", i+1, outs[i], e)
+		}
+	}
+}
+
+// mustReadFile reads a file or fails the test (group 26 helper).
+func mustReadFile(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
