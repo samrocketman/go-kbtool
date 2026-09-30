@@ -18,7 +18,8 @@
 //	kbtool mcp start|stop|status      manage the background MCP service
 //	kbtool daemon run|start|stop|status
 //	                                  manage the background RAM-resident vector DB service
-//	kbtool mtls -ip … | -dns …        generate the local mTLS PKI (CA + server + client certs)
+//	kbtool mtls -ip … -dns …         generate the local mTLS PKI (CA + server + client certs)
+//	                                  with the requested SANs — verified present in the issued cert
 //	kbtool client -export/-import     move the client setup between machines (encrypted bundle)
 //	kbtool status                     show db + board + daemon/mcp service state
 //
@@ -5829,12 +5830,16 @@ type clientConfig struct {
 	Updated    string `json:"updated,omitempty"`
 	UnixSocket string `json:"unix_socket,omitempty"` // unix socket to use (empty => host:port)
 	Host       string `json:"host,omitempty"`
-	Port       int    `json:"port,omitempty"`
-	TLS        bool   `json:"tls,omitempty"` // mTLS: present client cert, verify server via ServerName
-	ServerName string `json:"server_name,omitempty"`
-	CaCert     string `json:"ca_cert,omitempty"` // relative to <stateDir> unless absolute
-	ClientCert string `json:"client_cert,omitempty"`
-	ClientKey  string `json:"client_key,omitempty"`
+	// Hosts lists additional ordered endpoints for a multi-interface server
+	// (plans/mtls-ip-connectivity-fix-plan.md D4): tried in order after Host, first
+	// reachable one wins. Written by `kbtool mtls` as every SAN endpoint.
+	Hosts      []string `json:"hosts,omitempty"`
+	Port       int      `json:"port,omitempty"`
+	TLS        bool     `json:"tls,omitempty"` // mTLS: present client cert, verify server via ServerName
+	ServerName string   `json:"server_name,omitempty"`
+	CaCert     string   `json:"ca_cert,omitempty"` // relative to <stateDir> unless absolute
+	ClientCert string   `json:"client_cert,omitempty"`
+	ClientKey  string   `json:"client_key,omitempty"`
 }
 
 func clientConfigPath() string { return filepath.Join(stateDir(), "client.json") }
@@ -5932,7 +5937,30 @@ func ensureClientConfigFromArgs(args []string, socket string) (string, bool) {
 	return ensureClientConfig(httpEff, mtlsEff, addr, socket)
 }
 
-// endpointFromClientConfig turns a client config into a usable endpoint.
+// endpointForHostPort builds one http endpoint for a host:port client config.
+func endpointForHostPort(cc *clientConfig, host string) (endpoint, string, bool) {
+	if host == "" {
+		return endpoint{}, "", false
+	}
+	port := cc.Port
+	if port <= 0 {
+		port = defHTTPPort
+	}
+	url := net.JoinHostPort(host, strconv.Itoa(port))
+	ep := endpoint{kind: "http", url: "http://" + url}
+	if cc.TLS {
+		cfg, err := cryptoClientTLSConfig(cc)
+		if err != nil {
+			return endpoint{}, "", false
+		}
+		ep.tlsCfg = cfg
+		ep.url = "https://" + url
+	}
+	return ep, ep.url, true
+}
+
+// endpointFromClientConfig turns a client config into a usable primary endpoint.
+// (liveDaemon additionally tries cc.Hosts in order — D4.)
 func endpointFromClientConfig(cc *clientConfig) (endpoint, string, bool) {
 	if cc.UnixSocket != "" {
 		ep := endpoint{kind: "unix", socket: cc.UnixSocket}
@@ -5952,24 +5980,11 @@ func endpointFromClientConfig(cc *clientConfig) (endpoint, string, bool) {
 		}
 		return ep, desc, true
 	}
-	if cc.Host == "" {
-		return endpoint{}, "", false
+	host := cc.Host
+	if host == "" && len(cc.Hosts) > 0 {
+		host = cc.Hosts[0]
 	}
-	port := cc.Port
-	if port <= 0 {
-		port = defHTTPPort
-	}
-	url := net.JoinHostPort(cc.Host, strconv.Itoa(port))
-	ep := endpoint{kind: "http", url: "http://" + url}
-	if cc.TLS {
-		cfg, err := cryptoClientTLSConfig(cc)
-		if err != nil {
-			return endpoint{}, "", false
-		}
-		ep.tlsCfg = cfg
-		ep.url = "https://" + url
-	}
-	return ep, ep.url, true
+	return endpointForHostPort(cc, host)
 }
 
 // ensureClientConfig creates <stateDir>/client.json when absent (see
@@ -6065,10 +6080,13 @@ func unixEndpointFor(socket string) endpoint {
 func socketAlive(socket string) bool { return pingEndpoint(unixEndpointFor(socket)) == nil }
 
 // liveDaemon returns the first reachable daemon (local sockets, then the
-// client.json endpoint — unix or http), or ok=false.
+// client.json endpoint(s) — unix or http), or ok=false plus the per-candidate
+// connection errors (plans/mtls-ip-connectivity-fix-plan.md D5: a swallowed x509
+// SAN mismatch was invisible and read as "no daemon running").
 // Resolution order (plans/http-support-with-mtls-auth-plan.md §8):
-// KBTOOL_SOCKET, <state>/daemon.sock, <state>/mcp.sock, client.json endpoint.
-func liveDaemon() (*remoteExec, string, bool) {
+// KBTOOL_SOCKET, <state>/daemon.sock, <state>/mcp.sock, client.json endpoint
+// (host, then hosts… for multi-interface servers — D4).
+func liveDaemon() (*remoteExec, string, bool, error) {
 	type cand struct {
 		ep   endpoint
 		desc string
@@ -6089,16 +6107,64 @@ func liveDaemon() (*remoteExec, string, bool) {
 	add(filepath.Join(sd, "daemon.sock"))
 	add(filepath.Join(sd, "mcp.sock"))
 	if cc := loadClientConfigSafe(); cc != nil {
-		if ep, desc, ok := endpointFromClientConfig(cc); ok {
-			cs = append(cs, cand{ep, desc})
+		if cc.UnixSocket != "" {
+			if ep, desc, ok := endpointFromClientConfig(cc); ok {
+				cs = append(cs, cand{ep, desc})
+			}
+		} else {
+			// host, then hosts… — a multi-interface server is reachable by each of
+			// its SAN addresses; the first reachable endpoint wins (D4).
+			seen := map[string]bool{}
+			for _, h := range append([]string{cc.Host}, cc.Hosts...) {
+				h = strings.TrimSpace(h)
+				if h == "" || seen[h] {
+					continue
+				}
+				seen[h] = true
+				if ep, desc, ok := endpointForHostPort(cc, h); ok {
+					cs = append(cs, cand{ep, desc})
+				}
+			}
 		}
 	}
+	// Typed errors are kept (wrapped, not stringified) so daemonConnHint can
+	// errors.As() them (e.g. *tls.CertificateVerificationError ⇒ SAN hint).
+	var fails []error
 	for _, c := range cs {
-		if pingEndpoint(c.ep) == nil {
-			return &remoteExec{ep: c.ep}, c.desc, true
+		if err := pingEndpoint(c.ep); err != nil {
+			fails = append(fails, fmt.Errorf("%s: %w", c.desc, err))
+			continue
 		}
+		return &remoteExec{ep: c.ep}, c.desc, true, nil
 	}
-	return nil, "", false
+	return nil, "", false, errors.Join(fails...) // nil when there were no candidates
+}
+
+// daemonConnHint maps a daemon-connection failure to an actionable hint ("" when
+// nothing specific applies) — plans/mtls-ip-connectivity-fix-plan.md D5.
+func daemonConnHint(err error) string {
+	var vErr *tls.CertificateVerificationError
+	if errors.As(err, &vErr) {
+		return "the server certificate does not cover the name/IP you dialed (x509 SAN mismatch). " +
+			"On the server, regenerate the PKI with it included — kbtool mtls -ip <dial address> [-dns <name>] — " +
+			"re-import the client bundle, or connect by one of the certificate's SANs."
+	}
+	return ""
+}
+
+// reportDaemonFailure prints why the daemon was unreachable (when known) before
+// the caller gives up on the one-shot local fallback — D5.
+func reportDaemonFailure(connErr error) {
+	if connErr == nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, appName+": daemon unreachable:")
+	for _, ln := range strings.Split(strings.TrimRight(connErr.Error(), "\n"), "\n") {
+		fmt.Fprintln(os.Stderr, "  "+ln)
+	}
+	if h := daemonConnHint(connErr); h != "" {
+		fmt.Fprintln(os.Stderr, "  hint: "+h)
+	}
 }
 
 // ---------- state / process management ----------
@@ -7348,12 +7414,13 @@ func doTerms(a []string) {
 
 	var text string
 	var isErr bool
-	if ex, sock, ok := liveDaemon(); ok {
+	if ex, sock, ok, connErr := liveDaemon(); ok {
 		text, isErr = ex.Execute("kb_terms", args)
 		fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
 	} else {
 		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
 		if err != nil {
+			reportDaemonFailure(connErr)
 			fatal(err)
 		}
 		text, isErr = tb.Execute("kb_terms", args)
@@ -7401,12 +7468,13 @@ func doBundle(a []string) {
 	args := mustMarshal(map[string]any{"target": target, "q": *q, "k": *k})
 	var text string
 	var isErr bool
-	if ex, sock, ok := liveDaemon(); ok {
+	if ex, sock, ok, connErr := liveDaemon(); ok {
 		text, isErr = ex.Execute("kb_bundle", args)
 		fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
 	} else {
 		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
 		if err != nil {
+			reportDaemonFailure(connErr)
 			fatal(err)
 		}
 		text, isErr = tb.Execute("kb_bundle", args)
@@ -7464,7 +7532,8 @@ func doQuery(a []string) {
 	// access paths, so the expansion is identical via daemon or direct DB.
 	if *bundle {
 		args := mustMarshal(map[string]any{"q": q, "k": *k})
-		if ex, sock, ok := liveDaemon(); ok {
+		ex, sock, ok, connErr := liveDaemon()
+		if ok {
 			text, isErr := ex.Execute("kb_bundle", args)
 			if isErr {
 				fmt.Fprintln(os.Stderr, text)
@@ -7476,6 +7545,7 @@ func doQuery(a []string) {
 		}
 		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
 		if err != nil {
+			reportDaemonFailure(connErr)
 			fatal(err)
 		}
 		text, isErr := tb.Execute("kb_bundle", args)
@@ -7487,8 +7557,10 @@ func doQuery(a []string) {
 		return
 	}
 
-	// Prefer the daemon when it is up.
-	if ex, sock, ok := liveDaemon(); ok {
+	// Prefer the daemon when it is up (connErr is reported below, only if the
+	// one-shot local fallback also fails — D5).
+	ex, sock, ok, connErr := liveDaemon()
+	if ok {
 		args := mustMarshal(map[string]any{
 			"q": q, "k": *k, "min": *min, "full": *full, "path": *path, "kind": *kind,
 			"mode": *mode, "weights": map[string]float64{"keyword": *kwW, "vector": *vecW},
@@ -7509,6 +7581,7 @@ func doQuery(a []string) {
 		fatal(err)
 	}
 	if len(st.dbBytes) == 0 {
+		reportDaemonFailure(connErr)
 		fatal(fmt.Errorf("no daemon running and no db at %s; run 'kbtool build .' first", *dbp))
 	}
 	db, err := st.db()
@@ -7675,7 +7748,9 @@ func doCall(a []string) {
 		fatal(fmt.Errorf("args must be valid JSON, got: %s", argsRaw))
 	}
 
-	if ex, sock, ok := liveDaemon(); ok {
+	// connErr is reported below, only if the one-shot local fallback also fails (D5).
+	ex, sock, ok, connErr := liveDaemon()
+	if ok {
 		text, isErr := ex.Execute(name, argsRaw)
 		fmt.Println(text)
 		fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
@@ -7704,6 +7779,7 @@ func doCall(a []string) {
 	} else if strings.HasPrefix(name, "board_") {
 		tb = newToolbox(nil, nil) // board works without a codebase DB
 	} else {
+		reportDaemonFailure(connErr)
 		fatal(fmt.Errorf("no daemon running and no db at %s; run 'kbtool build .' first", *dbp))
 	}
 	tb.Store = st
@@ -7882,47 +7958,191 @@ func cryptoPEMKey(key *ecdsa.PrivateKey) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
 }
 
-// doMtls implements `kbtool mtls -ip … | -dns … [-expire 24h]`:
-// creates ca.crt/ca.key, server.crt/server.key (with the SANs), client.crt/
-// client.key under <stateDir>; sets http/mtls (+ bind address when exactly one
-// IP is given) in config.json; and creates client.json when absent.
-func doMtls(a []string) {
-	fs := flag.NewFlagSet("mtls", flag.ExitOnError)
-	ip := fs.String("ip", "", "comma-separated IP SANs (at least one of -ip/-dns required)")
-	dns := fs.String("dns", "", "comma-separated DNS SANs (at least one of -ip/-dns required)")
-	expire := fs.Duration("expire", 24*time.Hour, "CA/server/client certificate validity (e.g. 24h, 720h)")
-	fs.Parse(a)
+// mtlsArgs is the parsed `kbtool mtls` argument set
+// (plans/mtls-ip-connectivity-fix-plan.md §4).
+type mtlsArgs struct {
+	ips    []string // validated IP SANs, in order, de-duplicated
+	names  []string // validated DNS SANs, in order, de-duplicated
+	expire time.Duration
+}
 
-	var ips []net.IP
-	if *ip != "" {
-		for _, s := range strings.Split(*ip, ",") {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
+// ipNets converts the requested IP SAN strings to []net.IP (cert template input).
+func (m mtlsArgs) ipNets() []net.IP {
+	ips := make([]net.IP, 0, len(m.ips))
+	for _, s := range m.ips {
+		ips = append(ips, net.ParseIP(s))
+	}
+	return ips
+}
+
+// parseMtlsArgs parses `kbtool mtls` arguments (plans/mtls-ip-connectivity-fix-plan.md §4):
+//
+//	kbtool mtls [-ip IP[,IP…]] [-dns NAME[,NAME…]] [-expire D] [IP-or-NAME …]
+//
+// flag.Parse stops at the first bare token and silently DROPPED everything after
+// it — including later flags — which is how a cert issued with missing SANs
+// caused the "connects by DNS but not by IP" failure. This parser walks the
+// arguments in order: -ip/-dns values are comma lists of their respective type,
+// bare tokens classify (IP => IP SAN, else DNS SAN), -expire takes a duration
+// anywhere, and any other flag is a hard error. Nothing typed is dropped.
+func parseMtlsArgs(a []string) (mtlsArgs, error) {
+	var out mtlsArgs
+	out.expire = 24 * time.Hour
+	addIP := func(s string) error {
+		p := net.ParseIP(s)
+		if p == nil {
+			return fmt.Errorf("-ip entry %q is not an IP address (use -dns for DNS names, or a bare argument)", s)
+		}
+		if !containsString(out.ips, p.String()) { // normalized form: dedupes ::1 vs 0:0:0:0:0:0:0:1
+			out.ips = append(out.ips, p.String())
+		}
+		return nil
+	}
+	addName := func(s string) error {
+		if net.ParseIP(s) != nil {
+			return fmt.Errorf("-dns entry %q is an IP address (list it with -ip, or as a bare argument)", s)
+		}
+		if !dnsNameOK(s) {
+			return fmt.Errorf("-dns entry %q is not a syntactically valid DNS name", s)
+		}
+		if !containsString(out.names, s) {
+			out.names = append(out.names, s)
+		}
+		return nil
+	}
+	classify := func(s string) error {
+		if net.ParseIP(s) != nil {
+			return addIP(s)
+		}
+		return addName(s)
+	}
+	for i := 0; i < len(a); i++ {
+		s := a[i]
+		if len(s) > 1 && s[0] == '-' {
+			name, val, hasVal := s[1:], "", false
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name, val, hasVal = name[:eq], name[eq+1:], true
 			}
-			p := net.ParseIP(s)
-			if p == nil {
-				fatal(fmt.Errorf("mtls: invalid -ip entry %q", s))
+			if !hasVal {
+				i++
+				if i >= len(a) {
+					return out, fmt.Errorf("-%s needs a value", name)
+				}
+				val = a[i]
 			}
-			ips = append(ips, p)
+			switch name {
+			case "ip":
+				for _, e := range strings.Split(val, ",") {
+					if e = strings.TrimSpace(e); e != "" {
+						if err := addIP(e); err != nil {
+							return out, err
+						}
+					}
+				}
+			case "dns":
+				for _, e := range strings.Split(val, ",") {
+					if e = strings.TrimSpace(e); e != "" {
+						if err := addName(e); err != nil {
+							return out, err
+						}
+					}
+				}
+			case "expire":
+				d, err := time.ParseDuration(val)
+				if err != nil || d <= 0 {
+					return out, fmt.Errorf("-expire %q must be a duration > 0 (e.g. 24h, 720h)", val)
+				}
+				out.expire = d
+			default:
+				return out, fmt.Errorf("unknown flag -%s (kbtool mtls takes -ip, -dns, -expire)", name)
+			}
+		} else if s == "-" {
+			return out, errors.New("- is not a SAN entry")
+		} else {
+			if err := classify(s); err != nil {
+				return out, err
+			}
 		}
 	}
-	var names []string
-	if *dns != "" {
-		for _, s := range strings.Split(*dns, ",") {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
+	if len(out.ips) == 0 && len(out.names) == 0 {
+		return out, errors.New("at least one of -ip or -dns is required (or a bare IP/DNS argument)")
+	}
+	return out, nil
+}
+
+// dnsNameOK is a syntactic DNS-name check for -dns SAN entries (labels of
+// letters/digits/hyphens/underscores, no leading or trailing hyphen, sane
+// lengths). It is deliberately permissive — the SAN is a match target, not a
+// lookup key.
+func dnsNameOK(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, lab := range strings.Split(s, ".") {
+		if lab == "" || len(lab) > 63 {
+			return false
+		}
+		for i, r := range lab {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			case r == '-' && i > 0 && i < len(lab)-1:
+			default:
+				return false
 			}
-			names = append(names, s)
 		}
 	}
-	if len(ips) == 0 && len(names) == 0 {
-		fatal(errors.New("mtls: at least one of -ip or -dns is required (comma-separated SAN entries)"))
+	return true
+}
+
+// containsString reports whether s is in list.
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
 	}
-	if *expire <= 0 {
-		fatal(errors.New("mtls: -expire must be > 0"))
+	return false
+}
+
+// verifyCertSANs asserts the ISSUED certificate carries every requested IP and
+// DNS SAN (plans/mtls-ip-connectivity-fix-plan.md D2): a silently dropped SAN is
+// exactly the "connects by DNS but not by IP" failure.
+func verifyCertSANs(cert *x509.Certificate, ips, names []string) error {
+	haveIP := map[string]bool{}
+	for _, p := range cert.IPAddresses {
+		haveIP[p.String()] = true
 	}
+	for _, s := range ips {
+		p := net.ParseIP(s)
+		if p == nil || !haveIP[p.String()] {
+			return fmt.Errorf("issued server certificate is missing IP SAN %s — refusing a PKI that drops a requested SAN", s)
+		}
+	}
+	haveDNS := map[string]bool{}
+	for _, n := range cert.DNSNames {
+		haveDNS[n] = true
+	}
+	for _, n := range names {
+		if !haveDNS[n] {
+			return fmt.Errorf("issued server certificate is missing DNS SAN %s — refusing a PKI that drops a requested SAN", n)
+		}
+	}
+	return nil
+}
+
+// doMtls implements `kbtool mtls [-ip …] [-dns …] [-expire 24h] [IP-or-NAME …]`:
+// creates ca.crt/ca.key, server.crt/server.key (with the requested SANs, then
+// VERIFIED present in the issued cert), client.crt/client.key under <stateDir>;
+// sets http/mtls (+ bind address when exactly one IP is given) in config.json;
+// and rewrites client.json (host + hosts = every SAN endpoint).
+func doMtls(a []string) {
+	sa, err := parseMtlsArgs(a)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "usage: kbtool mtls [-ip IP[,IP…]] [-dns NAME[,NAME…]] [-expire 24h] [IP-or-NAME …]")
+		fatal(err)
+	}
+	ips := sa.ipNets()
+	names := sa.names
 
 	sd := stateDir()
 	if err := os.MkdirAll(sd, 0755); err != nil {
@@ -7937,9 +8157,9 @@ func doMtls(a []string) {
 		bindAddr = net.JoinHostPort(ips[0].String(), strconv.Itoa(defHTTPPort))
 	}
 
-	caKey, caCert := cryptoGenerateCA("kbtool local CA", *expire)
-	serverKey, serverCert := cryptoGenerateLeaf(caKey, caCert, "kbtool daemon", ips, names, *expire)
-	clientKey, clientCert := cryptoGenerateLeaf(caKey, caCert, "kbtool client", nil, nil, *expire)
+	caKey, caCert := cryptoGenerateCA("kbtool local CA", sa.expire)
+	serverKey, serverCert := cryptoGenerateLeaf(caKey, caCert, "kbtool daemon", ips, names, sa.expire)
+	clientKey, clientCert := cryptoGenerateLeaf(caKey, caCert, "kbtool client", nil, nil, sa.expire)
 
 	files := map[string][]byte{
 		"ca.crt":     cryptoPEMCert(caCert),
@@ -7981,24 +8201,40 @@ func doMtls(a []string) {
 		fatal(err)
 	}
 
-	// 'kbtool mtls' creates client.json (plan §4.2): it regenerated the local
-	// PKI, so the local client config must point at the new certs. The connect
-	// name matches a SAN: a DNS name when given (portable for import on another
-	// machine — that machine must resolve it), else the single bound IP.
-	host, port := "", defHTTPPort
-	if len(names) > 0 {
-		host = names[0]
-	} else if len(ips) == 1 {
-		host = ips[0].String()
+	// Self-check (plans/mtls-ip-connectivity-fix-plan.md D2): re-read the ISSUED
+	// server.crt and assert every requested SAN is present — a PKI that drops a
+	// requested SAN is never left on disk.
+	issued, err := cryptoFirstCert(filepath.Join(sd, "server.crt"))
+	if err != nil {
+		fatal(fmt.Errorf("mtls: could not re-read the issued server.crt: %v", err))
 	}
-	if err := saveClientConfig(&clientConfig{Version: 1, Host: host, Port: port,
+	if err := verifyCertSANs(issued, sa.ips, sa.names); err != nil {
+		fatal(err)
+	}
+
+	// 'kbtool mtls' rewrites client.json (plan §4.2): it regenerated the local
+	// PKI, so the local client config must point at the new certs. host = first
+	// DNS (portable for import on another machine), else the first IP — never
+	// empty (D3: >=1 SAN is required). hosts = every SAN endpoint (DNS first,
+	// then IPs) so a multi-interface server is reachable by each of its
+	// addresses and the client fails over across them (D4).
+	host := ""
+	if len(names) > 0 {
+		host = names[0] // DNS preferred (portable for import)
+	} else {
+		host = ips[0].String() // safe: >=1 SAN is required, so ips is non-empty when names is empty
+	}
+	hosts := append(append([]string{}, names...), mapIps(ips)...) // DNS first, then IPs
+	if err := saveClientConfig(&clientConfig{Version: 1, Host: host, Hosts: hosts, Port: defHTTPPort,
 		TLS:    true,
 		CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}); err != nil {
 		fatal(err)
 	}
 	fmt.Printf("client: wrote %s (local CLI now uses the new mTLS setup)\n", clientConfigPath())
-	fmt.Printf("mtls: CA + server + client certificates under %s (valid for %s)\n", sd, *expire)
-	fmt.Printf("mtls: server SANs: ip=[%s] dns=[%s]\n", strings.Join(mapIps(ips), ","), strings.Join(names, ","))
+	fmt.Printf("mtls: CA + server + client certificates under %s (valid for %s)\n", sd, sa.expire)
+	fmt.Printf("mtls: server SANs (verified in issued cert): ip=[%s] dns=[%s]\n",
+		strings.Join(mapIps(issued.IPAddresses), ","), strings.Join(issued.DNSNames, ","))
+	fmt.Printf("mtls: client endpoints tried in order: %s\n", strings.Join(hosts, ", "))
 	fmt.Printf("mtls: config %s: http=%v mtls=%v%s\n", configPath(), true, true, extraBind(bindAddr))
 	fmt.Printf("mtls: now: kbtool daemon start -http -mtls   (or: kbtool daemon run -http -mtls)\n")
 }
@@ -8891,7 +9127,14 @@ func doStatus(a []string) {
 			if cc.TLS {
 				scheme = "https"
 			}
-			what = fmt.Sprintf("%s://%s:%d", scheme, cc.Host, cc.Port)
+			host := cc.Host
+			if host == "" && len(cc.Hosts) > 0 {
+				host = cc.Hosts[0]
+			}
+			what = fmt.Sprintf("%s://%s:%d", scheme, host, cc.Port)
+			if len(cc.Hosts) > 0 {
+				what += fmt.Sprintf(" [hosts: %s]", strings.Join(cc.Hosts, ", "))
+			}
 		}
 		if cc.TLS {
 			what += " (mtls)"
@@ -8961,9 +9204,11 @@ Usage:
   kbtool daemon start/run additionally: [-http] [-mtls] [-bind HOST:PORT]
                                          [-crl FILE] [-crlrefresh] [-crlinterval SEC]
                                          [-db-key-env NAME | -db-key-file PATH]
-  kbtool mtls -ip 10.0.0.5 [-dns kb.local] [-expire 24h]
-                                        generate the local mTLS PKI (CA + server + client certs),
-                                        record http/mtls in config.json, create client.json (absent only)
+  kbtool mtls [-ip IP[,IP…]] [-dns NAME[,NAME…]] [-expire 24h] [IP-or-NAME …]
+                                        generate the local mTLS PKI (CA + server + client certs) with the
+                                        requested SANs (verified present in the issued cert; bare tokens
+                                        classify as IP or DNS; nothing is silently dropped), record
+                                        http/mtls in config.json, write client.json (host + hosts = every SAN)
   kbtool client -export [file] -key PASS         export an encrypted bundle of the client setup
   kbtool client -import file -key PASS [-yes]    decrypt + extract a bundle into <stateDir>
   kbtool status

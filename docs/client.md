@@ -25,7 +25,7 @@ Provide **exactly one** of `-export` / `-import`; `-key` is always required.
 |---|---|
 | `ca.crt` | CA the client trusts (vouches for the daemon). |
 | `client.crt` / `client.key` | The client certificate/key to present at the mTLS handshake. |
-| `client.json` | Endpoint config: `host:port` (or `unix_socket`), `tls`, cert names. |
+| `client.json` | Endpoint config: `host:port` (or `unix_socket`), optional `hosts` list (multi-interface failover), `tls`, cert names. |
 
 ## Behavior
 
@@ -36,6 +36,10 @@ Provide **exactly one** of `-export` / `-import`; `-key` is always required.
   overwrite existing files unless `-yes`.
 - After import, the local CLI (`query`, `call`, `status`, …) automatically
   uses the imported `client.json` — no other setup needed.
+- **Many clients, one identity:** all imported clients share the same client
+  certificate by design (TLS has no per-certificate uniqueness) — one bundle
+  authorizes any number of concurrent clients. To cut them off, revoke the
+  certificate in the server's CRL (`crl.pem`).
 - The passphrase travels **out-of-band** (it is not in the bundle). Treat the
   bundle + passphrase together as secret: possession of both equals a valid
   client identity.

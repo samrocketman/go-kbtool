@@ -86,8 +86,9 @@ resolved against the state dir.
 |---|---|
 | `unix_socket` | Unix socket to use (when set, `host`/`port` are ignored). |
 | `host`, `port` | TCP endpoint (used when `unix_socket` is empty). |
-| `tls` | `true` ⇒ mTLS: present the client cert, verify the server via `server_name`. |
-| `server_name` | Expected server identity (defaults to the host). |
+| `hosts` | Optional ordered list of further endpoints for a multi-interface server (written by `kbtool mtls` as every SAN): tried in order after `host`, first live one wins. |
+| `tls` | `true` ⇒ mTLS: present the client cert; over TCP the dialed host is verified against the server cert's SANs (unless `server_name` overrides). |
+| `server_name` | Optional override of the expected server identity (unix-socket TLS uses it by default, from the local `server.crt`'s first SAN). |
 | `ca_cert` | CA to trust. |
 | `client_cert`, `client_key` | Cert/key to present. |
 | `version`, `updated` | Bookkeeping. |

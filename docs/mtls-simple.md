@@ -11,12 +11,20 @@ kbtool mtls -dns kb.example.net
 # …or by IP (e.g. a private LAN address):
 kbtool mtls -ip 10.0.0.5
 
+# Multi-interface server: every address clients may dial goes into the SAN
+# (comma- or space-separated; flags in any order; nothing is silently dropped):
+kbtool mtls -ip 10.0.0.5,192.168.1.20 -dns kb.example.net
+
 # Long-lived certs:
 kbtool mtls -dns kb.example.net -expire 720h
 
 # Now serve with it:
 kbtool daemon start -http -mtls
 ```
+
+Many clients may share one client certificate (e.g. a dozen friends importing
+one `kbtool client -export` bundle) — that is allowed by design; revoke it via
+the CRL if you need to cut them all off.
 
 What it does:
 
