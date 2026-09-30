@@ -7,6 +7,9 @@
 //
 //	kbtool build [dir]                build the DB (vectors + keyword index) from a codebase / docs
 //	kbtool query "text"               search; uses the daemon when it is up, else loads the DB locally
+//	kbtool query "text" -bundle       …and expand each top hit into a context bundle (see `kbtool bundle`)
+//	kbtool terms <identifier>         exact identifier/string census (presence/ABSENCE evidence): exit 0=present, 3=absent
+//	kbtool bundle <file:line>         context-bundle expansion of a known location (or -q "query" for its top hits)
 //	kbtool tools                      print MCP tool schemas (or -qwen for an OpenAI/Qwen "tools" array)
 //	kbtool call <tool> '<json>'       invoke one tool directly (daemon when up, else local)
 //	kbtool bench -db PATH             in-process query benchmark (min/p50/p95/max)
@@ -2039,6 +2042,1069 @@ func weightedFuse(rankA, rankB []idScore, wA, wB float64, n int) []idScore {
 	return out
 }
 
+// ---------- terms census + context bundle (plans/context-bundle-plan.md) ----------
+//
+// Two lexical, read-only tools over the existing chunk store — no new index
+// artifact, no AST, no type inference:
+//
+//   kb_terms — a COMPLETE occurrence census of one exact identifier/string over
+//       every indexed chunk (substring match). Absence is a citable result:
+//       present = the text occurs in at least one indexed chunk, independent of
+//       any ranking (an identifier that "exists but didn't rank" in a hybrid
+//       query is still censused as present).
+//
+//   kb_bundle — context-bundle expansion: for a location (file:line) or the top
+//       hits of a query, one consolidated read pack per hit following the
+//       code's own written pointers: (1) package neighborhood (sibling files +
+//       one-line summary), (2) literal/identifier propagation (stable fragments
+//       searched tree-wide), (3) import verdicts (internal / external /
+//       unresolved — never a wrong verdict), (4) test-file pairing.
+
+// bundle limits (plan §Design): hard caps keep large repos from flooding the
+// terminal; every cap that fires renders an explicit "…truncated" marker.
+const (
+	termsDefaultMaxFiles = 20 // default census files shown (k)
+	termsMaxLinesPerFile = 3  // representative lines per census file
+
+	bundleDefaultHits   = 3  // top hits bundled for a query
+	bundleMaxHits       = 8  // cap on hits bundled for a query
+	bundleNeighborhood  = 20 // sibling files per neighborhood section
+	bundleSummaryLimit  = 80 // one-line summary length (rune clip)
+	bundleCandMax       = 8  // propagation candidates per hit
+	bundleFragMax       = 6  // fragments per candidate
+	bundleFragFilesMax  = 10 // files per fragment
+	bundleFragMinLen    = 6  // min fragment length
+	bundleImportsMax    = 20 // import statements per hit
+	bundleTestMax       = 10 // paired test files per hit
+	bundleTestSharedMax = 3  // shared identifiers shown per test file
+	bundleSymbolLimit   = 3  // exported symbols in a neighborhood summary
+)
+
+// ---------- kb_terms: occurrence census ----------
+
+type termsFile struct {
+	Path  string   `json:"path"`
+	Count int      `json:"count"`
+	Lines []string `json:"lines,omitempty"`
+}
+
+type termsResult struct {
+	Identifier  string      `json:"identifier"`
+	Present     bool        `json:"present"`
+	Occurrences int         `json:"occurrences"`
+	FileCount   int         `json:"fileCount"`
+	Files       []termsFile `json:"files"`
+	Truncated   bool        `json:"truncated"`
+}
+
+// termsCensus scans every non-board chunk once and aggregates exact (case-
+// sensitive) substring occurrences of term per file, with up to
+// termsMaxLinesPerFile representative lines per file. k caps the file list (the
+// true total stays in FileCount). Ranking is deliberately NOT involved: the
+// result is a complete census of the indexed source, so absence is citable.
+func termsCensus(db *DB, term string, k int) *termsResult {
+	term = stripInvisible(term)
+	if k <= 0 {
+		k = termsDefaultMaxFiles
+	}
+	type acc struct {
+		count int
+		lines []string
+	}
+	res := &termsResult{Identifier: term, Files: []termsFile{}}
+	if term == "" {
+		return res
+	}
+	byFile := map[string]*acc{}
+	total := 0
+	for i := range db.Chunks {
+		c := &db.Chunks[i]
+		if c.Kind == "board" {
+			continue // census is over indexed sources, not conversation
+		}
+		n := strings.Count(c.Text, term)
+		if n == 0 {
+			continue
+		}
+		total += n
+		a, ok := byFile[c.Path]
+		if !ok {
+			a = &acc{}
+			byFile[c.Path] = a
+		}
+		a.count += n
+		if len(a.lines) < termsMaxLinesPerFile {
+			for li, ln := range strings.Split(c.Text, "\n") {
+				if strings.Contains(ln, term) {
+					a.lines = append(a.lines, fmt.Sprintf(":%d  %s", c.Start+li, clip(strings.TrimSpace(ln), 120)))
+					if len(a.lines) >= termsMaxLinesPerFile {
+						break
+					}
+				}
+			}
+		}
+	}
+	res.Occurrences = total
+	res.Present = total > 0
+	res.FileCount = len(byFile)
+	names := make([]string, 0, len(byFile))
+	for p := range byFile {
+		names = append(names, p)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if byFile[names[i]].count != byFile[names[j]].count {
+			return byFile[names[i]].count > byFile[names[j]].count
+		}
+		return names[i] < names[j]
+	})
+	if len(names) > k {
+		names = names[:k]
+		res.Truncated = true
+	}
+	for _, p := range names {
+		res.Files = append(res.Files, termsFile{Path: p, Count: byFile[p].count, Lines: byFile[p].lines})
+	}
+	return res
+}
+
+// renderTerms is the human-readable census (kbtool terms without -json).
+func renderTerms(r *termsResult) string {
+	var b strings.Builder
+	if !r.Present {
+		// The feature's reason to exist: a DISTINCT, unambiguous absence result
+		// that is citable as evidence (plans/context-bundle-plan.md).
+		fmt.Fprintf(&b, "ABSENT in indexed sources: %q (0 occurrences in 0 files)\n", r.Identifier)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%d occurrence(s) in %d file(s) for %q:\n", r.Occurrences, r.FileCount, r.Identifier)
+	for _, f := range r.Files {
+		fmt.Fprintf(&b, "  %s  (%d)\n", f.Path, f.Count)
+		for _, ln := range f.Lines {
+			fmt.Fprintf(&b, "      %s\n", ln)
+		}
+	}
+	if r.Truncated {
+		fmt.Fprintf(&b, "  …truncated (showing first %d of %d files)\n", len(r.Files), r.FileCount)
+	}
+	return b.String()
+}
+
+// ---------- kb_bundle: shared primitives ----------
+
+// bundleFiles precomputes the per-file chunk map for one bundle call (board
+// chunks excluded — the pack follows the code's pointers, not the board).
+type bundleFiles struct {
+	names  []string         // distinct chunk paths, in first-seen order
+	set    map[string]bool  // membership
+	chunks map[string][]int // path -> chunk indexes
+}
+
+func newBundleFiles(db *DB) *bundleFiles {
+	bf := &bundleFiles{set: map[string]bool{}, chunks: map[string][]int{}}
+	for i := range db.Chunks {
+		c := &db.Chunks[i]
+		if c.Kind == "board" {
+			continue
+		}
+		if !bf.set[c.Path] {
+			bf.set[c.Path] = true
+			bf.names = append(bf.names, c.Path)
+		}
+		bf.chunks[c.Path] = append(bf.chunks[c.Path], i)
+	}
+	return bf
+}
+
+// dirOf returns the directory prefix of a chunk path ("a/b/c.go" -> "a/b/").
+func dirOf(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i <= 0 {
+		return ""
+	}
+	return p[:i+1]
+}
+
+// baseOf returns the final path element ("a/b/c.go" -> "c.go").
+func baseOf(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return p
+	}
+	return p[i+1:]
+}
+
+// pathSegs splits a slash path into non-empty segments.
+func pathSegs(p string) []string {
+	var out []string
+	for _, s := range strings.Split(p, "/") {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// segsSuffix reports whether segs is a suffix of dir (segment-wise).
+func segsSuffix(dir, segs []string) bool {
+	if len(segs) > len(dir) {
+		return false
+	}
+	off := len(dir) - len(segs)
+	for i, s := range segs {
+		if dir[off+i] != s {
+			return false
+		}
+	}
+	return true
+}
+
+// fileSummary produces the one-line neighborhood summary for a file: the first
+// top-of-file doc-comment line (Go //, Java /**, #, """/”'), else up to
+// bundleSymbolLimit exported symbol names (func/class/interface/struct/def/
+// export), else the first non-empty line.
+func fileSummary(db *DB, bf *bundleFiles, path string) string {
+	idxs := bf.chunks[path]
+	if len(idxs) == 0 {
+		return "(no chunks)"
+	}
+	first := idxs[0]
+	for _, i := range idxs[1:] {
+		if db.Chunks[i].Start < db.Chunks[first].Start {
+			first = i
+		}
+	}
+	lines := strings.Split(db.Chunks[first].Text, "\n")
+	if len(lines) > 20 {
+		lines = lines[:20]
+	}
+	commentRe := regexp.MustCompile(`^(?:/\*\*\?|//+|#|"""|'')\s*(.*)$`)
+	symRe := regexp.MustCompile(`(?:\bfunc\s+|\bclass\s+|\binterface\s+|\bstruct\s+|\bdef\s+|\bexport\s+(?:default\s+)?(?:async\s+)?)` +
+		`([A-Za-z_$][A-Za-z0-9_$]*)`)
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			continue
+		}
+		if m := commentRe.FindStringSubmatch(t); m != nil && strings.TrimSpace(m[1]) != "" {
+			return clip(strings.TrimSpace(m[1]), bundleSummaryLimit)
+		}
+		break // only comment lines at the very top of the file count
+	}
+	var syms []string
+	seen := map[string]bool{}
+	for _, ln := range lines {
+		for _, m := range symRe.FindAllStringSubmatch(ln, -1) {
+			if !seen[m[1]] && !identStopword[m[1]] {
+				seen[m[1]] = true
+				syms = append(syms, m[1])
+				if len(syms) >= bundleSymbolLimit {
+					break
+				}
+			}
+		}
+		if len(syms) >= bundleSymbolLimit {
+			break
+		}
+	}
+	if len(syms) > 0 {
+		return clip(strings.Join(syms, ", "), bundleSummaryLimit)
+	}
+	for _, ln := range lines {
+		if t := strings.TrimSpace(ln); t != "" {
+			return clip(t, bundleSummaryLimit)
+		}
+	}
+	return "(empty)"
+}
+
+// ---------- propagation: candidate extraction + stable fragments ----------
+
+// identStopword filters language keywords and ubiquitous generic names out of
+// the propagation candidates and test-pairing identifiers (a hit mentioning
+// "class" or "String" is not a pointer worth a tree-wide scan).
+var identStopword = map[string]bool{
+	// Go
+	"package": true, "import": true, "return": true, "func": true, "type": true,
+	"var": true, "const": true, "nil": true, "new": true, "make": true,
+	"string": true, "int": true, "int32": true, "int64": true, "uint32": true,
+	"uint64": true, "byte": true, "rune": true, "bool": true, "error": true,
+	"errors": true, "context": true, "json": true, "http": true, "bytes": true,
+	"fmt": true, "io": true, "os": true, "sync": true, "time": true,
+	"println": true, "print": true,
+	// Java / C-like
+	"class": true, "interface": true, "public": true, "private": true,
+	"protected": true, "static": true, "final": true, "void": true, "this": true,
+	"super": true, "extends": true, "implements": true, "true": true, "false": true,
+	"null": true, "boolean": true, "integer": true, "double": true, "float": true,
+	"char": true, "long": true, "short": true, "enum": true, "case": true,
+	"switch": true, "break": true, "continue": true, "else": true, "for": true,
+	"while": true, "if": true, "in": true, "throw": true, "try": true,
+	"catch": true, "finally": true, "assert": true, "String": true,
+	"Integer": true, "Boolean": true, "Double": true, "Float": true, "Object": true,
+	"Number": true, "System": true, "equals": true, "toString": true, "valueOf": true,
+	"parseInt": true, "parseLong": true, "format": true, "formatted": true,
+	"StringBuilder": true, "append": true, "trim": true, "split": true, "join": true,
+	"length": true, "size": true, "isEmpty": true, "builder": true, "buffer": true,
+	"buffers": true, "stream": true, "streams": true, "Optional": true,
+	"List": true, "Map": true, "Set": true, "Collection": true, "Iterable": true,
+	// JS / TS
+	"export": true, "default": true, "module": true, "require": true,
+	"from": true, "await": true, "async": true, "yield": true, "typeof": true,
+	"console": true, "undefined": true, "Promise": true, "Array": true,
+	"math": true, "JSON": true, "then": true,
+	// Python
+	"def": true, "self": true, "None": true, "True": true, "False": true, "with": true,
+	"raise": true, "except": true, "lambda": true, "pass": true, "global": true,
+	"nonlocal": true, "del": true, "is": true, "not": true, "and": true, "or": true,
+	"str": true, "dict": true, "list": true, "tuple": true,
+	"range": true, "len": true,
+	// ubiquitous generics (all languages)
+	"value": true, "values": true, "name": true, "names": true, "key": true,
+	"keys": true, "data": true, "result": true, "results": true, "response": true,
+	"request": true, "message": true, "messages": true, "info": true, "log": true,
+	"logger": true, "logging": true, "warn": true, "warning": true, "debug": true,
+	"trace": true, "level": true, "levels": true, "config": true, "configuration": true,
+	"option": true, "options": true, "setting": true, "settings": true, "property": true,
+	"properties": true, "attribute": true, "attributes": true, "field": true,
+	"fields": true, "column": true, "columns": true, "table": true, "tables": true,
+	"row": true, "rows": true, "record": true, "records": true, "entity": true,
+	"entities": true, "document": true, "documents": true, "item": true, "items": true,
+	"entry": true, "entries": true, "element": true, "elements": true, "node": true,
+	"nodes": true, "child": true, "children": true, "parent": true, "root": true,
+	"index": true, "indices": true, "offset": true, "limit": true, "count": true,
+	"total": true, "sum": true, "average": true, "max": true, "min": true,
+	"step": true, "steps": true, "interval": true, "duration": true, "timeout": true,
+	"retries": true, "retry": true, "poll": true, "polling": true, "batch": true,
+	"batches": true, "chunk": true, "chunks": true, "page": true, "pages": true,
+	"slice": true, "stack": true, "queue": true, "map": true, "set": true,
+	"channel": true, "channels": true, "pipe": true, "pipes": true, "socket": true,
+	"sockets": true, "server": true, "servers": true, "client": true, "clients": true,
+	"connection": true, "connections": true, "session": true, "sessions": true,
+	"token": true, "tokens": true, "secret": true, "secrets": true, "password": true,
+	"credential": true, "credentials": true, "certificate": true, "certificates": true,
+	"sign": true, "signing": true, "signature": true, "verify": true,
+	"verification": true, "auth": true, "authentication": true, "authorization": true,
+	"permission": true, "permissions": true, "role": true, "roles": true, "user": true,
+	"users": true, "account": true, "accounts": true, "team": true, "teams": true,
+	"project": true, "projects": true, "policy": true, "policies": true, "rule": true,
+	"rules": true, "filter": true, "filters": true, "matcher": true, "matchers": true,
+	"handler": true, "handlers": true, "listener": true, "listeners": true,
+	"callback": true, "callbacks": true, "hook": true, "hooks": true, "plugin": true,
+	"plugins": true, "provider": true, "providers": true, "adapter": true,
+	"adapters": true, "wrapper": true, "wrappers": true, "proxy": true, "proxies": true,
+	"cache": true, "caches": true, "pool": true, "pools": true, "store": true,
+	"stores": true, "repository": true, "repositories": true, "registry": true,
+	"registries": true, "catalog": true, "catalogs": true, "source": true,
+	"sources": true, "target": true, "targets": true, "input": true, "inputs": true,
+	"output": true, "outputs": true, "payload": true, "payloads": true, "body": true,
+	"header": true, "headers": true, "query": true, "queries": true, "param": true,
+	"params": true, "argument": true, "arguments": true, "flag": true, "flags": true,
+	"mode": true, "modes": true, "state": true, "states": true, "status": true,
+	"phase": true, "phases": true, "stage": true, "stages": true, "task": true,
+	"tasks": true, "job": true, "jobs": true, "worker": true, "workers": true,
+	"agent": true, "agents": true, "process": true, "processes": true, "thread": true,
+	"threads": true, "service": true, "services": true, "endpoint": true,
+	"endpoints": true, "route": true, "routes": true, "path": true, "paths": true,
+	"url": true, "urls": true, "uri": true, "uris": true, "link": true, "links": true,
+	"ref": true, "refs": true, "id": true, "ids": true, "uuid": true, "uuids": true,
+	"timestamp": true, "timestamps": true, "date": true, "dates": true, "day": true,
+	"days": true, "month": true, "months": true, "year": true, "years": true,
+	"hour": true, "hours": true, "minute": true, "minutes": true, "second": true,
+	"seconds": true, "week": true, "weeks": true, "quarter": true, "quarters": true,
+	"epoch": true, "utc": true, "gmt": true, "zone": true, "zones": true,
+	"local": true, "remote": true, "internal": true, "external": true, "shared": true,
+	"open": true, "closed": true, "active": true, "inactive": true, "enabled": true,
+	"disabled": true, "valid": true, "invalid": true, "ready": true, "pending": true,
+	"completed": true, "failed": true, "failure": true, "failures": true,
+	"success": true, "succeeded": true, "running": true, "stopped": true,
+	"started": true, "starting": true, "killed": true, "expired": true,
+	"expiring": true, "deleted": true, "removed": true, "cleared": true, "purged": true,
+	"archived": true, "stored": true, "saved": true, "loaded": true, "loading": true,
+	"parse": true, "encode": true, "decode": true, "read": true, "write": true,
+	"create": true, "update": true, "insert": true, "select": true, "fetch": true,
+	"get": true, "put": true, "empty": true,
+}
+
+var (
+	// string literals: double-quoted, single-quoted (min 2 inner chars), or
+	// backtick-quoted (min 1 char) — escapes allowed in the first two.
+	propLitRe   = regexp.MustCompile("\"(?:[^\"\\\\]|\\\\.)*\"|'(?:[^'\\\\]|\\\\.)*'|`[^`\n]*`")
+	propIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]{4,}`)
+	propVerbRe  = regexp.MustCompile(`%[-#0 +]*[a-zA-Z]`)
+	propRunRe   = regexp.MustCompile(`[A-Za-z0-9._-]{6,}`)
+	propAlphaRe = regexp.MustCompile(`[A-Za-z0-9]`)
+)
+
+// stripCommentLines drops comment-only lines (//, #, * block-continuation, """/
+// ”' docstring openers, /* openers) so doc text doesn't pollute the propagation
+// candidates — the code's own pointers are in code, not prose.
+func stripCommentLines(text string) string {
+	var out []string
+	for _, ln := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#") ||
+			strings.HasPrefix(t, "*") || strings.HasPrefix(t, "/*") ||
+			strings.HasPrefix(t, "\"\"\"") || strings.HasPrefix(t, "'''") {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
+}
+
+// extractCandidates pulls the propagation candidates out of the hit text (comment
+// lines stripped): string literals first, then identifiers — longest first,
+// deduped, stopword-filtered, capped at bundleCandMax. (plan §Design.2)
+func extractCandidates(text string) []string {
+	text = stripCommentLines(text)
+	var literals, idents []string
+	seen := map[string]bool{}
+	for _, m := range propLitRe.FindAllString(text, -1) {
+		inner := strings.Trim(m, "\"'`")
+		if inner == "" || seen[inner] {
+			continue
+		}
+		if len(inner) < 4 || len(inner) > 200 {
+			continue
+		}
+		if !propAlphaRe.MatchString(inner) {
+			continue
+		}
+		seen[inner] = true
+		literals = append(literals, inner)
+	}
+	for _, m := range propIdentRe.FindAllString(text, -1) {
+		if seen[m] || identStopword[m] {
+			continue
+		}
+		seen[m] = true
+		idents = append(idents, m)
+	}
+	byLen := func(s []string) {
+		sort.Slice(s, func(a, b int) bool {
+			if len(s[a]) != len(s[b]) {
+				return len(s[a]) > len(s[b])
+			}
+			return s[a] < s[b]
+		})
+	}
+	byLen(literals)
+	byLen(idents)
+	out := append(literals, idents...)
+	if len(out) > bundleCandMax {
+		out = out[:bundleCandMax]
+	}
+	return out
+}
+
+// stableFragments derives the search fragments of one candidate (plan
+// §Design.2): split on format verbs (%s, %d, …), then keep every run of
+// ≥ bundleFragMinLen word chars ([A-Za-z0-9._-], edges trimmed). A pure
+// identifier yields itself;
+// "...nvdcve-2.0-%s.json.gz" -> ["nvdcve-2.0", "nvd.nist.gov", "json.gz", …].
+// Longest first, capped at bundleFragMax, deduped.
+func stableFragments(s string) []string {
+	if len(s) < bundleFragMinLen {
+		return nil
+	}
+	seen := map[string]bool{}
+	var frags []string
+	add := func(f string) {
+		f = strings.TrimLeft(f, "-.")
+		f = strings.TrimRight(f, "-.")
+		if len(f) >= bundleFragMinLen && !seen[f] {
+			seen[f] = true
+			frags = append(frags, f)
+		}
+	}
+	for _, piece := range propVerbRe.Split(s, -1) {
+		for _, run := range propRunRe.FindAllString(piece, -1) {
+			add(run)
+		}
+	}
+	sort.Slice(frags, func(a, b int) bool {
+		if len(frags[a]) != len(frags[b]) {
+			return len(frags[a]) > len(frags[b])
+		}
+		return frags[a] < frags[b]
+	})
+	if len(frags) > bundleFragMax {
+		frags = frags[:bundleFragMax]
+	}
+	return frags
+}
+
+// fragHit is one file's occurrence count for a fragment.
+type fragHit struct {
+	Path  string `json:"path"`
+	Count int    `json:"count"`
+}
+
+// fragmentSearch finds one exact fragment tree-wide (substring scan over the
+// chunk texts — the BM25 postings cannot express "this exact fragment", and no
+// new index is wanted). Returns per-file counts, top bundleFragFilesMax files.
+func fragmentSearch(db *DB, frag string) []fragHit {
+	byFile := map[string]int{}
+	for i := range db.Chunks {
+		c := &db.Chunks[i]
+		if c.Kind == "board" {
+			continue
+		}
+		if n := strings.Count(c.Text, frag); n > 0 {
+			byFile[c.Path] += n
+		}
+	}
+	out := make([]fragHit, 0, len(byFile))
+	for p, n := range byFile {
+		out = append(out, fragHit{Path: p, Count: n})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count != out[j].Count {
+			return out[i].Count > out[j].Count
+		}
+		return out[i].Path < out[j].Path
+	})
+	if len(out) > bundleFragFilesMax {
+		out = out[:bundleFragFilesMax]
+	}
+	return out
+}
+
+// ---------- import verdicts (per-language line patterns, NOT an AST) ----------
+
+type importVerdict struct {
+	Line    int    `json:"line"`
+	Stmt    string `json:"stmt"`
+	Verdict string `json:"verdict"` // internal | external | unresolved
+	Detail  string `json:"detail,omitempty"`
+}
+
+var (
+	goImportLineRe  = regexp.MustCompile(`^\s*import\s+(?:([A-Za-z_][\w.]*|\.\|\*)\s+)?"([^"]+)"\s*(//.*)?$`)
+	goImportOpenRe  = regexp.MustCompile(`^\s*import\s*\(`)
+	goBlockImportRe = regexp.MustCompile(`^\s*(?:([A-Za-z_][\w.]*|\.\|\*)\s+)?"([^"]+)"\s*(//.*)?$`)
+	javaImportRe    = regexp.MustCompile(`^\s*import\s+(static\s+)?([A-Za-z_][\w.]*)\s*;`)
+	jsFromImportRe  = regexp.MustCompile(`^\s*(?:import|export)\b.*?\bfrom\s+["']([^"']+)["']`)
+	jsRequireRe     = regexp.MustCompile(`\brequire\s*\(\s*["']([^"']+)["']\s*\)`)
+	pyImportRe      = regexp.MustCompile(`^\s*import\s+([\w.]+(?:\s*,\s*[\w.]+)*)`)
+	pyFromImportRe  = regexp.MustCompile(`^\s*from\s+([.\w*]+)\s+import\s+(.+)$`)
+)
+
+// importVerdicts scans the hit chunk's lines with the language's import pattern
+// (keyed by extension: Go, Java/Kotlin, JS/TS, Python) and resolves each
+// against the indexed file set. The verdict ladder is deliberately fail-closed
+// (plan §Design.3): internal requires a matching indexed file (shown, with the
+// matched suffix for module-style imports); external means "no indexed file
+// matches this deterministic mapping"; anything ambiguous (Python relative or
+// wildcard imports) is unresolved. Never a wrong verdict.
+func importVerdicts(db *DB, bf *bundleFiles, c Chunk) []importVerdict {
+	ext := strings.ToLower(filepath.Ext(baseOf(c.Path)))
+	lines := strings.Split(c.Text, "\n")
+	var out []importVerdict
+	add := func(lineIdx int, stmt, verdict, detail string) {
+		if len(out) >= bundleImportsMax {
+			return
+		}
+		out = append(out, importVerdict{Line: c.Start + lineIdx, Stmt: clip(stmt, 100), Verdict: verdict, Detail: detail})
+	}
+
+	// dirSuffixMatch: the longest suffix of the import's path segments that is a
+	// suffix of some indexed file's directory segments (Go module imports carry
+	// a module prefix the indexed paths do not, so suffix matching is the
+	// honest lexical rule; the matched suffix is reported for human judgment).
+	dirSuffixMatch := func(impSegs []string) (path, matched string) {
+		for n := len(impSegs); n >= 1; n-- {
+			suffix := impSegs[len(impSegs)-n:]
+			for _, f := range bf.names {
+				if segsSuffix(pathSegs(dirOf(f)), suffix) {
+					return f, strings.Join(suffix, "/")
+				}
+			}
+		}
+		return "", ""
+	}
+
+	switch ext {
+	case ".go":
+		inBlock := false
+		for li, raw := range lines {
+			t := strings.TrimSpace(raw)
+			if inBlock {
+				if t == ")" {
+					inBlock = false
+					continue
+				}
+				if strings.HasPrefix(t, "//") {
+					continue
+				}
+				if m := goBlockImportRe.FindStringSubmatch(t); m != nil && m[2] != "" {
+					if p, suf := dirSuffixMatch(pathSegs(m[2])); p != "" {
+						add(li, m[2], "internal", p+" (matched suffix \""+suf+"\")")
+					} else {
+						add(li, m[2], "external", "not-in-tree")
+					}
+				}
+				continue
+			}
+			if goImportOpenRe.MatchString(t) {
+				inBlock = true
+				continue
+			}
+			if m := goImportLineRe.FindStringSubmatch(raw); m != nil && m[2] != "" {
+				if p, suf := dirSuffixMatch(pathSegs(m[2])); p != "" {
+					add(li, m[2], "internal", p+" (matched suffix \""+suf+"\")")
+				} else {
+					add(li, m[2], "external", "not-in-tree")
+				}
+			}
+		}
+	case ".java", ".kt":
+		for li, raw := range lines {
+			m := javaImportRe.FindStringSubmatch(raw)
+			if m == nil || m[2] == "" {
+				continue
+			}
+			dotted := m[2]
+			segs := pathSegs(strings.ReplaceAll(dotted, ".", "/"))
+			if len(segs) == 0 {
+				add(li, dotted, "unresolved", "empty import path")
+				continue
+			}
+			base := segs[len(segs)-1]
+			dirPart := segs[:len(segs)-1]
+			var found string
+			for _, f := range bf.names {
+				fsegs := pathSegs(f)
+				if len(fsegs) < 2 {
+					continue
+				}
+				fdir, fbase := fsegs[:len(fsegs)-1], fsegs[len(fsegs)-1]
+				// class file in a directory whose tail matches the package part
+				if strings.EqualFold(fbase, base+".java") && segsSuffix(fdir, dirPart) {
+					found = f
+					break
+				}
+				// nested-class layout: the package directory includes the base
+				if segsSuffix(fdir, segs) && strings.HasSuffix(fbase, ".java") {
+					found = f
+					break
+				}
+			}
+			if found != "" {
+				add(li, dotted, "internal", found)
+			} else {
+				add(li, dotted, "external", "not-in-tree")
+			}
+		}
+	case ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs":
+		for li, raw := range lines {
+			var specs []string
+			if m := jsFromImportRe.FindStringSubmatch(raw); m != nil {
+				specs = append(specs, m[1])
+			}
+			for _, m := range jsRequireRe.FindAllStringSubmatch(raw, -1) {
+				specs = append(specs, m[1])
+			}
+			for _, spec := range specs {
+				if strings.HasPrefix(spec, "./") || strings.HasPrefix(spec, "../") {
+					target := dirOf(c.Path) + strings.TrimPrefix(strings.TrimPrefix(spec, "./"), "../")
+					cand := []string{target}
+					for _, e := range []string{".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"} {
+						cand = append(cand, target+e, target+"/index"+e)
+					}
+					var found string
+					for _, cc := range cand {
+						if bf.set[cc] {
+							found = cc
+							break
+						}
+					}
+					if found != "" {
+						add(li, spec, "internal", found)
+					} else {
+						add(li, spec, "external", "not-in-tree")
+					}
+				} else {
+					if p, suf := dirSuffixMatch(pathSegs(spec)); p != "" {
+						add(li, spec, "internal", p+" (matched suffix \""+suf+"\")")
+					} else {
+						add(li, spec, "external", "not-in-tree")
+					}
+				}
+			}
+		}
+	case ".py":
+		for li, raw := range lines {
+			if m := pyFromImportRe.FindStringSubmatch(raw); m != nil {
+				module, imports := m[1], m[2]
+				if strings.Contains(imports, "*") {
+					add(li, "from "+module+" import "+clip(imports, 40), "unresolved", "wildcard import")
+					continue
+				}
+				if strings.HasPrefix(module, ".") {
+					add(li, "from "+module+" import "+clip(imports, 40), "unresolved", "relative import")
+					continue
+				}
+				ms := pathSegs(strings.ReplaceAll(module, ".", "/")) // dotted module -> path segments
+				var names []string
+				for _, nm := range strings.Split(imports, ",") {
+					if f := strings.Fields(strings.TrimSpace(nm)); len(f) > 0 {
+						names = append(names, f[0]) // "x as y" -> x
+					}
+				}
+				var found string
+				for _, f := range bf.names {
+					fsegs := pathSegs(f)
+					if len(fsegs) < 2 {
+						continue
+					}
+					fdir, fbase := fsegs[:len(fsegs)-1], fsegs[len(fsegs)-1]
+					if (fbase == ms[len(ms)-1]+".py" && segsSuffix(fdir, ms[:len(ms)-1])) ||
+						(fbase == "__init__.py" && segsSuffix(fdir, ms)) {
+						found = f
+						break
+					}
+					for _, nm := range names {
+						if nm == "" {
+							continue
+						}
+						if (fbase == nm+".py" && segsSuffix(fdir, ms)) ||
+							(fbase == "__init__.py" && segsSuffix(fdir, append(append([]string{}, ms...), nm))) {
+							found = f
+							break
+						}
+					}
+					if found != "" {
+						break
+					}
+				}
+				stmt := "from " + module + " import " + clip(imports, 40)
+				if found != "" {
+					add(li, stmt, "internal", found)
+				} else {
+					add(li, stmt, "external", "not-in-tree")
+				}
+				continue
+			}
+			if m := pyImportRe.FindStringSubmatch(raw); m != nil {
+				for _, mod := range strings.Split(m[1], ",") {
+					mod = strings.TrimSpace(mod)
+					if mod == "" {
+						continue
+					}
+					ms := pathSegs(strings.ReplaceAll(mod, ".", "/")) // dotted module -> path segments
+					var found string
+					for _, f := range bf.names {
+						fsegs := pathSegs(f)
+						if len(fsegs) < 2 {
+							continue
+						}
+						fdir, fbase := fsegs[:len(fsegs)-1], fsegs[len(fsegs)-1]
+						if (fbase == ms[len(ms)-1]+".py" && segsSuffix(fdir, ms[:len(ms)-1])) ||
+							(fbase == "__init__.py" && segsSuffix(fdir, ms)) {
+							found = f
+							break
+						}
+					}
+					if found != "" {
+						add(li, "import "+mod, "internal", found)
+					} else {
+						add(li, "import "+mod, "external", "not-in-tree")
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// ---------- test-file pairing ----------
+
+// isTestFile applies the test naming conventions (plan §Design.4):
+// *Test.java, *_test.go, *.test.* / *.spec.*, test_*.py.
+func isTestFile(path string) bool {
+	base := baseOf(path)
+	switch {
+	case strings.HasSuffix(base, "Test.java"):
+		return true
+	case strings.HasSuffix(base, "_test.go"):
+		return true
+	case strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py"):
+		return true
+	}
+	ext := filepath.Ext(base)
+	if ext == "" {
+		return false
+	}
+	rest := strings.TrimSuffix(base, ext)
+	return strings.HasSuffix(rest, ".test") || strings.HasSuffix(rest, ".spec")
+}
+
+// testPairs finds indexed test files sharing identifiers with the hit (its
+// extracted identifiers plus the hit file's name stem — how bar.go finds
+// bar_test.go and X.java finds XTest.java).
+func testPairs(db *DB, bf *bundleFiles, c Chunk) []struct {
+	Path   string
+	Shared []string
+} {
+	var hitIdents []string
+	seen := map[string]bool{}
+	addIdent := func(s string) {
+		if !seen[s] && !identStopword[s] {
+			seen[s] = true
+			hitIdents = append(hitIdents, s)
+		}
+	}
+	if stem := strings.TrimSuffix(baseOf(c.Path), filepath.Ext(baseOf(c.Path))); len(stem) >= 3 {
+		addIdent(stem)
+	}
+	for _, id := range extractCandidates(c.Text) {
+		if len(id) >= 4 {
+			addIdent(id)
+		}
+	}
+	var out []struct {
+		Path   string
+		Shared []string
+	}
+	for _, p := range bf.names {
+		if !isTestFile(p) || p == c.Path {
+			continue
+		}
+		var shared []string
+		for _, id := range hitIdents {
+			ok := false
+			for _, ci := range bf.chunks[p] {
+				if strings.Contains(db.Chunks[ci].Text, id) {
+					ok = true
+					break
+				}
+			}
+			if ok {
+				shared = append(shared, id)
+			}
+		}
+		if len(shared) == 0 {
+			continue
+		}
+		if len(shared) > bundleTestSharedMax {
+			shared = shared[:bundleTestSharedMax]
+		}
+		out = append(out, struct {
+			Path   string
+			Shared []string
+		}{p, shared})
+		if len(out) >= bundleTestMax {
+			break
+		}
+	}
+	return out
+}
+
+// ---------- bundle rendering ----------
+
+// bundleChunk renders ONE hit's consolidated read pack (the four components,
+// each capped with an explicit truncation marker).
+func bundleChunk(db *DB, bf *bundleFiles, c Chunk) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "== %s:%d-%d [%s] ==\n\n", c.Path, c.Start, c.End, c.Kind)
+
+	// 1) package neighborhood
+	hitDir := dirOf(c.Path)
+	var sibs []string
+	for _, p := range bf.names {
+		if dirOf(p) == hitDir {
+			sibs = append(sibs, p)
+		}
+	}
+	sort.Strings(sibs)
+	shown := sibs
+	if len(shown) > bundleNeighborhood {
+		shown = shown[:bundleNeighborhood]
+	}
+	b.WriteString("neighborhood (" + strconv.Itoa(len(sibs)) + " file(s) in " + hitDir + "):\n")
+	for _, p := range shown {
+		marker := "  "
+		if p == c.Path {
+			marker = "* "
+		}
+		fmt.Fprintf(&b, "%s%s  %s\n", marker, p, fileSummary(db, bf, p))
+	}
+	if len(sibs) > bundleNeighborhood {
+		fmt.Fprintf(&b, "  …truncated (showing %d of %d files)\n", bundleNeighborhood, len(sibs))
+	}
+	b.WriteString("\n")
+
+	// 2) propagation (stable-fragment search of the hit's literals/identifiers)
+	cands := extractCandidates(c.Text)
+	b.WriteString("propagation (literals/identifiers searched tree-wide):\n")
+	if len(cands) == 0 {
+		b.WriteString("  (no candidates)\n")
+	}
+	for _, cand := range cands {
+		frags := stableFragments(cand)
+		label := "  candidate " + strconv.Quote(cand)
+		if len(frags) == 0 {
+			fmt.Fprintf(&b, "%s — too short to propagate\n", label)
+			continue
+		}
+		fmt.Fprintf(&b, "%s:\n", label)
+		hitAny := false
+		for _, frag := range frags {
+			files := fragmentSearch(db, frag)
+			if len(files) == 0 {
+				continue
+			}
+			hitAny = true
+			fmt.Fprintf(&b, "    fragment %q — %d file(s):\n", frag, len(files))
+			for _, f := range files {
+				fmt.Fprintf(&b, "      %s (%d)\n", f.Path, f.Count)
+			}
+		}
+		if !hitAny {
+			fmt.Fprintf(&b, "    — no occurrences anywhere (tried fragment(s): %s)\n", strings.Join(frags, ", "))
+		}
+	}
+	b.WriteString("\n")
+
+	// 3) import verdicts
+	imps := importVerdicts(db, bf, c)
+	b.WriteString("imports: " + strconv.Itoa(len(imps)) + " statement(s)\n")
+	for _, iv := range imps {
+		fmt.Fprintf(&b, "  L%d  %s  ->  %s", iv.Line, iv.Stmt, iv.Verdict)
+		if iv.Detail != "" {
+			fmt.Fprintf(&b, "  (%s)", iv.Detail)
+		}
+		b.WriteString("\n")
+	}
+	if len(imps) == 0 {
+		b.WriteString("  (none detected, or no supported import syntax in this file)\n")
+	}
+	b.WriteString("\n")
+
+	// 4) test pairing
+	pairs := testPairs(db, bf, c)
+	b.WriteString("tests: " + strconv.Itoa(len(pairs)) + " paired test file(s)\n")
+	for _, p := range pairs {
+		fmt.Fprintf(&b, "  %s — shared: %s\n", p.Path, strings.Join(p.Shared, ", "))
+	}
+	if len(pairs) == 0 {
+		b.WriteString("  (none found sharing identifiers with the hit)\n")
+	}
+	return b.String()
+}
+
+// bundleForQuery searches (hybrid, k hits) and renders each hit's pack.
+func bundleForQuery(db *DB, q string, k int) string {
+	if k <= 0 {
+		k = bundleDefaultHits
+	}
+	if k > bundleMaxHits {
+		k = bundleMaxHits
+	}
+	res, err := db.Search(q, k, "", "", 0, false, ModeHybrid)
+	if err != nil {
+		// Backend mismatch (e.g. remote embedder configured at build time):
+		// degrade to keyword-only so the bundle is still useful lexically.
+		res, err = db.Search(q, k, "", "", 0, false, ModeKeyword)
+		if err != nil {
+			return "bundle: search failed: " + err.Error() + "\n"
+		}
+	}
+	bf := newBundleFiles(db)
+	var b strings.Builder
+	fmt.Fprintf(&b, "bundle for query %q: %d hit(s)\n\n", q, len(res))
+	if len(res) == 0 {
+		b.WriteString("(no hits — try kb_terms to check whether the identifier exists at all)\n")
+		return b.String()
+	}
+	for i, r := range res {
+		fmt.Fprintf(&b, "-- hit %d/%d (score %.4f) --\n", i+1, len(res), r.Score)
+		b.WriteString(bundleChunk(db, bf, r.C))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// parseTarget splits "file:line" (line optional: the last colon before digits).
+func parseTarget(target string) (file string, line int) {
+	i := strings.LastIndexByte(target, ':')
+	if i > 0 {
+		if n, err := strconv.Atoi(target[i+1:]); err == nil && n > 0 {
+			return target[:i], n
+		}
+	}
+	return target, 0
+}
+
+// findChunkForTarget locates the chunk for a file:line reference: exact path
+// first, then suffix match (either direction), then basename; among candidates,
+// the chunk whose [Start,End] contains the line (else the nearest).
+func findChunkForTarget(db *DB, file string, line int) (*Chunk, bool) {
+	type cand struct {
+		idx  int
+		dist int
+	}
+	var cands []cand
+	add := func(i int) {
+		c := &db.Chunks[i]
+		d := 0
+		if line > 0 {
+			if c.Start <= line && line <= c.End {
+				d = 0
+			} else if line < c.Start {
+				d = c.Start - line
+			} else {
+				d = line - c.End
+			}
+		}
+		cands = append(cands, cand{i, d})
+	}
+	for i := range db.Chunks {
+		if db.Chunks[i].Path == file {
+			add(i)
+		}
+	}
+	if len(cands) == 0 {
+		for i := range db.Chunks {
+			p := db.Chunks[i].Path
+			if strings.HasSuffix(p, "/"+file) || strings.HasSuffix(file, "/"+p) ||
+				baseOf(p) == file || baseOf(file) == baseOf(p) {
+				add(i)
+			}
+		}
+	}
+	if len(cands) == 0 {
+		return nil, false
+	}
+	best := cands[0]
+	for _, c := range cands[1:] {
+		if c.dist < best.dist {
+			best = c
+		}
+	}
+	return &db.Chunks[best.idx], true
+}
+
+// bundleForTarget renders the pack for a known file:line location (the first
+// form of the feature — no query involved).
+func bundleForTarget(db *DB, target string) (string, bool) {
+	file, line := parseTarget(target)
+	c, ok := findChunkForTarget(db, file, line)
+	if !ok {
+		return "bundle: no indexed file matches " + file + " — use search_codebase or list_files first", false
+	}
+	bf := newBundleFiles(db)
+	var b strings.Builder
+	if line > 0 {
+		fmt.Fprintf(&b, "bundle for location %s:%d\n\n", c.Path, line)
+	} else {
+		fmt.Fprintf(&b, "bundle for location %s\n\n", c.Path)
+	}
+	b.WriteString(bundleChunk(db, bf, *c))
+	return b.String(), true
+}
+
 // ---------- message board (see plans/message-board-plan.md) ----------
 //
 // A signed, append-only, multi-thread collaboration board for AI agents. It is
@@ -2594,6 +3660,39 @@ func toolSchemas() []mcpTool {
 					"path":  map[string]any{"type": "string", "description": "Filter by path substring."},
 					"kind":  map[string]any{"type": "string", "description": "Filter by kind: code|doc|text|commit|diff."},
 					"limit": map[string]any{"type": "integer", "description": "Max files (default 200)."},
+				},
+			},
+		},
+		{
+			Name: "kb_terms",
+			Description: "COMPLETE occurrence census of one exact identifier or string across ALL indexed sources: per-file " +
+				"occurrence counts plus representative lines. Use it for presence/ABSENCE checks — 'X does not exist in the " +
+				"tree' is a citable result, not an inference: a zero-hit census is distinct from 'present but didn't rank' " +
+				"in a search. Required: term. Optional: k (max files shown, default 20), json (machine-readable result).",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"term": map[string]any{"type": "string", "description": "Exact identifier or string to census (case-sensitive substring match)."},
+					"k":    map[string]any{"type": "integer", "description": "Max files to show (default 20; the true total is always reported)."},
+					"json": map[string]any{"type": "boolean", "description": "Return the machine-readable JSON result instead of text."},
+				},
+				"required": []string{"term"},
+			},
+		},
+		{
+			Name: "kb_bundle",
+			Description: "Context-bundle expansion: for a known location (target 'file:line', as reported by search_codebase) " +
+				"or the top hits of a query (q), emit one consolidated read pack per hit following the code's own written " +
+				"pointers: package neighborhood (sibling files + one-line summary), tree-wide literal/identifier propagation " +
+				"(stable-fragment match, so constructed strings surface), import verdicts (internal / external not-in-tree / " +
+				"unresolved — never a wrong verdict), and paired test files. Provide target OR q. Optional: k (hits to bundle, " +
+				"default 3).",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"target": map[string]any{"type": "string", "description": "Location to expand: 'file:line' (file path as from search_codebase, 1-based line)."},
+					"q":      map[string]any{"type": "string", "description": "Query text: expand the top hits of this search instead of a fixed location."},
+					"k":      map[string]any{"type": "integer", "description": "Hits to bundle when q is used (default 3, max 8)."},
 				},
 			},
 		},
@@ -3784,6 +4883,10 @@ func (tb *Toolbox) executeRaw(name string, args json.RawMessage) (string, bool) 
 		Repo    string             `json:"repo"`
 		N       int                `json:"n"`
 		Author  string             `json:"author"`
+		// kb_terms / kb_bundle (plans/context-bundle-plan.md)
+		Term   string `json:"term"`
+		Target string `json:"target"`
+		Json   bool   `json:"json"`
 	}
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &a); err != nil {
@@ -3795,6 +4898,27 @@ func (tb *Toolbox) executeRaw(name string, args json.RawMessage) (string, bool) 
 		return "knowledge base not loaded", true
 	}
 	switch name {
+	case "kb_terms":
+		if a.Term == "" {
+			return "missing required argument 'term'", true
+		}
+		r := termsCensus(db, a.Term, a.K)
+		if a.Json {
+			return string(mustMarshal(r)), false
+		}
+		return renderTerms(r), false
+	case "kb_bundle":
+		if a.Target == "" && a.Q == "" {
+			return "provide 'target' (file:line) or 'q' (query text)", true
+		}
+		if a.Target != "" {
+			out, ok := bundleForTarget(db, a.Target)
+			if !ok {
+				return out, true
+			}
+			return out, false
+		}
+		return bundleForQuery(db, a.Q, a.K), false
 	case "search_codebase":
 		if a.Q == "" {
 			return "missing required argument 'q'", true
@@ -6179,6 +7303,121 @@ func doBuild(a []string) {
 	}
 }
 
+// oneShotToolbox loads the at-rest store (plain or encrypted; key resolved from
+// -db-key-env / -db-key-file, or prompted when the store is encrypted) and returns
+// a ready Toolbox over the indexed DB. Shared by the one-shot CLI commands
+// (query, terms, bundle, call) so the direct-DB access path behaves identically.
+func oneShotToolbox(dbp, keyEnv, keyFile string) (*Toolbox, error) {
+	st, err := openStore(dbp, keyEnv, keyFile, true, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.checkConsistency(); err != nil {
+		return nil, err
+	}
+	if len(st.dbBytes) == 0 {
+		return nil, fmt.Errorf("no daemon running and no db at %s; run 'kbtool build .' first", dbp)
+	}
+	db, err := st.db()
+	if err != nil {
+		return nil, err
+	}
+	tb := newToolbox(db, nil)
+	tb.Store = st
+	return tb, nil
+}
+
+// doTerms implements `kbtool terms <term> [-k N] [-json]` — the citable
+// absence/presence census (plans/context-bundle-plan.md). Exit codes:
+// 0 = present, 3 = ABSENT in indexed sources, 1 = error.
+func doTerms(a []string) {
+	a = flagFirst(a, map[string]bool{"k": true, "db": true, "db-key-env": true, "db-key-file": true})
+	fs := flag.NewFlagSet("terms", flag.ExitOnError)
+	k := fs.Int("k", termsDefaultMaxFiles, "max files to show (the true total is always reported)")
+	jsonOut := fs.Bool("json", false, "machine-readable JSON output")
+	dbp := fs.String("db", defaultDB(), "db file (used when daemon is down; default: config db)")
+	keyEnv := fs.String("db-key-env", "", "DB-at-rest key from environment variable $NAME (when the store is encrypted)")
+	keyFile := fs.String("db-key-file", "", "DB-at-rest key from file PATH (when the store is encrypted)")
+	fs.Parse(a)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: kbtool terms <identifier-or-string> [-k N] [-json]")
+		os.Exit(2)
+	}
+	term := strings.Join(fs.Args(), " ")
+	args := mustMarshal(map[string]any{"term": term, "k": *k, "json": true})
+
+	var text string
+	var isErr bool
+	if ex, sock, ok := liveDaemon(); ok {
+		text, isErr = ex.Execute("kb_terms", args)
+		fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
+	} else {
+		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
+		if err != nil {
+			fatal(err)
+		}
+		text, isErr = tb.Execute("kb_terms", args)
+	}
+	if isErr {
+		fmt.Fprintln(os.Stderr, appName+": "+text)
+		os.Exit(1)
+	}
+	var r termsResult
+	if err := json.Unmarshal([]byte(text), &r); err != nil {
+		fmt.Fprintln(os.Stderr, text)
+		os.Exit(1)
+	}
+	if *jsonOut {
+		out, _ := json.MarshalIndent(r, "", "  ")
+		fmt.Println(string(out))
+	} else {
+		fmt.Print(renderTerms(&r))
+	}
+	if !r.Present {
+		os.Exit(3) // distinct, scriptable absence result (0 = present, 1 = error)
+	}
+}
+
+// doBundle implements `kbtool bundle <file:line>` / `kbtool bundle -q QUERY`
+// — context-bundle expansion of a known location or a query's top hits
+// (plans/context-bundle-plan.md).
+func doBundle(a []string) {
+	a = flagFirst(a, map[string]bool{"q": true, "k": true, "db": true, "db-key-env": true, "db-key-file": true})
+	fs := flag.NewFlagSet("bundle", flag.ExitOnError)
+	q := fs.String("q", "", "query text: bundle the top hits of this search (instead of a file:line target)")
+	k := fs.Int("k", bundleDefaultHits, "hits to bundle when -q is used (default 3, max 8)")
+	dbp := fs.String("db", defaultDB(), "db file (used when daemon is down; default: config db)")
+	keyEnv := fs.String("db-key-env", "", "DB-at-rest key from environment variable $NAME (when the store is encrypted)")
+	keyFile := fs.String("db-key-file", "", "DB-at-rest key from file PATH (when the store is encrypted)")
+	fs.Parse(a)
+	target := strings.Join(fs.Args(), " ")
+	if *q == "" && target == "" {
+		fmt.Fprintln(os.Stderr, "usage: kbtool bundle <file:line> | kbtool bundle -q \"query text\" [-k N]")
+		os.Exit(2)
+	}
+	if *q != "" && target != "" {
+		fatal(errors.New("bundle: give a file:line target OR -q, not both"))
+	}
+	args := mustMarshal(map[string]any{"target": target, "q": *q, "k": *k})
+	var text string
+	var isErr bool
+	if ex, sock, ok := liveDaemon(); ok {
+		text, isErr = ex.Execute("kb_bundle", args)
+		fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
+	} else {
+		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
+		if err != nil {
+			fatal(err)
+		}
+		text, isErr = tb.Execute("kb_bundle", args)
+	}
+	if isErr {
+		fmt.Fprintln(os.Stderr, text)
+		os.Exit(1)
+	}
+	fmt.Println(text)
+}
+
 func printResults(res []Result, full bool) {
 	if len(res) == 0 {
 		fmt.Println("no matches")
@@ -6210,6 +7449,7 @@ func doQuery(a []string) {
 	mode := fs.String("mode", ModeHybrid, "search mode: hybrid|vector|keyword|weighted (default hybrid)")
 	kwW := fs.Float64("kw-w", defWKeyword, "keyword weight for -mode weighted (default 0.6)")
 	vecW := fs.Float64("vec-w", defWVector, "vector weight for -mode weighted (default 0.4)")
+	bundle := fs.Bool("bundle", false, "expand each top hit into a context bundle (neighborhood, propagation, imports, tests) instead of listing snippets")
 	dbp := fs.String("db", defaultDB(), "db file (used when daemon is down; default: config db)")
 	keyEnv := fs.String("db-key-env", "", "DB-at-rest key from environment variable $NAME (when the store is encrypted)")
 	keyFile := fs.String("db-key-file", "", "DB-at-rest key from file PATH (when the store is encrypted)")
@@ -6219,6 +7459,33 @@ func doQuery(a []string) {
 		os.Exit(2)
 	}
 	q := strings.Join(fs.Args(), " ")
+
+	// -bundle (plans/context-bundle-plan.md): the same kb_bundle tool serves both
+	// access paths, so the expansion is identical via daemon or direct DB.
+	if *bundle {
+		args := mustMarshal(map[string]any{"q": q, "k": *k})
+		if ex, sock, ok := liveDaemon(); ok {
+			text, isErr := ex.Execute("kb_bundle", args)
+			if isErr {
+				fmt.Fprintln(os.Stderr, text)
+				os.Exit(1)
+			}
+			fmt.Println(text)
+			fmt.Fprintf(os.Stderr, "(via daemon: %s)\n", sock)
+			return
+		}
+		tb, err := oneShotToolbox(*dbp, *keyEnv, *keyFile)
+		if err != nil {
+			fatal(err)
+		}
+		text, isErr := tb.Execute("kb_bundle", args)
+		if isErr {
+			fmt.Fprintln(os.Stderr, text)
+			os.Exit(1)
+		}
+		fmt.Println(text)
+		return
+	}
 
 	// Prefer the daemon when it is up.
 	if ex, sock, ok := liveDaemon(); ok {
@@ -7663,11 +8930,26 @@ Usage:
         -db-key-file PATH      DB-at-rest key from file PATH: write the store ENCRYPTED
         -encrypt               prompt for a DB-at-rest key (hidden input); ENCRYPTED store
   kbtool query "text" [-k N] [-min f] [-full] [-path sub] [-kind code|doc|text|commit|diff]
-                       [-mode hybrid|vector|keyword|weighted] [-kw-w F] [-vec-w F]
+                       [-mode hybrid|vector|keyword|weighted] [-kw-w F] [-vec-w F] [-bundle]
                        [-db-key-env NAME | -db-key-file PATH]
         -mode                  hybrid (default) = BM25+vector rank fusion; vector = dense only;
                                keyword = BM25 only; weighted = weighted fusion
         -kw-w / -vec-w         fusion weights for -mode weighted (default 0.6 / 0.4)
+        -bundle                expand each top hit into a context bundle instead of listing snippets
+  kbtool terms <term> [-k N] [-json] [-db PATH]
+                       [-db-key-env NAME | -db-key-file PATH]
+        COMPLETE occurrence census of an exact identifier/string across the
+        indexed source: per-file counts + representative lines. Absence is a
+        citable result (distinct from 'present but didn't rank').
+        Exit codes: 0 = present, 3 = ABSENT in indexed sources, 1 = error.
+  kbtool bundle <file:line> | -q "query text" [-k N] [-db PATH]
+                       [-db-key-env NAME | -db-key-file PATH]
+        Context-bundle expansion: for a location (or a query's top hits) one
+        consolidated read pack per hit — package neighborhood (sibling files +
+        one-line summary), tree-wide literal/identifier propagation (stable
+        fragments, so constructed strings surface), import verdicts (internal /
+        external not-in-tree / unresolved — never a wrong verdict), and paired
+        test files. See also: kbtool query "text" -bundle.
   kbtool bench -db PATH [-n N] [-mode M] [-db-key-env NAME | -db-key-file PATH]
                                in-process query benchmark (min/p50/p95/max)
   kbtool tools [-qwen]
@@ -7710,7 +8992,8 @@ MCP tools — enabled/disabled by options in config.json (plans/new-tool-options
     honored, even over the group options: add a name (even a core one) to disable
     it, remove it to re-enable; [] disables nothing (default ["kb_status", "board_sign"]).
   • A tool is served when its group option is on AND its name is not in
-    disable_tools. Enabled by default: search_codebase, get_chunk, list_files.
+    disable_tools. Enabled by default: search_codebase, get_chunk, list_files,
+    kb_terms, kb_bundle.
   • Path trust (plans/constrain-file-ops-to-trusted-paths-plan.md): the git tools
     (git_blame/git_log) may read only inside the trusted set = -live repos +
     indexed git sources + trusted_paths (config). forbidden_paths (config)
@@ -7837,6 +9120,10 @@ func main() {
 		doBuild(rest)
 	case "query", "search":
 		doQuery(rest)
+	case "terms":
+		doTerms(rest)
+	case "bundle":
+		doBundle(rest)
 	case "bench":
 		doBench(rest)
 	case "tools":
