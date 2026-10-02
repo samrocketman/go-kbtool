@@ -5,6 +5,10 @@ can be shared over the network with mutual TLS, and point the local CLI at
 the new setup.
 
 ```sh
+# Defaults: every interface IP (not link-local), the hostname, and
+# host.docker.internal:
+kbtool mtls
+
 # By DNS name (portable to other machines that resolve it):
 kbtool mtls -dns kb.example.net
 
@@ -20,10 +24,13 @@ kbtool mtls -dns kb.example.net -expire 720h
 
 # Now serve with it:
 kbtool daemon start -http -mtls
+
+# Daemon behind NAT: certificates for a relay instead (see relay-simple.md):
+kbtool mtls -relay https://relay.example.net:9876/
 ```
 
 Many clients may share one client certificate (e.g. a dozen friends importing
-one `kbtool client -export` bundle) — that is allowed by design; revoke it via
+with the same `kbtool client -import` line) — that is allowed by design; revoke it via
 the CRL if you need to cut them all off.
 
 What it does:
@@ -32,8 +39,10 @@ What it does:
   `client.key` under the state dir (`~/.config/kbtool`).
 - Records `http: true`, `mtls: true` (and the bind address for a single `-ip`)
   in `config.json`.
-- Writes `client.json`, so the local CLI immediately uses the mTLS endpoint.
-- Share the client side with a friend via
-  `kbtool client -export` — see [client-simple.md](client-simple.md).
+- Writes no `client.json`: this host's CLI keeps using the daemon's unix
+  socket (over mTLS). It prints the endpoints remote clients will reach.
+- Prints the CA fingerprint. Once the daemon runs with `-http -mtls`, it
+  prints a one-line `kbtool client -import …` for other machines — see
+  [client-simple.md](client-simple.md).
 
 Full reference: [mtls.md](mtls.md) · back to [README](../README.md)

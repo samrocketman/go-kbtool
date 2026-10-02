@@ -25,7 +25,8 @@ kbtool status [-db-key-env NAME | -db-key-file PATH]
 | `disabled tools:` | The effective disabled set (list ∪ group-off tools). |
 | `path trust:` | `trusted_paths`, `forbidden_paths` and the rule: git tools read only `-live` repos + indexed git sources + `trusted_paths`; `forbidden_paths` always wins. |
 | `network:` | `http`, `mtls`, `insecure`, bind address (default shown: `127.0.0.1:9876` without mTLS, `:9876` with), CRL file (exists + refresh mode). "unix socket only" when no network is configured. |
-| `client:` | The endpoint from `client.json` (unix socket, or `http(s)://host:port (mtls)`) — or "no client.json". |
+| `relay:` | Only in relay mode: `relay_url`, `relay_session` and whether a token is set ([relay.md](relay.md)). |
+| `client:` | On a daemon host: that its CLI uses the unix socket only (plus a note about a leftover `client.json`). On a remote client, status shows the `client.json` endpoint (`https://host:port`, plus the relay session) and whether it is reachable instead of the local sections. |
 | `board:` | Thread/message/agent counts (when a board is present). |
 | `daemon:` / `mcp:` | Running (pid + socket) or stopped, per service. |
 

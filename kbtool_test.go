@@ -29,21 +29,52 @@ package main
 //  25. terms census + context bundle (plans/context-bundle-plan.md)
 //  26. mTLS IP connectivity: SAN parsing/verification, error surfacing,
 //     multi-host failover, shared client certs (plans/mtls-ip-connectivity-fix-plan.md)
+//  27. mTLS client-only endpoint: no local sockets, no local db/board fallback
+//     (plans/mtls-client-only-endpoint-plan.md)
+//  28. message board HTML dump: embedded template, escaping, read-only export,
+//     board/export API (plans/message-board-html-dump-plan.md)
+//  29. message board attachments: streaming tar.gz, hostile archives, signed
+//     digests, safe collect/extract, CLI attach/fetch
+//     (plans/message-board-attachments-plan.md)
+//  30. message board memory limit: value parsing, flag > config > default,
+//     refused growth (plans/message-board-memory-limit-plan.md)
+//  31. mTLS client bootstrap: one port for plain HTTP / TLS / mTLS, fingerprint,
+//     per-request encrypted bundle, one-line import (plans/mtls-client-bootstrap-plan.md)
+//  32. kbtool mtls default SANs: interface IPs, hostname, host.docker.internal;
+//     daemon logs one enrollment entry per SAN endpoint
+//     (plans/mtls-default-sans-plan.md, plans/daemon-enrollment-log-per-san-plan.md)
+//  33. mTLS implies HTTP on all interfaces (plans/mtls-implies-http-plan.md)
+//  34. mTLS relay: SNI routing, registration, splice, limits, enrollment and
+//     calls through the relay, relay CLI (plans/mtls-relay-plan.md)
+//  35. PBKDF2 cost: clients pay 600k iterations once, the server derives once
+//     (plans/pbkdf2-derive-once-plan.md)
 //
 // All tests use only the standard library and run hermetically (temp dirs,
 // no network). Git-dependent tests are skipped when git is absent.
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"math/big"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -52,8 +83,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -2652,8 +2686,8 @@ func TestQwenToolsShape(t *testing.T) {
 
 func TestToolSchemasWellFormed(t *testing.T) {
 	tools := toolSchemas()
-	if len(tools) != 16 {
-		t.Fatalf("got %d tools, want 16", len(tools))
+	if len(tools) != 17 {
+		t.Fatalf("got %d tools, want 17", len(tools))
 	}
 	seen := map[string]bool{}
 	for _, tool := range tools {
@@ -2666,7 +2700,7 @@ func TestToolSchemasWellFormed(t *testing.T) {
 		seen[tool.Name] = true
 	}
 	// Required tools present.
-	for _, want := range []string{"search_codebase", "board_signup", "board_read", "git_blame", "git_log", "kb_status", "kb_terms", "kb_bundle"} {
+	for _, want := range []string{"search_codebase", "board_signup", "board_read", "board_fetch", "git_blame", "git_log", "kb_status", "kb_terms", "kb_bundle"} {
 		if !seen[want] {
 			t.Fatalf("missing tool %s", want)
 		}
@@ -3333,6 +3367,7 @@ func TestExecuteNilDB(t *testing.T) {
 
 func TestExecuteRawSearchCodebase(t *testing.T) {
 	t.Setenv("KB_EMBED_URL", "")
+	t.Setenv("KBTOOL_DIR", t.TempDir()) // refreshBoard locks the default board path
 	tb := &Toolbox{DB: searchSetup(t)}
 	out, isErr := tb.Execute("search_codebase", mustMarshal(map[string]any{"q": "token bucket limiter", "k": 3}))
 	if isErr {
@@ -3348,6 +3383,7 @@ func TestExecuteRawSearchCodebase(t *testing.T) {
 
 func TestExecuteRawGetChunk(t *testing.T) {
 	t.Setenv("KB_EMBED_URL", "")
+	t.Setenv("KBTOOL_DIR", t.TempDir()) // refreshBoard locks the default board path
 	chunks := []Chunk{
 		{Path: "a", Kind: "code", Text: "first"},
 		{Path: "b", Kind: "code", Text: "second"},
@@ -3377,6 +3413,7 @@ func TestExecuteRawGetChunk(t *testing.T) {
 
 func TestExecuteRawListFiles(t *testing.T) {
 	t.Setenv("KB_EMBED_URL", "")
+	t.Setenv("KBTOOL_DIR", t.TempDir()) // refreshBoard locks the default board path
 	chunks := []Chunk{
 		{Path: "repo/src/a.go", Kind: "code"},
 		{Path: "repo/src/b.go", Kind: "code"},
@@ -3813,48 +3850,20 @@ func TestEndpointFromClientConfigEmpty(t *testing.T) {
 	}
 }
 
-func TestEnsureClientConfig(t *testing.T) {
+// TestRemoveLeftoverClientConfig: why — a daemon host talks to its daemon over
+// the unix socket only, so a client.json an older version wrote there is
+// removed (plans/host-socket-cli-and-live-reindex-plan.md); without one,
+// nothing happens.
+func TestRemoveLeftoverClientConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("KBTOOL_DIR", dir)
-	path, created := ensureClientConfig(true, false, "0.0.0.0:8080", "")
-	if !created {
-		t.Fatal("should create")
-	}
-	if !fileExists(path) {
-		t.Fatal("file missing")
-	}
-	// Second call: no overwrite.
-	if _, created := ensureClientConfig(true, false, "0.0.0.0:8081", ""); created {
-		t.Fatal("should not overwrite")
-	}
-	// Verify the written config.
-	cc, err := loadClientConfig()
-	if err != nil {
+	removeLeftoverClientConfig()
+	if err := saveClientConfig(&clientConfig{Version: 1, Host: "127.0.0.1", Port: 9876, TLS: true}); err != nil {
 		t.Fatal(err)
 	}
-	if cc.Host != "127.0.0.1" || cc.Port != 8080 {
-		t.Fatalf("got %+v", cc)
-	}
-}
-
-func TestEnsureClientConfigFromArgs(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("KBTOOL_DIR", dir)
-	// No http/mtls args → nothing created.
-	if path, created := ensureClientConfigFromArgs([]string{}, "/sock"); created || path != "" {
-		t.Fatalf("should not create: (%q,%v)", path, created)
-	}
-	// -http → creates.
-	path, created := ensureClientConfigFromArgs([]string{"-http", "-bind", "0.0.0.0:7777"}, "/sock")
-	if !created || path == "" {
-		t.Fatalf("should create: path=%q created=%v", path, created)
-	}
-	cc, err := loadClientConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cc.Port != 7777 {
-		t.Fatalf("port = %d", cc.Port)
+	removeLeftoverClientConfig()
+	if fileExists(clientConfigPath()) {
+		t.Fatal("a leftover client.json must be removed")
 	}
 }
 
@@ -4092,7 +4101,7 @@ func TestWeightedFuseZeroScores(t *testing.T) {
 
 // ---------- 22. documentation link consistency (README + docs/) ----------
 
-var docSubcommands = []string{"build", "query", "terms", "bundle", "bench", "tools", "call", "mcp", "daemon", "mtls", "client", "status"}
+var docSubcommands = []string{"build", "query", "terms", "bundle", "bench", "tools", "call", "mcp", "daemon", "mtls", "client", "relay", "status", "board"}
 
 // mdLinks extracts the relative markdown link targets of a doc. Fenced code
 // blocks are stripped first (shell/JSON examples must not count as links);
@@ -4982,7 +4991,8 @@ func TestMtlsSANArgParsing(t *testing.T) {
 		{"unknown flag errors", []string{"-bogus", "x"}, nil, nil, 0, "unknown flag"},
 		{"-expire without value errors", []string{"-ip", "10.0.0.1", "-expire"}, nil, nil, 0, "needs a value"},
 		{"bad duration errors", []string{"-ip", "10.0.0.1", "-expire", "soon"}, nil, nil, 0, "duration"},
-		{"no SANs errors", []string{}, nil, nil, 0, "at least one"},
+		{"no SANs parses empty (defaults applied by doMtls)", []string{}, nil, nil, 24 * time.Hour, ""},
+		{"-expire only parses empty", []string{"-expire", "48h"}, nil, nil, 48 * time.Hour, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -5241,8 +5251,8 @@ func TestClientConfigHostsFailover(t *testing.T) {
 // loopback only, skipped without the go toolchain):
 //   - `mtls` with a space-separated multi-SAN list issues a cert carrying ALL of
 //     them (D1) and a usable client.json (D3/D4);
-//   - a client-only state dir (bundle import, no DB) connects to the mTLS
-//     daemon BY IP;
+//   - a client-only state dir (enrolled with the daemon's printed
+//     `client -import` line, no DB) connects to the mTLS daemon BY IP;
 //   - twelve concurrent clients sharing the SAME client cert all succeed (D6:
 //     sharing is allowed by design — TLS has no per-cert uniqueness).
 func TestMtlsSharedClientCertE2E(t *testing.T) {
@@ -5271,8 +5281,9 @@ func TestMtlsSharedClientCertE2E(t *testing.T) {
 
 	// D1 regression: space-separated SAN list (would have silently dropped
 	// 127.0.0.2 and -dns under the old parser).
-	if out, err := run(srvEnv, "mtls", "-ip", "127.0.0.1", "127.0.0.2", "-dns", "kbtool.test"); err != nil {
-		t.Fatalf("mtls: %v\n%s", err, out)
+	mtlsOut, err := run(srvEnv, "mtls", "-ip", "127.0.0.1", "127.0.0.2", "-dns", "kbtool.test")
+	if err != nil {
+		t.Fatalf("mtls: %v\n%s", err, mtlsOut)
 	}
 	// The ISSUED cert must carry every requested SAN (D2's guard, through the CLI).
 	b, err := os.ReadFile(filepath.Join(srvDir, "server.crt"))
@@ -5290,13 +5301,10 @@ func TestMtlsSharedClientCertE2E(t *testing.T) {
 	if err := verifyCertSANs(cert, []string{"127.0.0.1", "127.0.0.2"}, []string{"kbtool.test"}); err != nil {
 		t.Fatalf("issued cert missing requested SANs: %v", err)
 	}
-	// client.json must be usable: non-empty host + every SAN endpoint (D3/D4).
-	cj := clientConfig{}
-	if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "client.json")), &cj); err != nil {
-		t.Fatal(err)
-	}
-	if cj.Host == "" || len(cj.Hosts) != 3 || !cj.TLS {
-		t.Fatalf("client.json not usable: %+v", cj)
+	// Remote clients reach every SAN endpoint (D3/D4); the host itself keeps no
+	// client.json (plans/host-socket-cli-and-live-reindex-plan.md).
+	if fileExists(filepath.Join(srvDir, "client.json")) || !strings.Contains(mtlsOut, "remote client endpoints (one enrollment line each): kbtool.test, 127.0.0.1, 127.0.0.2") {
+		t.Fatalf("mtls must list every SAN endpoint for remote clients and write no host client.json:\n%s", mtlsOut)
 	}
 
 	// Fixture DB so the daemon has something to serve.
@@ -5312,48 +5320,59 @@ func TestMtlsSharedClientCertE2E(t *testing.T) {
 	port := freePort(t)
 	daemon := exec.Command(bin, "daemon", "run", "-http", "-mtls", "-bind", fmt.Sprintf("127.0.0.1:%d", port), "-db", dbPath)
 	daemon.Env = srvEnv
-	var logBuf bytes.Buffer
-	daemon.Stdout = &logBuf
-	daemon.Stderr = &logBuf
+	logPath := filepath.Join(work, "daemon.log")
+	logF, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logF.Close()
+	daemon.Stdout = logF
+	daemon.Stderr = logF
 	if err := daemon.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = daemon.Process.Kill(); _, _ = daemon.Process.Wait() }()
-	// Wait for the TLS port to accept.
-	up := false
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
-			_ = c.Close()
-			up = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !up {
-		_ = daemon.Process.Kill()
-		t.Fatalf("daemon port never came up; log:\n%s", logBuf.String())
-	}
+	// Wait for the boot line (printed once the port is bound).
+	line := waitImportLine(t, logPath, "https://127.0.0.1:", 15*time.Second)
 
-	// Friend's machine: client-only dir (no DB), bundle import.
-	bundle := filepath.Join(work, "client.kbx")
-	if out, err := run(srvEnv, "client", "-export", bundle, "-key", "e2e-key"); err != nil {
-		t.Fatalf("export: %v\n%s", err, out)
+	// Friend's machine: client-only dir (no DB), enrolled by IP with the daemon's
+	// printed one-liner (plans/mtls-client-bootstrap-plan.md).
+	if out, err := run(cliEnv, strings.Fields(line)[1:]...); err != nil || !strings.Contains(out, "mTLS to https://127.0.0.1:") {
+		t.Fatalf("client -import: %v\n%s", err, out)
 	}
-	if out, err := run(cliEnv, "client", "-import", bundle, "-key", "e2e-key"); err != nil {
-		t.Fatalf("import: %v\n%s", err, out)
+	// Re-running the line needs -yes (client.json would be replaced) and works with it.
+	if out, err := run(cliEnv, strings.Fields(line)[1:]...); err == nil || !strings.Contains(out, "-yes") {
+		t.Fatalf("re-import without -yes must refuse: %v\n%s", err, out)
 	}
-	// Friend connects BY IP (the reported failing case): point the import at the IP.
-	cjPath := filepath.Join(cliDir, "client.json")
-	var cliCfg clientConfig
-	if err := json.Unmarshal(mustReadFile(t, cjPath), &cliCfg); err != nil {
-		t.Fatal(err)
+	if out, err := run(cliEnv, append(strings.Fields(line)[1:], "-yes")...); err != nil {
+		t.Fatalf("re-import with -yes: %v\n%s", err, out)
 	}
-	cliCfg.Host = "127.0.0.1"
-	cliCfg.Port = port
-	cliCfg.Hosts = []string{"127.0.0.1"}
-	cb, _ := json.Marshal(&cliCfg)
-	os.WriteFile(cjPath, cb, 0644)
+	// Removed forms: file import, export, and the long -bundle/-fingerprint/-key/-session flags.
+	w := strings.Fields(line)
+	tok, _ := parseEnrollToken(w[4])
+	longForm := []string{"client", "-import", w[3], "-bundle", bundleIDFromKey(tok.Key), "-fingerprint", "x", "-key", base64.RawURLEncoding.EncodeToString(tok.Key)}
+	for _, args := range [][]string{{"client", "-import", "client.kbx", "-key", "k"}, {"client", "-export", "-key", "k"}, longForm,
+		{"client", "-import", w[3], w[4], "-session", newRelaySessionID()}, {"client", "-import", w[3]}} {
+		if out, err := run(cliEnv, args...); err == nil {
+			t.Fatalf("%v must fail:\n%s", args, out)
+		}
+	}
+	// A token in the wrong form: direct token alone, relay token behind a URL, relay token without a session.
+	relayTok := enrollToken{Host: "127.0.0.1", Session: newRelaySessionID(), Key: tok.Key}.encode()
+	noSession := enrollToken{Host: "127.0.0.1", Key: tok.Key}.encode()
+	for args, want := range map[[4]string]string{
+		{"client", "-import", w[4], ""}:       "put the daemon URL in front of it",
+		{"client", "-import", w[3], relayTok}: "pass it alone",
+		{"client", "-import", noSession, ""}:  "put the daemon URL in front of it",
+	} {
+		a := args[:]
+		if a[3] == "" {
+			a = a[:3]
+		}
+		if out, err := run(cliEnv, a...); err == nil || !strings.Contains(out, want) {
+			t.Fatalf("%v must fail with %q: %v\n%s", a, want, err, out)
+		}
+	}
 
 	call := func() (string, error) {
 		return run(cliEnv, "call", "list_files")
@@ -5381,6 +5400,25 @@ func TestMtlsSharedClientCertE2E(t *testing.T) {
 	}
 }
 
+// waitImportLine polls a daemon log for its boot-time `kbtool client -import`
+// command for the given URL prefix and returns the command (group 26/31 helper).
+func waitImportLine(t *testing.T, logPath, urlPrefix string, d time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(logPath)
+		for _, l := range strings.Split(string(b), "\n") {
+			if i := strings.Index(l, "kbtool client -import "+urlPrefix); i >= 0 {
+				return l[i:]
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(logPath)
+	t.Fatalf("no 'kbtool client -import %s' line in the daemon log:\n%s", urlPrefix, b)
+	return ""
+}
+
 // mustReadFile reads a file or fails the test (group 26 helper).
 func mustReadFile(t *testing.T, p string) []byte {
 	t.Helper()
@@ -5389,4 +5427,4488 @@ func mustReadFile(t *testing.T, p string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// ---------- 27. mTLS client-only endpoint (plans/mtls-client-only-endpoint-plan.md) ----------
+//
+// Regression context: with client.json tls=true, liveDaemon still tried
+// KBTOOL_SOCKET / daemon.sock / mcp.sock first, and when nothing answered the
+// CLI silently fell back to the local db and board.bin. An agent whose mTLS
+// endpoint was unreachable therefore signed up and posted on a PRIVATE board
+// and never saw its collaborators. This group pins: mTLS ⇒ only the client.json
+// endpoint, cert errors surfaced, and no local fallback from any client command.
+
+// shortStateDir returns a short temp dir usable as KBTOOL_DIR that can also hold a
+// unix socket (t.TempDir paths can exceed the sun_path limit on some platforms).
+func shortStateDir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("", "kb27")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	return d
+}
+
+// startTestUnixDaemon serves the MCP line protocol (fakeExec) on socket.
+func startTestUnixDaemon(t *testing.T, socket string) {
+	t.Helper()
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = serveLines(c, c, &fakeExec{})
+			}(c)
+		}
+	}()
+}
+
+// writeTestClientPKI writes ca.crt / client.crt / client.key into dir.
+func writeTestClientPKI(t *testing.T, dir string) (*ecdsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+	caKey, caCert := cryptoGenerateCA("test CA", time.Hour)
+	cliKey, cliCert := cryptoGenerateLeaf(caKey, caCert, "cli", nil, nil, time.Hour)
+	writeTestPEM(t, dir, "ca.crt", cryptoPEMCert(caCert))
+	writeTestPEM(t, dir, "client.crt", cryptoPEMCert(cliCert))
+	writeTestPEM(t, dir, "client.key", cryptoPEMKey(cliKey))
+	return caKey, caCert
+}
+
+func mtlsHostConfig(port int) *clientConfig {
+	return &clientConfig{Host: "127.0.0.1", Port: port, TLS: true,
+		CaCert: "ca.crt", ClientCert: "client.crt", ClientKey: "client.key"}
+}
+
+// assertOnlyClientFiles fails when the state dir holds anything but the mTLS
+// client files (plus extra): a pure client must never create kb.db, board.bin,
+// *.lock, pid/log files or sockets — the backend daemon owns all of that.
+func assertOnlyClientFiles(t *testing.T, dir string, extra ...string) {
+	t.Helper()
+	allowed := map[string]bool{"ca.crt": true, "client.crt": true, "client.key": true, "client.json": true}
+	for _, e := range extra {
+		allowed[e] = true
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if !allowed[e.Name()] {
+			t.Fatalf("pure mTLS client created local state %q in %s", e.Name(), dir)
+		}
+	}
+}
+
+// startTestMtlsDaemon serves the real daemon HTTP handler (httpHandler) over mTLS
+// on 127.0.0.1 with ex as the backend; returns the port.
+func startTestMtlsDaemon(t *testing.T, caKey *ecdsa.PrivateKey, caCert *x509.Certificate, ex executor) int {
+	t.Helper()
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(cryptoPEMCert(caCert))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: httpHandler(ex), TLSConfig: &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvCert.Raw}, PrivateKey: srvKey}},
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// TestMtlsPureClientUsesBackendToolsAndState is the reported `kbtool tools` bug:
+// a pure client (certs + client.json only, no config.json) showed the LOCAL
+// default tool set, which hides the message board, instead of what the backend
+// serves. The tool list (CLI + the stdio-mcp proxy's filter) must come from the
+// daemon, tool calls must go there, and the state dir must stay client-only.
+func TestMtlsPureClientUsesBackendToolsAndState(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	t.Setenv("KBTOOL_DB", "")
+	t.Setenv("KBTOOL_BOARD", "")
+	caKey, caCert := writeTestClientPKI(t, dir)
+	backend := &fakeExec{disabled: map[string]bool{"kb_status": true}} // backend: board ON
+	port := startTestMtlsDaemon(t, caKey, caCert, backend)
+	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
+		t.Fatal(err)
+	}
+	if !effectiveDisabledSet(nil)["board_signup"] {
+		t.Fatal("control: the local default view must hide the board (else this test is vacuous)")
+	}
+
+	tools, via, err := cliToolList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(via, "https://127.0.0.1:") {
+		t.Fatalf("tool list not from the mTLS daemon: via=%q", via)
+	}
+	got := map[string]bool{}
+	for _, tl := range tools {
+		got[tl.Name] = true
+	}
+	if !got["board_signup"] || !got["board_post"] || got["kb_status"] {
+		t.Fatalf("tool list must be the backend's (board on, kb_status off), got %v", got)
+	}
+
+	ex, _, ok, err := liveDaemon()
+	if !ok {
+		t.Fatal(err)
+	}
+	if ex.toolDisabled("board_signup") || !ex.toolDisabled("kb_status") {
+		t.Fatal("stdio-mcp proxy filter must follow the backend's tools/list")
+	}
+	if text, isErr := ex.Execute("board_threads", json.RawMessage(`{}`)); isErr || text != "exec:board_threads" {
+		t.Fatalf("tool call not served by the backend: %q (err=%v)", text, isErr)
+	}
+	assertOnlyClientFiles(t, dir)
+}
+
+// TestMtlsClientSkipsLocalSockets pins the core bug: a live local daemon socket
+// offered through KBTOOL_SOCKET must NOT be used by a remote client — the dead
+// endpoint's failure is returned instead, without noise from the socket. The
+// no-client.json control proves the socket is live, so the remote case isn't
+// vacuous (plans/host-socket-cli-and-live-reindex-plan.md: a remote client
+// talks only to its client.json endpoint, with or without TLS).
+func TestMtlsClientSkipsLocalSockets(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	sock := filepath.Join(shortStateDir(t), "daemon.sock")
+	t.Setenv("KBTOOL_SOCKET", sock)
+	startTestUnixDaemon(t, sock)
+	writeTestClientPKI(t, dir)
+
+	if _, desc, ok, err := liveDaemon(); !ok || !strings.HasPrefix(desc, "unix ") {
+		t.Fatalf("control: without client.json the local socket must win, got ok=%v desc=%q err=%v", ok, desc, err)
+	}
+	dead := freePort(t)
+	plain := mtlsHostConfig(dead)
+	plain.TLS = false
+	if err := saveClientConfig(plain); err != nil {
+		t.Fatal(err)
+	}
+	if _, desc, ok, _ := liveDaemon(); ok {
+		t.Fatalf("a remote client without TLS must not use the local socket either, got %q", desc)
+	}
+
+	if err := saveClientConfig(mtlsHostConfig(dead)); err != nil {
+		t.Fatal(err)
+	}
+	_, desc, ok, err := liveDaemon()
+	if ok {
+		t.Fatalf("mTLS configured: the local socket must be skipped, but got %q", desc)
+	}
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("127.0.0.1:%d", dead)) {
+		t.Fatalf("expected the mTLS endpoint failure, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "daemon.sock") || strings.Contains(err.Error(), "mcp.sock") {
+		t.Fatalf("a failed opportunistic local socket must not be reported under mTLS: %v", err)
+	}
+}
+
+// TestMtlsClientUsesOnlyMtlsEndpoint: with BOTH a live local socket and a live
+// mTLS endpoint, the mTLS endpoint is chosen (before, the socket won).
+func TestMtlsClientUsesOnlyMtlsEndpoint(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	stray := filepath.Join(shortStateDir(t), "daemon.sock") // a live socket outside the client's dir
+	t.Setenv("KBTOOL_SOCKET", stray)
+	startTestUnixDaemon(t, stray)
+	caKey, caCert := writeTestClientPKI(t, dir)
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(cryptoPEMCert(caCert))
+	port, stop := startTestTLSHTTPServer(t, srvCert, srvKey, pool)
+	defer stop()
+	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
+		t.Fatal(err)
+	}
+	_, desc, ok, err := liveDaemon()
+	if !ok {
+		t.Fatalf("live mTLS endpoint not used: %v", err)
+	}
+	if !strings.HasPrefix(desc, "https://127.0.0.1:") {
+		t.Fatalf("expected the mTLS endpoint, got %q", desc)
+	}
+}
+
+// TestMtlsClientConfigErrorsSurfaced: an unloadable client cert (it used to be
+// dropped silently, leaving no candidate and a nil error — the trigger for the
+// silent local fallback) and a tls=true config with no endpoint must both be
+// returned as errors, even with a live local socket present.
+func TestMtlsClientConfigErrorsSurfaced(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	stray := filepath.Join(shortStateDir(t), "daemon.sock") // a live socket outside the client's dir
+	t.Setenv("KBTOOL_SOCKET", stray)
+	startTestUnixDaemon(t, stray)
+
+	if err := saveClientConfig(mtlsHostConfig(freePort(t))); err != nil { // no PKI written yet
+		t.Fatal(err)
+	}
+	if _, desc, ok, err := liveDaemon(); ok || err == nil || !strings.Contains(err.Error(), "client cert/key") {
+		t.Fatalf("missing client cert must be an error (not a socket fallback): ok=%v desc=%q err=%v", ok, desc, err)
+	}
+
+	writeTestClientPKI(t, dir)
+	noEP := mtlsHostConfig(0)
+	noEP.Host = ""
+	if err := saveClientConfig(noEP); err != nil {
+		t.Fatal(err)
+	}
+	if _, desc, ok, err := liveDaemon(); ok || err == nil || !strings.Contains(err.Error(), "no endpoint") {
+		t.Fatalf("tls=true without an endpoint must be an error: ok=%v desc=%q err=%v", ok, desc, err)
+	}
+}
+
+// TestMtlsClientRefusesLocalFallbackCLI is the user's scenario through the built
+// binary: with an unreachable mTLS endpoint, `call board_signup`, `query`, and
+// stdio `mcp` must fail and must NOT create a local board.bin. The control run
+// (no client.json) shows the same call otherwise writes the local board.
+func TestMtlsClientRefusesLocalFallbackCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary for the CLI fallback test")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	dir := shortStateDir(t)
+	env := append(os.Environ(), "KBTOOL_DIR="+dir, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KB_EMBED_URL=")
+	run := func(stdin string, args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Env = env
+		c.Stdin = strings.NewReader(stdin)
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	board := filepath.Join(dir, "board.bin")
+	seedFile := filepath.Join(work, "seed")
+	if err := os.WriteFile(seedFile, []byte(strings.Repeat("ab", 32)), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("KBTOOL_DIR", dir) // saveClientConfig writes into the binary's state dir
+	writeTestClientPKI(t, dir)
+	if err := saveClientConfig(mtlsHostConfig(freePort(t))); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		stdin string
+		args  []string
+	}{
+		{"", []string{"call", "board_signup", `{"name":"gus"}`}},
+		{"", []string{"query", "anything"}},
+		{"", []string{"terms", "anything"}},
+		{"", []string{"bundle", "-q", "anything"}},
+		{"", []string{"tools"}},
+		{"", []string{"status"}},
+		{"", []string{"board", "dump"}},
+		{"", []string{"board", "attach", "-thread", "x", "-text", "y", "-seed-file", seedFile, "go.mod"}},
+		{"", []string{"board", "fetch", "-seed-file", seedFile, "-o", work, "x#0"}},
+		{`{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n", []string{"mcp"}},
+	}
+	for _, c := range cases {
+		out, err := run(c.stdin, c.args...)
+		if err == nil {
+			t.Fatalf("%v: must fail with an unreachable mTLS endpoint, got:\n%s", c.args, out)
+		}
+		if !strings.Contains(out, "refusing local db/board fallback") {
+			t.Fatalf("%v: missing the no-fallback error:\n%s", c.args, out)
+		}
+		if fileExists(board) {
+			t.Fatalf("%v: a local board.bin was created under mTLS", c.args)
+		}
+		assertOnlyClientFiles(t, dir)
+	}
+
+	if err := os.Remove(filepath.Join(dir, "client.json")); err != nil {
+		t.Fatal(err)
+	}
+	// Control: a plain local dir with the board on writes board.bin locally.
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"version":1,"message_board":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run("", "call", "board_signup", `{"name":"gus"}`); err != nil || !fileExists(board) {
+		t.Fatalf("control: without mTLS the one-shot board call writes board.bin locally: err=%v\n%s", err, out)
+	}
+}
+
+// ---------- 28. message board HTML dump (plans/message-board-html-dump-plan.md) ----------
+
+// dumpSignup signs name up on tb's board and returns its seed.
+func dumpSignup(t *testing.T, tb *Toolbox, name string) string {
+	t.Helper()
+	out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": name}))
+	if isErr {
+		t.Fatalf("signup %s: %s", name, out)
+	}
+	m := regexp.MustCompile(`seed: ([0-9a-f]{64})`).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("no seed in signup output: %q", out)
+	}
+	return m[1]
+}
+
+// dumpPost posts a signed message as the seed's identity.
+func dumpPost(t *testing.T, tb *Toolbox, seed, thread, kind, text string) {
+	t.Helper()
+	args := map[string]any{"thread": thread, "kind": kind, "text": text, "seed": seed}
+	if out, isErr := tb.Execute("board_post", mustMarshal(args)); isErr {
+		t.Fatalf("post: %s", out)
+	}
+}
+
+// editBoard applies fn to the stored board under the board lock and saves it,
+// for crafting states the tools refuse to produce (forged/tampered messages).
+func editBoard(t *testing.T, tb *Toolbox, fn func(b *Board)) {
+	t.Helper()
+	st := tb.store()
+	unlock, err := st.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	b, err := st.loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn(b)
+	if err := st.saveBoard(b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func renderDump(t *testing.T, s boardSnapshot) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := renderBoardHTML(&buf, s); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	return buf.String()
+}
+
+// TestBoardTemplateParsesAndIsEmbedded pins that the page template ships inside
+// the binary: the embedded string is the real template, and it renders an empty
+// snapshot (no threads, no agents) without error.
+func TestBoardTemplateParsesAndIsEmbedded(t *testing.T) {
+	if !strings.HasPrefix(messageBoardGohtml, "<!doctype html>") {
+		head := messageBoardGohtml
+		if len(head) > 40 {
+			head = head[:40]
+		}
+		t.Fatalf("embedded template missing or wrong, starts with %q", head)
+	}
+	page := renderDump(t, boardSnapshot{})
+	if !strings.Contains(page, "No agents have signed up yet.") || !strings.Contains(page, "0 thread(s)") {
+		t.Fatalf("empty snapshot rendered unexpectedly:\n%s", page)
+	}
+}
+
+// TestBoardSnapshotVerificationStatus pins that trust is computed by the producer
+// and shown to the human: a genuine post is verified, a post signed with another
+// agent's key is impersonation, tampered text is bad-signature, and both
+// untrusted messages get the red badge and row.
+func TestBoardSnapshotVerificationStatus(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := dumpSignup(t, tb, "alice")
+	bob := dumpSignup(t, tb, "bob")
+	dumpPost(t, tb, alice, "welcome", "hello", "genuine alice")
+	alicePriv, _, err := cryptoDeriveSeed(alice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobPriv, bobPub, err := cryptoDeriveSeed(bob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	editBoard(t, tb, func(b *Board) {
+		th := b.thread("welcome")
+		now := time.Now().Unix()
+		forged := BoardMsg{ID: b.NextID + 1, Thread: "welcome", Seq: len(th.Msgs), Agent: "alice",
+			Pub: hex.EncodeToString(bobPub), Text: "forged alice", At: now, Kind: "info"}
+		forged.Sig = cryptoSignBoard(bobPriv, canonicalMsg(forged))
+		th.Msgs = append(th.Msgs, forged)
+		tampered := BoardMsg{ID: b.NextID + 2, Thread: "welcome", Seq: len(th.Msgs), Agent: "alice",
+			Pub: b.Agents["alice"].Pub, Text: "original", At: now, Kind: "info"}
+		tampered.Sig = cryptoSignBoard(alicePriv, canonicalMsg(tampered))
+		tampered.Text = "tampered"
+		th.Msgs = append(th.Msgs, tampered)
+		b.NextID += 2
+	})
+	s, err := tb.boardExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, m := range s.Threads[0].Msgs {
+		got = append(got, m.Text+"="+m.Status)
+	}
+	want := []string{"genuine alice=verified", "forged alice=impersonation", "tampered=bad-signature"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("statuses = %v, want %v", got, want)
+	}
+	page := renderDump(t, s)
+	if strings.Count(page, `class="badge ok"`) != 1 || strings.Count(page, `class="badge bad"`) != 2 ||
+		strings.Count(page, `class="msg untrusted"`) != 2 {
+		t.Fatalf("verification badges/rows not rendered as expected:\n%s", page)
+	}
+}
+
+// TestBoardSnapshotOrderAndRoster pins the page order (welcome first, then thread
+// creation order, messages by seq) and that ACTIVE/STALE follows
+// KBTOOL_BOARD_TTL at export time.
+func TestBoardSnapshotOrderAndRoster(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	t.Setenv("KBTOOL_BOARD_TTL", "60")
+	alice := dumpSignup(t, tb, "alice")
+	dumpSignup(t, tb, "bob")
+	dumpPost(t, tb, alice, "zeta", "info", "z0")
+	dumpPost(t, tb, alice, "alpha", "info", "a0")
+	dumpPost(t, tb, alice, "zeta", "task", "z1")
+	editBoard(t, tb, func(b *Board) { b.Agents["bob"].LastSeen = time.Now().Unix() - 3600 })
+	s, err := tb.boardExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, th := range s.Threads {
+		ids = append(ids, th.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"welcome", "zeta", "alpha"}) {
+		t.Fatalf("thread order = %v", ids)
+	}
+	if z := s.Threads[1].Msgs; len(z) != 2 || z[0].Text != "z0" || z[1].Text != "z1" || z[1].Seq != 1 {
+		t.Fatalf("zeta messages out of seq order: %+v", z)
+	}
+	if s.TTL != 60 || len(s.Agents) != 2 {
+		t.Fatalf("ttl=%d agents=%d", s.TTL, len(s.Agents))
+	}
+	if a := s.Agents[0]; a.ID != "alice" || !a.Active {
+		t.Fatalf("most recent agent should be ACTIVE alice, got %+v", a)
+	}
+	if b := s.Agents[1]; b.ID != "bob" || b.Active {
+		t.Fatalf("bob (last seen 1h ago, ttl 60s) should be STALE, got %+v", b)
+	}
+}
+
+// TestBoardDumpEscapesUntrustedText pins html/template: board text is untrusted
+// agent input, so markup in a message renders as text (stored-XSS guard),
+// including inside the data-search attribute.
+func TestBoardDumpEscapesUntrustedText(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "mallory")
+	dumpPost(t, tb, seed, "welcome", "info", `<script>alert(1)</script> "><img src=x onerror=alert(2)>`)
+	s, err := tb.boardExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := renderDump(t, s)
+	for _, raw := range []string{"<script>alert(1)", "<img src=x", `"><img`} {
+		if strings.Contains(page, raw) {
+			t.Fatalf("unescaped %q in page:\n%s", raw, page)
+		}
+	}
+	if !strings.Contains(page, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+		t.Fatalf("message text should be present, escaped:\n%s", page)
+	}
+}
+
+// TestBoardTemplateCollapsesBlobs pins that a long base64 line (how agents share
+// tarballs) becomes its own collapsed segment, short text stays inline, and the
+// blob stays out of the filter text and the summary preview.
+func TestBoardTemplateCollapsesBlobs(t *testing.T) {
+	blob := strings.Repeat("QUJD", 1250)
+	text := "see attachment abc123\n" + blob + "\nbye"
+	want := []boardSegment{{Text: "see attachment abc123"}, {Blob: true, Text: blob}, {Text: "bye"}}
+	if got := boardSegments(text); !reflect.DeepEqual(got, want) {
+		t.Fatalf("segments = %+v", got)
+	}
+	m := snapMsg{Agent: "ben", Kind: "result", Text: text, Status: "verified"}
+	if strings.Contains(boardSearchText(m), "qujd") {
+		t.Fatal("blob leaked into the filter text")
+	}
+	if p := boardPreview(text); p != "see attachment abc123" {
+		t.Fatalf("preview = %q", p)
+	}
+	if p := boardPreview(blob + "\nafter"); p != "after" {
+		t.Fatalf("preview must skip a leading blob, got %q", p)
+	}
+	page := renderDump(t, boardSnapshot{Threads: []snapThread{{ID: "t", Msgs: []snapMsg{m}}}})
+	if !strings.Contains(page, `<details class="blob"><summary>base64 attachment (5000 chars)</summary>`) {
+		t.Fatalf("blob not collapsed:\n%s", page)
+	}
+}
+
+// TestBoardDumpIsReadOnly pins that exporting never writes: the board bytes are
+// unchanged (no last-seen bump, no save), and a missing board is an error rather
+// than being created.
+func TestBoardDumpIsReadOnly(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "hi")
+	before, err := os.ReadFile(tb.BoardPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tb.boardExport(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(tb.BoardPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("board file changed during export")
+	}
+
+	empty := newBoardToolbox(t, nil)
+	if _, err := empty.boardExport(); err == nil {
+		t.Fatal("exporting a missing board must be an error")
+	}
+	if fileExists(empty.BoardPath) {
+		t.Fatal("export created a board")
+	}
+}
+
+// TestBoardExportNotAnMCPTool pins that board/export is a JSON-RPC method for the
+// human CLI, not an agent tool: absent from tools/list, refused by tools/call,
+// served over the daemon's HTTP route, and method-not-found for an executor
+// that cannot export.
+func TestBoardExportNotAnMCPTool(t *testing.T) {
+	t.Setenv("KB_EMBED_URL", "")
+	// A loaded DB, so tools/call reaches the tool lookup ("unknown tool") instead of
+	// stopping at "knowledge base not loaded".
+	tb := newBoardToolbox(t, makeDB(t, []Chunk{{Path: "a", Kind: "code", Text: "base chunk"}}))
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "over http")
+
+	res, err := dispatch(tb, "tools/list", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range res.(map[string]any)["tools"].([]mcpTool) {
+		if strings.Contains(tl.Name, "export") {
+			t.Fatalf("tools/list exposes %q", tl.Name)
+		}
+	}
+	if out, isErr := tb.Execute("board/export", nil); !isErr || !strings.Contains(out, "unknown tool") {
+		t.Fatalf("tools/call must refuse board/export, got (%q, %v)", out, isErr)
+	}
+
+	srv := httptest.NewServer(httpHandler(tb))
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/mcp", "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"board/export"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var rr struct {
+		Result boardSnapshot `json:"result"`
+		Error  *rpcError     `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Error != nil || len(rr.Result.Threads) != 1 || len(rr.Result.Threads[0].Msgs) != 1 ||
+		rr.Result.Threads[0].Msgs[0].Text != "over http" || rr.Result.Threads[0].Msgs[0].Status != "verified" {
+		t.Fatalf("board/export over HTTP: error=%v result=%+v", rr.Error, rr.Result)
+	}
+
+	if _, err := dispatch(&fakeExec{}, "board/export", nil); err == nil || !strings.Contains(err.Error(), "method not found") {
+		t.Fatalf("non-exporting executor must answer method not found, got %v", err)
+	}
+}
+
+// TestBoardExportRemoteOverMtls pins the pure-client path: with client.json
+// tls=true the dump comes from the backend over mTLS (board/export), equals the
+// backend's own snapshot, and the client state dir stays client-only.
+func TestBoardExportRemoteOverMtls(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "from the backend")
+
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	t.Setenv("KBTOOL_DB", "")
+	caKey, caCert := writeTestClientPKI(t, dir)
+	port := startTestMtlsDaemon(t, caKey, caCert, tb)
+	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
+		t.Fatal(err)
+	}
+	got, via, err := boardDumpSnapshot(filepath.Join(dir, "kb.db"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(via, "https://127.0.0.1:") {
+		t.Fatalf("dump not served by the mTLS backend: via=%q", via)
+	}
+	want, err := tb.boardExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Threads, want.Threads) || !reflect.DeepEqual(got.Agents, want.Agents) {
+		t.Fatalf("remote snapshot differs from the backend's:\n got %+v\nwant %+v", got, want)
+	}
+	assertOnlyClientFiles(t, dir)
+}
+
+// TestBoardExportDisabledBoard pins that a config with the message board off
+// (message_board absent/false) refuses the export with an explanation instead of
+// rendering an empty page; the control exports the same board once it is on.
+func TestBoardExportDisabledBoard(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "hi")
+	tb.Disabled = effectiveDisabledSet(nil)
+	if _, err := tb.boardExport(); err == nil || !strings.Contains(err.Error(), "disabled by config") {
+		t.Fatalf("board off must refuse the export, got %v", err)
+	}
+	on := true
+	tb.Disabled = effectiveDisabledSet(&config{MessageBoard: &on})
+	if s, err := tb.boardExport(); err != nil || len(s.Threads) != 1 {
+		t.Fatalf("control: board on must export, got %v (threads=%d)", err, len(s.Threads))
+	}
+}
+
+// TestBoardDumpBinaryRunsWithoutTemplateOnDisk pins "never an external asset
+// after building": the binary from the single-command build runs in an empty
+// directory (no message_board.gohtml) and still renders the page, to stdout by
+// default and to a 0600 file with -o.
+func TestBoardDumpBinaryRunsWithoutTemplateOnDisk(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	bin := filepath.Join(t.TempDir(), "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "embedded template works")
+	state := os.Getenv("KBTOOL_DIR")
+	if err := os.WriteFile(filepath.Join(state, "config.json"), []byte(`{"version":1,"message_board":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+filepath.Join(state, "none.sock"),
+		"KBTOOL_DB=", "KBTOOL_BOARD="+tb.BoardPath, "KB_EMBED_URL=")
+	cmd := func(args ...string) *exec.Cmd {
+		c := exec.Command(bin, args...)
+		c.Dir = work
+		c.Env = env
+		return c
+	}
+
+	out, err := cmd("board", "dump").Output()
+	if err != nil {
+		t.Fatalf("board dump: %v", err)
+	}
+	if !strings.HasPrefix(string(out), "<!doctype html>") || !strings.Contains(string(out), "embedded template works") {
+		t.Fatalf("stdout is not the rendered page:\n%s", out)
+	}
+
+	if b, err := cmd("board", "dump", "-o", "page.html").CombinedOutput(); err != nil {
+		t.Fatalf("board dump -o: %v\n%s", err, b)
+	}
+	page := filepath.Join(work, "page.html")
+	fi, err := os.Stat(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("page mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if b, _ := os.ReadFile(page); !strings.Contains(string(b), "embedded template works") {
+		t.Fatal("-o file is missing the board content")
+	}
+	ents, err := os.ReadDir(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 {
+		t.Fatalf("work dir should hold only page.html, got %d entries", len(ents))
+	}
+}
+
+// ---------- 29. message board attachments (plans/message-board-attachments-plan.md) ----------
+
+// rawEntry is one hand-built tar entry for crafting hostile archives.
+type rawEntry struct {
+	hdr  tar.Header
+	data string
+}
+
+// rawTarGZ builds a tar.gz byte for byte as given (no sorting, no validation),
+// so tests can produce archives kbtool itself would never write.
+func rawTarGZ(t *testing.T, entries ...rawEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, e := range entries {
+		h := e.hdr
+		if h.Typeflag == 0 {
+			h.Typeflag = tar.TypeReg
+		}
+		if h.Typeflag == tar.TypeReg && h.Size == 0 {
+			h.Size = int64(len(e.data))
+		}
+		if h.Mode == 0 {
+			h.Mode = 0644
+		}
+		if err := tw.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+		if h.Typeflag == tar.TypeReg {
+			if _, err := tw.Write([]byte(e.data)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// packFiles packs in-memory files the way the CLI does (deterministic tar.gz).
+func packFiles(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var ms []tarGZMember
+	for n, d := range files {
+		ms = append(ms, tarGZMember{Name: n, Data: []byte(d)})
+	}
+	data, _, err := attachPack(ms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// postAttachment posts a message carrying data as its attachment.
+func postAttachment(tb *Toolbox, seed, thread string, data []byte) (string, bool) {
+	return tb.Execute("board_post", mustMarshal(map[string]any{"thread": thread, "text": "see attachment",
+		"seed": seed, "attachment": base64.StdEncoding.EncodeToString(data)}))
+}
+
+// TestTarGZWriteDeterministicAndStreamed pins that the shared tar.gz writer is
+// deterministic (same inputs, same bytes, hence a stable signed digest) and that
+// disk members are streamed with the same content as in-memory ones.
+func TestTarGZWriteDeterministicAndStreamed(t *testing.T) {
+	a := packFiles(t, map[string]string{"b.txt": "bee", "a/c.txt": "sea"})
+	b := packFiles(t, map[string]string{"a/c.txt": "sea", "b.txt": "bee"})
+	if !bytes.Equal(a, b) {
+		t.Fatal("identical inputs produced different archives")
+	}
+	p := filepath.Join(t.TempDir(), "c.txt")
+	if err := os.WriteFile(p, []byte("sea"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var disk, mem bytes.Buffer
+	if err := tarGZWrite(&disk, []tarGZMember{{Name: "c.txt", Path: p}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tarGZWrite(&mem, []tarGZMember{{Name: "c.txt", Data: []byte("sea")}}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(disk.Bytes(), mem.Bytes()) {
+		t.Fatal("a disk member and the same in-memory member packed differently")
+	}
+	files, err := attachManifest(a)
+	if err != nil || len(files) != 2 || files[0].Name != "a/c.txt" || files[1].Size != 3 {
+		t.Fatalf("manifest = %+v, %v", files, err)
+	}
+}
+
+// TestAttachManifestRejectsHostileArchives pins full upload validation: every
+// archive shape that could escape the extraction directory, overwrite through a
+// link, or exhaust memory is refused before it is stored.
+func TestAttachManifestRejectsHostileArchives(t *testing.T) {
+	big := strings.Repeat("\x00", boardMaxAttachUnpacked+1)
+	cases := map[string][]byte{
+		"not gzip":     []byte("plain text"),
+		"empty":        rawTarGZ(t),
+		"traversal":    rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "../evil"}, data: "x"}),
+		"inner dotdot": rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "a/../../evil"}, data: "x"}),
+		"absolute":     rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "/etc/evil"}, data: "x"}),
+		"symlink":      rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"}}),
+		"hardlink":     rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "hl", Typeflag: tar.TypeLink, Linkname: "/etc/passwd"}}),
+		"directory":    rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "d/", Typeflag: tar.TypeDir}}),
+		"duplicate":    rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "a"}, data: "1"}, rawEntry{hdr: tar.Header{Name: "a"}, data: "2"}),
+		"file vs dir":  rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "a"}, data: "1"}, rawEntry{hdr: tar.Header{Name: "a/b"}, data: "2"}),
+		"control char": rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "a\nb"}, data: "x"}),
+		"unclean":      rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "a//b"}, data: "x"}),
+		"bomb":         rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "zeros"}, data: big}),
+	}
+	for name, data := range cases {
+		if _, err := attachManifest(data); err == nil {
+			t.Errorf("%s: hostile archive was accepted", name)
+		}
+	}
+	if _, err := attachManifest(rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "ok/file.txt"}, data: "x"})); err != nil {
+		t.Fatalf("control: a clean archive was refused: %v", err)
+	}
+}
+
+// TestBoardAttachmentRoundTrip pins the MCP surface end to end: board_post stores
+// and signs the attachment, board_read summarizes it (no payload), board_fetch
+// returns the exact bytes as verified, and the board file round-trips it.
+func TestBoardAttachmentRoundTrip(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	data := packFiles(t, map[string]string{"plans/plan.md": "# plan", "tickets/01-x.md": "ticket"})
+	out, isErr := postAttachment(tb, seed, "plans", data)
+	if isErr || !strings.Contains(out, "attachment: 2 file(s)") || !strings.Contains(out, "sha256 "+sha256Hex(data)) {
+		t.Fatalf("post: %s", out)
+	}
+
+	read, _ := tb.Execute("board_read", mustMarshal(map[string]any{"thread": "plans", "seed": seed}))
+	if !strings.Contains(read, "attachment: 2 file(s)") || !strings.Contains(read, "kbtool board fetch plans#0") {
+		t.Fatalf("board_read lacks the attachment summary:\n%s", read)
+	}
+	if strings.Contains(read, base64.StdEncoding.EncodeToString(data)[:40]) {
+		t.Fatal("board_read must not print the attachment payload")
+	}
+
+	got, isErr := tb.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": seed}))
+	if isErr {
+		t.Fatalf("fetch: %s", got)
+	}
+	status, back, err := parseBoardFetch(got)
+	if err != nil || status != "verified" || !bytes.Equal(back, data) {
+		t.Fatalf("fetch round trip: status=%q err=%v equal=%v", status, err, bytes.Equal(back, data))
+	}
+	if !strings.Contains(got, "tickets/01-x.md") {
+		t.Fatalf("fetch output lacks the file list:\n%s", got)
+	}
+
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := b.Threads["plans"].Msgs[0]
+	if m.Attach == nil || !bytes.Equal(m.Attach.Data, data) || len(m.Attach.Files) != 2 {
+		t.Fatalf("attachment did not survive save/load: %+v", m.Attach)
+	}
+	if !strings.Contains(boardChunk(m).Text, "plans/plan.md") {
+		t.Fatal("search chunk should index the attachment's file names")
+	}
+
+	if out, isErr := tb.Execute("board_fetch", mustMarshal(map[string]any{"thread": "welcome", "seq": 0, "seed": seed})); !isErr {
+		t.Fatalf("fetching a message without an attachment must fail, got %s", out)
+	}
+	if out, isErr := tb.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": strings.Repeat("cd", 32)})); !isErr {
+		t.Fatalf("an unregistered seed must not fetch, got %s", out)
+	}
+}
+
+// TestBoardAttachmentTamperDetected pins that the signature covers the
+// attachment: swapping the stored bytes (digest untouched) or the digest itself
+// turns the message into bad-signature, and the CLI refuses to extract it.
+func TestBoardAttachmentTamperDetected(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	if out, isErr := postAttachment(tb, seed, "plans", packFiles(t, map[string]string{"a.txt": "good"})); isErr {
+		t.Fatal(out)
+	}
+	evil := packFiles(t, map[string]string{"a.txt": "evil"})
+	editBoard(t, tb, func(b *Board) { b.Threads["plans"].Msgs[0].Attach.Data = evil })
+	got, _ := tb.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": seed}))
+	if !strings.Contains(got, "· bad-signature") || !strings.Contains(got, "DO NOT TRUST") {
+		t.Fatalf("swapped bytes not flagged:\n%s", got)
+	}
+	if _, _, err := parseBoardFetch(got); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("the CLI must reject bytes that do not match the signed digest, got %v", err)
+	}
+
+	editBoard(t, tb, func(b *Board) {
+		b.Threads["plans"].Msgs[0].Attach.SHA256 = sha256Hex(evil)
+	})
+	got, _ = tb.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": seed}))
+	status, _, err := parseBoardFetch(got)
+	if err != nil || status != "bad-signature" {
+		t.Fatalf("a re-pointed digest must break the signature: status=%q err=%v", status, err)
+	}
+}
+
+// TestBoardAttachmentLimits pins the caps: an oversized upload is refused before
+// decoding, invalid archives are refused, and an attachment counts against the
+// whole-board memory limit.
+func TestBoardAttachmentLimits(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	huge := strings.Repeat("A", base64.StdEncoding.EncodedLen(boardMaxAttach)+4)
+	out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "x", "text": "t", "seed": seed, "attachment": huge}))
+	if !isErr || !strings.Contains(out, "compressed cap") {
+		t.Fatalf("oversized attachment: %s", out)
+	}
+	if out, isErr := postAttachment(tb, seed, "x", rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "../evil"}, data: "x"})); !isErr || !strings.Contains(out, "unsafe") {
+		t.Fatalf("hostile archive must be refused at upload: %s", out)
+	}
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb.BoardMaxBytes = int64(len(boardMarshal(b))) + 500 // room for a small text post, not an attachment
+	rnd := make([]byte, 4096)
+	x := uint32(7)
+	for i := range rnd {
+		x = x*1103515245 + 12345
+		rnd[i] = byte(x >> 16)
+	}
+	if out, isErr := postAttachment(tb, seed, "x", packFiles(t, map[string]string{"a": string(rnd)})); !isErr || !strings.Contains(out, "message board is full") {
+		t.Fatalf("attachment must count against the board memory limit: %s", out)
+	}
+	dumpPost(t, tb, seed, "x", "info", "a small text post still fits")
+}
+
+// TestBoardFileWithoutAttachmentsUnchanged pins compatibility: a board without
+// attachments serializes with no trailer (boards written before this feature
+// still load), and a trailer pointing at an unknown message is corruption.
+func TestBoardFileWithoutAttachmentsUnchanged(t *testing.T) {
+	b := newBoard()
+	b.Threads["welcome"].Msgs = []BoardMsg{{ID: 1, Thread: "welcome", Agent: "a", Text: "hi", Kind: "info"}}
+	plain := boardMarshal(b)
+	if _, err := readBoard(bytes.NewReader(plain)); err != nil {
+		t.Fatalf("board without trailer: %v", err)
+	}
+	b.Threads["welcome"].Msgs[0].Attach = &BoardAttachment{SHA256: "s", Data: []byte("d"), Files: []attachFile{{Name: "f", Size: 1}}}
+	with := boardMarshal(b)
+	if !bytes.HasPrefix(with, plain) {
+		t.Fatal("attachments must only append a trailer")
+	}
+	b2, err := readBoard(bytes.NewReader(with))
+	if err != nil || !reflect.DeepEqual(b2.Threads["welcome"].Msgs[0].Attach, b.Threads["welcome"].Msgs[0].Attach) {
+		t.Fatalf("trailer round trip: %v", err)
+	}
+	b.Threads["welcome"].Msgs[0].ID = 2
+	orphan := boardMarshal(b)
+	b.Threads["welcome"].Msgs[0].Attach = nil
+	b.Threads["welcome"].Msgs[0].ID = 1
+	corrupt := append(boardMarshal(b), orphan[len(plain):]...)
+	if _, err := readBoard(bytes.NewReader(corrupt)); err == nil || !strings.Contains(err.Error(), "unknown message") {
+		t.Fatalf("orphan attachment must be corruption, got %v", err)
+	}
+}
+
+// TestBoardAttachmentEncryptedAtRest pins the storage decision (attachments live
+// inside the board, so an encrypted store encrypts them too): no plaintext board
+// file appears, the attachment content is absent from the bundle bytes, and a
+// reopened store with the key serves the verified attachment.
+func TestBoardAttachmentEncryptedAtRest(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	boardFile := filepath.Join(dir, "board.bin")
+	t.Setenv("KBTOOL_BOARD", boardFile)
+	dbPath := filepath.Join(dir, "kb.db")
+	st, err := openKBStore(dbPath, []byte("at-rest-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.saveDB(&DB{Dim: testDim, Backend: "local-hashing"}); err != nil {
+		t.Fatal(err)
+	}
+	tb := &Toolbox{Store: st, BoardPath: boardFile}
+	seed := dumpSignup(t, tb, "alice")
+	secret := "TOP-SECRET-ATTACHMENT-CONTENT"
+	data := rawTarGZ(t, rawEntry{hdr: tar.Header{Name: "s.txt", Format: tar.FormatUSTAR}, data: secret})
+	if out, isErr := postAttachment(tb, seed, "plans", data); isErr {
+		t.Fatal(out)
+	}
+	if fileExists(boardFile) {
+		t.Fatal("an encrypted store must not write a plaintext board.bin")
+	}
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, data) || bytes.Contains(raw, []byte(secret)) {
+		t.Fatal("attachment bytes are visible in the encrypted bundle")
+	}
+	st2, err := openKBStore(dbPath, []byte("at-rest-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb2 := &Toolbox{Store: st2, BoardPath: boardFile}
+	got, _ := tb2.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": seed}))
+	if status, back, err := parseBoardFetch(got); err != nil || status != "verified" || !bytes.Equal(back, data) {
+		t.Fatalf("reopened encrypted store: status=%q err=%v", status, err)
+	}
+}
+
+// TestAttachCollectRefusesSecretsAndLinks pins the client-side slurp policy:
+// directory walks skip .git, kbtool credentials, seed-looking files, private keys
+// and symlinks (with a notice), and naming any of them explicitly is an error,
+// as are absolute and escaping paths.
+func TestAttachCollectRefusesSecretsAndLinks(t *testing.T) {
+	base := t.TempDir()
+	write := func(rel, data string) {
+		p := filepath.Join(base, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("plans/a.md", "plan")
+	write("plans/sub/b.md", "more")
+	write("plans/.git/config", "[core]")
+	write("plans/.kbtool-seed", strings.Repeat("ab", 32))
+	write("plans/my-seed", strings.Repeat("cd", 32)+"\n")
+	write("plans/key.pem", "-----BEGIN EC PRIVATE KEY-----\nxx\n")
+	if err := os.Symlink("/etc/passwd", filepath.Join(base, "plans", "link")); err != nil {
+		t.Fatal(err)
+	}
+	ms, skipped, err := attachCollect(base, []string{"plans"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range ms {
+		names = append(names, m.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"plans/a.md", "plans/sub/b.md"}) {
+		t.Fatalf("members = %v (skipped %v)", names, skipped)
+	}
+	joined := strings.Join(skipped, "\n")
+	for _, want := range []string{".git/ (excluded directory)", ".kbtool-seed (kbtool credential file)", "my-seed (looks like a board seed", "key.pem (contains a PEM private key)", "link (symlink, not followed)"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("skipped list lacks %q:\n%s", want, joined)
+		}
+	}
+	for _, bad := range []string{"/etc/passwd", "../x", "plans/link", "plans/.kbtool-seed", "plans/my-seed", "plans/key.pem", "plans/.git"} {
+		if _, _, err := attachCollect(base, []string{bad}); err == nil {
+			t.Errorf("explicit %q must be refused", bad)
+		}
+	}
+}
+
+// TestAttachExtractIsSafe pins the reader side: files land under the target dir,
+// existing files are never overwritten without -yes (and nothing is written on
+// refusal), and a symlinked directory inside the target is never followed.
+func TestAttachExtractIsSafe(t *testing.T) {
+	data := packFiles(t, map[string]string{"plans/a.md": "plan", "tickets/01.md": "ticket"})
+	dest := t.TempDir()
+	written, err := attachExtract(data, dest, false)
+	if err != nil || len(written) != 2 {
+		t.Fatalf("extract: %v %v", written, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "plans", "a.md")); string(b) != "plan" {
+		t.Fatalf("content = %q", b)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "plans", "a.md"), []byte("local edit"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dest, "tickets", "01.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachExtract(data, dest, false); err == nil || !strings.Contains(err.Error(), "-yes") {
+		t.Fatalf("existing file must block extraction, got %v", err)
+	}
+	if fileExists(filepath.Join(dest, "tickets", "01.md")) {
+		t.Fatal("a refused extraction must write nothing")
+	}
+	if _, err := attachExtract(data, dest, true); err != nil {
+		t.Fatalf("-yes must replace: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "plans", "a.md")); string(b) != "plan" {
+		t.Fatal("-yes did not replace the file")
+	}
+
+	outside := t.TempDir()
+	dest2 := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dest2, "plans")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachExtract(data, dest2, true); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked dir must be refused, got %v", err)
+	}
+	if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+		t.Fatal("extraction wrote through a symlink")
+	}
+}
+
+// TestBoardDumpEmbedsSmallAttachments pins the page rules: attachments under
+// 1 MiB are embedded as a data: download, larger ones show only metadata plus
+// the kbtool command, and file names are escaped like message text.
+func TestBoardDumpEmbedsSmallAttachments(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	small := packFiles(t, map[string]string{"<b>x</b>.md": "small"})
+	if out, isErr := postAttachment(tb, seed, "plans", small); isErr {
+		t.Fatal(out)
+	}
+	rnd := make([]byte, boardDumpEmbedMax+1024)
+	x := uint32(1)
+	for i := range rnd { // LCG noise: gzip cannot shrink it below the embed limit
+		x = x*1103515245 + 12345
+		rnd[i] = byte(x >> 16)
+	}
+	large := packFiles(t, map[string]string{"big.bin": string(rnd)})
+	if len(large) < boardDumpEmbedMax {
+		t.Fatalf("test archive too small to exercise the limit: %d", len(large))
+	}
+	if out, isErr := postAttachment(tb, seed, "plans", large); isErr {
+		t.Fatal(out)
+	}
+	s, err := tb.boardExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := renderDump(t, s)
+	// html/template writes '+' in attributes as &#43;; browsers decode it back.
+	if !strings.Contains(strings.ReplaceAll(page, "&#43;", "+"), `href="data:application/gzip;base64,`+base64.StdEncoding.EncodeToString(small)) {
+		t.Fatal("small attachment not embedded as a data: link")
+	}
+	if strings.Contains(page, base64.StdEncoding.EncodeToString(large)[:64]) {
+		t.Fatal("large attachment must not be embedded")
+	}
+	if !strings.Contains(page, "kbtool board fetch -o plans-1 plans#1") || !strings.Contains(page, sha256Hex(large)) {
+		t.Fatal("large attachment lacks the retrieval command or digest")
+	}
+	if strings.Contains(page, "<b>x</b>") || !strings.Contains(page, "&lt;b&gt;x&lt;/b&gt;.md") {
+		t.Fatal("attachment file names must be escaped")
+	}
+}
+
+// TestBoardAttachRemoteOverMtls pins the client/daemon split: through an mTLS
+// backend the client posts a locally packed attachment and fetches the same
+// bytes back, and an executor without board_fetch (an older daemon) is refused
+// before posting, so an attachment is never silently dropped.
+func TestBoardAttachRemoteOverMtls(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	t.Setenv("KBTOOL_DB", "")
+	caKey, caCert := writeTestClientPKI(t, dir)
+	port := startTestMtlsDaemon(t, caKey, caCert, tb)
+	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
+		t.Fatal(err)
+	}
+	ex, via, err := boardClientExec(filepath.Join(dir, "kb.db"), "", "")
+	if err != nil || !strings.HasPrefix(via, "https://127.0.0.1:") {
+		t.Fatalf("not resolved to the mTLS backend: via=%q err=%v", via, err)
+	}
+	if err := boardAttachSupported(ex); err != nil {
+		t.Fatal(err)
+	}
+	data := packFiles(t, map[string]string{"plans/p.md": "remote"})
+	out, isErr := ex.Execute("board_post", mustMarshal(map[string]any{"thread": "plans", "text": "t", "seed": seed,
+		"attachment": base64.StdEncoding.EncodeToString(data)}))
+	if isErr || !strings.Contains(out, sha256Hex(data)) {
+		t.Fatalf("remote post: %s", out)
+	}
+	got, isErr := ex.Execute("board_fetch", mustMarshal(map[string]any{"thread": "plans", "seq": 0, "seed": seed}))
+	status, back, err := parseBoardFetch(got)
+	if isErr || err != nil || status != "verified" || !bytes.Equal(back, data) {
+		t.Fatalf("remote fetch: status=%q err=%v", status, err)
+	}
+	assertOnlyClientFiles(t, dir)
+
+	if err := boardAttachSupported(&fakeExec{disabled: map[string]bool{"board_fetch": true}}); err == nil {
+		t.Fatal("an executor without board_fetch must be refused")
+	}
+}
+
+// TestBoardAttachFetchBinary pins the CLI end to end with the built binary:
+// attach packs a directory (skipping the seed file sitting in it), fetch
+// extracts identical files elsewhere, and a second fetch refuses to overwrite.
+func TestBoardAttachFetchBinary(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	bin := filepath.Join(t.TempDir(), "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	state := os.Getenv("KBTOOL_DIR")
+	if err := os.WriteFile(filepath.Join(state, "config.json"), []byte(`{"version":1,"message_board":true}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := t.TempDir()
+	for rel, data := range map[string]string{"plans/plan.md": "# plan", "tickets/01-a.md": "A", ".kbtool-seed": seed} {
+		p := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+filepath.Join(state, "none.sock"),
+		"KBTOOL_DB=", "KBTOOL_BOARD="+tb.BoardPath, "KB_EMBED_URL=")
+	run := func(dir string, args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Dir = dir
+		c.Env = env
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run(src, "board", "attach", "-thread", "plans", "-text", "plans + tickets", "."); err != nil {
+		t.Fatalf("attach: %v\n%s", err, out)
+	} else if !strings.Contains(out, ".kbtool-seed (kbtool credential file)") || !strings.Contains(out, "attachment: 2 file(s)") {
+		t.Fatalf("attach output:\n%s", out)
+	}
+	dst := t.TempDir()
+	seedFile := filepath.Join(src, ".kbtool-seed")
+	if out, err := run(dst, "board", "fetch", "-seed-file", seedFile, "-o", "got", "plans#0"); err != nil {
+		t.Fatalf("fetch: %v\n%s", err, out)
+	}
+	for rel, want := range map[string]string{"plans/plan.md": "# plan", "tickets/01-a.md": "A"} {
+		if b, err := os.ReadFile(filepath.Join(dst, "got", rel)); err != nil || string(b) != want {
+			t.Fatalf("%s: %q %v", rel, b, err)
+		}
+	}
+	if fileExists(filepath.Join(dst, "got", ".kbtool-seed")) {
+		t.Fatal("the seed file was attached")
+	}
+	if out, err := run(dst, "board", "fetch", "-seed-file", seedFile, "-o", "got", "plans#0"); err == nil || !strings.Contains(out, "-yes") {
+		t.Fatalf("second fetch must refuse to overwrite: %v\n%s", err, out)
+	}
+}
+
+// ---------- 30. message board memory limit (plans/message-board-memory-limit-plan.md) ----------
+
+// TestParseBoardMemLimit pins the accepted value forms: percentages of the
+// launch-time base, binary and decimal units, bare bytes, and clear errors for
+// anything else (a typo must never silently become "no limit").
+func TestParseBoardMemLimit(t *testing.T) {
+	ok := map[string]int64{
+		"1048576": 1 << 20,
+		"512MiB":  512 << 20,
+		"512M":    512 << 20,
+		"2GB":     2e9,
+		"1.5 GiB": 3 << 29,
+		"64kb":    64000,
+		"100%":    boardMemBase(),
+		"25%":     boardMemBase() / 4,
+	}
+	for in, want := range ok {
+		got, err := parseBoardMemLimit(in)
+		if err != nil || got != want {
+			t.Errorf("%q = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "0", "0%", "101%", "-5MiB", "lots", "5 parsecs", "%", "12XB"} {
+		if _, err := parseBoardMemLimit(bad); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}
+
+// TestResolveBoardMemLimitPrecedence pins flag > config > default, and that the
+// error names the source of a bad value so the operator knows what to fix.
+func TestResolveBoardMemLimitPrecedence(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	n, desc, err := resolveBoardMemLimit("", nil)
+	if err != nil || n != boardMemBase()/4 || !strings.Contains(desc, "(default)") {
+		t.Fatalf("default: %d %q %v", n, desc, err)
+	}
+	c := &config{BoardMaxMemory: "64MiB"}
+	if n, desc, _ := resolveBoardMemLimit("", c); n != 64<<20 || !strings.Contains(desc, "message_board_max_memory") {
+		t.Fatalf("config: %d %q", n, desc)
+	}
+	if n, desc, _ := resolveBoardMemLimit("1GiB", c); n != 1<<30 || !strings.Contains(desc, "-board-max-memory") {
+		t.Fatalf("flag must beat config: %d %q", n, desc)
+	}
+	if _, _, err := resolveBoardMemLimit("", &config{BoardMaxMemory: "huge"}); err == nil || !strings.Contains(err.Error(), "message_board_max_memory") {
+		t.Fatalf("bad config value must name its source, got %v", err)
+	}
+}
+
+// TestBoardMemLimitRefusesGrowth pins enforcement on the whole board: once a
+// post or signup would pass the limit it is refused and nothing is saved, while
+// reads (which only bump last-seen) keep working on the full board.
+func TestBoardMemLimitRefusesGrowth(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	dumpPost(t, tb, seed, "welcome", "hello", "hi")
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb.BoardMaxBytes = int64(len(boardMarshal(b))) + 100
+	before, err := os.ReadFile(tb.BoardPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "x", "text": strings.Repeat("y", 200), "seed": seed}))
+	if !isErr || !strings.Contains(out, "message board is full") || !strings.Contains(out, "-board-max-memory") {
+		t.Fatalf("post over the limit: %s", out)
+	}
+	after, _ := os.ReadFile(tb.BoardPath)
+	if !bytes.Equal(before, after) {
+		t.Fatal("a refused post must not change the stored board")
+	}
+	if out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "a-very-long-agent-name-to-overflow"})); !isErr || !strings.Contains(out, "message board is full") {
+		t.Fatalf("signup over the limit: %s", out)
+	}
+	if out, isErr := tb.Execute("board_read", mustMarshal(map[string]any{"thread": "welcome", "seed": seed})); isErr {
+		t.Fatalf("reads must keep working on a full board: %s", out)
+	}
+}
+
+// TestBoardMemLimitFromConfig pins that toolboxes without an explicit limit (one-
+// shot kbtool call, stdio mcp, CLI local fallback) honor message_board_max_memory,
+// and that an invalid value falls back to the default instead of blocking.
+func TestBoardMemLimitFromConfig(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	cfgFile := filepath.Join(os.Getenv("KBTOOL_DIR"), "config.json")
+	if err := os.WriteFile(cfgFile, []byte(`{"version":1,"message_board":true,"message_board_max_memory":"2KiB"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	seed := dumpSignup(t, tb, "alice")
+	if tb.boardLimit() != 2048 {
+		t.Fatalf("limit = %d, want 2048 from config", tb.boardLimit())
+	}
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "x", "text": strings.Repeat("y", 4096), "seed": seed})); !isErr || !strings.Contains(out, "message board is full") {
+		t.Fatalf("config limit not enforced: %s", out)
+	}
+
+	if err := os.WriteFile(cfgFile, []byte(`{"version":1,"message_board":true,"message_board_max_memory":"nonsense"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tb2 := &Toolbox{Store: tb.Store, BoardPath: tb.BoardPath}
+	if got := tb2.boardLimit(); got != boardMemBase()/4 {
+		t.Fatalf("invalid config value must fall back to the default, got %d", got)
+	}
+}
+
+// TestPersistDaemonArgsRecordsBoardMaxMemory pins that an explicit
+// -board-max-memory on `daemon start` is recorded like the other daemon flags,
+// so a later bare start keeps the operator's limit.
+func TestPersistDaemonArgsRecordsBoardMaxMemory(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	if !persistDaemonArgs([]string{"-board-max-memory", "512MiB"}) {
+		t.Fatal("explicit flag should write the config")
+	}
+	c, err := loadConfig()
+	if err != nil || c == nil || c.BoardMaxMemory != "512MiB" {
+		t.Fatalf("config = %+v, %v", c, err)
+	}
+}
+
+// TestDaemonRefusesInvalidBoardMemLimit pins fail-fast startup (built binary):
+// an unparseable -board-max-memory exits with the reason before any pid file or
+// socket exists, rather than serving with a surprise limit.
+func TestDaemonRefusesInvalidBoardMemLimit(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	bin := filepath.Join(t.TempDir(), "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	state := shortStateDir(t)
+	c := exec.Command(bin, "daemon", "run", "-board-max-memory", "bogus")
+	c.Env = append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KB_EMBED_URL=")
+	out, err := c.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "invalid board memory limit") || !strings.Contains(string(out), "-board-max-memory") {
+		t.Fatalf("daemon must refuse a bad limit: %v\n%s", err, out)
+	}
+	if ents, _ := os.ReadDir(state); len(ents) != 0 {
+		t.Fatalf("a refused start must leave no state, found %d entries", len(ents))
+	}
+}
+
+// ---------- 31. mTLS client bootstrap (plans/mtls-client-bootstrap-plan.md) ----------
+
+// bootFixture is an in-process enrollment port wired exactly like the daemon's
+// (bootstrapTLSConfig + serveBootstrap + tlsHandler/plainHandler).
+type bootFixture struct {
+	dir    string
+	caKey  *ecdsa.PrivateKey
+	caCert *x509.Certificate
+	cli    *x509.Certificate
+	bs     *bootstrapState
+	hp     string
+	port   int
+}
+
+// startBootFixture serves a fresh PKI; prepare runs before serving (so tests can
+// tamper with state without racing the server goroutines).
+func startBootFixture(t *testing.T, prepare func(f *bootFixture, store *crlStore)) *bootFixture {
+	t.Helper()
+	f := &bootFixture{dir: t.TempDir()}
+	f.caKey, f.caCert = writeTestClientPKI(t, f.dir)
+	srvKey, srvCert := cryptoGenerateLeaf(f.caKey, f.caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	writeTestPEM(t, f.dir, "server.crt", cryptoPEMCert(srvCert))
+	writeTestPEM(t, f.dir, "server.key", cryptoPEMKey(srvKey))
+	cli, err := cryptoFirstCert(filepath.Join(f.dir, "client.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cli = cli
+	store := &crlStore{ca: f.caCert}
+	strict, err := cryptoServerTLSConfig(filepath.Join(f.dir, "server.crt"), filepath.Join(f.dir, "server.key"), filepath.Join(f.dir, "ca.crt"), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.port = ln.Addr().(*net.TCPAddr).Port
+	f.hp = fmt.Sprintf("127.0.0.1:%d", f.port)
+	f.bs, err = newBootstrapState(filepath.Join(f.dir, "ca.crt"), filepath.Join(f.dir, "client.crt"), filepath.Join(f.dir, "client.key"), []string{"127.0.0.1"}, f.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(f, store)
+	}
+	tlsSrv := &http.Server{Handler: f.bs.tlsHandler(httpHandler(&fakeExec{})), TLSConfig: bootstrapTLSConfig(strict), ReadHeaderTimeout: 5 * time.Second}
+	plainSrv := &http.Server{Handler: f.bs.plainHandler(), ReadHeaderTimeout: 5 * time.Second}
+	serveBootstrap(ln, tlsSrv, plainSrv, make(chan error, 2))
+	t.Cleanup(func() { _ = tlsSrv.Close(); _ = plainSrv.Close(); _ = ln.Close() })
+	return f
+}
+
+// httpsClient trusts the fixture CA; withCert adds the fixture client certificate.
+func (f *bootFixture) httpsClient(t *testing.T, withCert bool) *http.Client {
+	t.Helper()
+	pool := x509.NewCertPool()
+	pool.AddCert(f.caCert)
+	cfg := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if withCert {
+		pair, err := tls.LoadX509KeyPair(filepath.Join(f.dir, "client.crt"), filepath.Join(f.dir, "client.key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
+	}
+	return &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg}}
+}
+
+func httpGetStatus(t *testing.T, c *http.Client, url string) (int, []byte) {
+	t.Helper()
+	resp, err := c.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, b
+}
+
+// TestCAFingerprintFormat: why — `kbtool mtls` and `status` still print the CA
+// fingerprint for humans: the full SHA-256 as 43-char base64url, distinct per CA.
+func TestCAFingerprintFormat(t *testing.T) {
+	_, ca := cryptoGenerateCA("fp CA", time.Hour)
+	fp := caFingerprint(ca.Raw)
+	sum := sha256.Sum256(ca.Raw)
+	if len(fp) != 43 || fp != base64.RawURLEncoding.EncodeToString(sum[:]) {
+		t.Fatalf("fingerprint %q is not the 43-char base64url SHA-256", fp)
+	}
+	if _, other := cryptoGenerateCA("other CA", time.Hour); caFingerprint(other.Raw) == fp {
+		t.Fatal("different CAs must have different fingerprints")
+	}
+}
+
+// TestParseImportURL: why — -import accepts only the daemon URL (file import was
+// removed); anything else (http, paths, credentials) must be refused up front.
+func TestParseImportURL(t *testing.T) {
+	ok := map[string]struct {
+		host string
+		port int
+	}{
+		"https://kb.example:1234/": {"kb.example", 1234},
+		"https://kb.example:1234":  {"kb.example", 1234},
+		"https://10.0.0.5/":        {"10.0.0.5", defHTTPPort},
+		"https://[::1]:9876/":      {"::1", 9876},
+	}
+	for in, want := range ok {
+		h, p, err := parseImportURL(in, defHTTPPort)
+		if err != nil || h != want.host || p != want.port {
+			t.Errorf("parseImportURL(%q) = %q %d %v, want %q %d", in, h, p, err, want.host, want.port)
+		}
+	}
+	for _, bad := range []string{"client.kbx", "/tmp/client.kbx", "http://kb.example:9876/", "https://kb.example:9876/mcp",
+		"https://kb.example/?x=1", "https://u:p@kb.example/", "https://:9876/", "https://kb.example:0/", "https://kb.example:99999/"} {
+		if _, _, err := parseImportURL(bad, defHTTPPort); err == nil {
+			t.Errorf("parseImportURL(%q) must fail", bad)
+		}
+	}
+}
+
+// TestBootstrapPortRouting: why — one port now speaks plain HTTP, TLS and mTLS;
+// the security boundary is that plain HTTP yields only the public CA, TLS without
+// a certificate yields only the encrypted bundle, and every API stays mTLS-only.
+func TestBootstrapPortRouting(t *testing.T) {
+	f := startBootFixture(t, nil)
+	plain := &http.Client{Timeout: 10 * time.Second}
+	if code, body := httpGetStatus(t, plain, "http://"+f.hp+"/ca.crt"); code != 200 || !bytes.Equal(body, f.bs.CAPEM) {
+		t.Fatalf("plain /ca.crt: %d", code)
+	}
+	for _, p := range []string{"/", "/healthz", "/mcp", "/bundle/" + f.bs.ID} {
+		if code, _ := httpGetStatus(t, plain, "http://"+f.hp+p); code != 404 {
+			t.Errorf("plain %s: got %d, want 404", p, code)
+		}
+	}
+	anon := f.httpsClient(t, false)
+	for _, p := range []string{"/healthz", "/mcp", "/ca.crt"} {
+		if code, _ := httpGetStatus(t, anon, "https://"+f.hp+p); code != 401 {
+			t.Errorf("TLS without cert %s: got %d, want 401", p, code)
+		}
+	}
+	if resp, err := anon.Post("https://"+f.hp+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)); err != nil || resp.StatusCode != 401 {
+		t.Fatalf("POST /mcp without cert must be 401: %v %v", resp, err)
+	}
+	for _, p := range []string{"/bundle/", "/bundle/" + f.bs.ID[:21], "/bundle/" + f.bs.ID + "x", "/bundle/" + base64.RawURLEncoding.EncodeToString(f.bs.Key)} {
+		if code, _ := httpGetStatus(t, anon, "https://"+f.hp+p); code != 404 {
+			t.Errorf("TLS %s: got %d, want 404", p, code)
+		}
+	}
+	code, data := httpGetStatus(t, anon, "https://"+f.hp+"/bundle/"+f.bs.ID)
+	if code != 200 {
+		t.Fatalf("bundle: %d", code)
+	}
+	if _, err := cryptoDecryptBundle(data, f.bs.Key); err != nil {
+		t.Fatalf("bundle must decrypt with the boot key: %v", err)
+	}
+	if code, _ := httpGetStatus(t, f.httpsClient(t, true), "https://"+f.hp+"/healthz"); code != 200 {
+		t.Fatalf("mTLS /healthz: %d", code)
+	}
+}
+
+// TestBootstrapBundleFreshPerRequest: why — the bundle is encrypted on the fly
+// with a fresh nonce, so two downloads never share ciphertext yet carry the
+// same four files.
+func TestBootstrapBundleFreshPerRequest(t *testing.T) {
+	f := startBootFixture(t, nil)
+	anon := f.httpsClient(t, false)
+	_, a := httpGetStatus(t, anon, "https://"+f.hp+"/bundle/"+f.bs.ID)
+	_, b := httpGetStatus(t, anon, "https://"+f.hp+"/bundle/"+f.bs.ID)
+	if bytes.Equal(a, b) {
+		t.Fatal("two bundle downloads must differ in ciphertext")
+	}
+	var got []map[string][]byte
+	for _, d := range [][]byte{a, b} {
+		plain, err := cryptoDecryptBundle(d, f.bs.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := tarGZFilesMem(plain, bundleAllowed, 1<<20)
+		if err != nil || len(m) != 4 {
+			t.Fatalf("bundle files: %v %d", err, len(m))
+		}
+		got = append(got, m)
+	}
+	if !reflect.DeepEqual(got[0], got[1]) {
+		t.Fatal("both downloads must carry the same files")
+	}
+}
+
+// TestBootstrapRevokedCertRefused: why — making the client certificate optional
+// at the handshake must not weaken revocation: a revoked certificate is still
+// refused, while certificate-less enrollment keeps working.
+func TestBootstrapRevokedCertRefused(t *testing.T) {
+	f := startBootFixture(t, func(f *bootFixture, store *crlStore) {
+		now := time.Now()
+		der, err := x509.CreateRevocationList(crand.Reader, &x509.RevocationList{
+			Number: big.NewInt(1), ThisUpdate: now.Add(-time.Minute), NextUpdate: now.Add(time.Hour),
+			RevokedCertificateEntries: []x509.RevocationListEntry{{SerialNumber: f.cli.SerialNumber, RevocationTime: now}},
+		}, f.caCert, f.caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crl, err := x509.ParseRevocationList(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.set([]*x509.RevocationList{crl})
+	})
+	if resp, err := f.httpsClient(t, true).Get("https://" + f.hp + "/healthz"); err == nil {
+		resp.Body.Close()
+		t.Fatalf("revoked client cert must be refused, got %d", resp.StatusCode)
+	}
+	if code, _ := httpGetStatus(t, f.httpsClient(t, false), "https://"+f.hp+"/bundle/"+f.bs.ID); code != 200 {
+		t.Fatalf("enrollment without a cert must still work: %d", code)
+	}
+}
+
+// TestClientImportEndToEnd: why — the one-liner's whole client path (bundle
+// fetch from the derived ID, decrypt with the token key, server checked against
+// the bundled CA, install, mTLS check) must leave a client.json that reaches the
+// daemon at the imported host:port.
+func TestClientImportEndToEnd(t *testing.T) {
+	f := startBootFixture(t, nil)
+	cli := t.TempDir()
+	t.Setenv("KBTOOL_DIR", cli)
+	files, err := bootstrapFetchBundle(f.hp, "127.0.0.1", "", f.bs.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, err := bootstrapInstall(cli, files, "127.0.0.1", f.port, "", false)
+	if err != nil || len(written) != 4 {
+		t.Fatalf("install: %v %v", written, err)
+	}
+	assertOnlyClientFiles(t, cli)
+	if fi, err := os.Stat(filepath.Join(cli, "client.key")); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("client.key must be 0600: %v %v", fi, err)
+	}
+	cc, err := loadClientConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cc.Host != "127.0.0.1" || cc.Port != f.port || len(cc.Hosts) != 0 || !cc.TLS || cc.UnixSocket != "" {
+		t.Fatalf("client.json must point at the imported URL: %+v", cc)
+	}
+	ep, _, ok := endpointForHostPort(cc, cc.Host)
+	if !ok {
+		t.Fatal("imported credentials do not load")
+	}
+	if err := pingEndpoint(ep); err != nil {
+		t.Fatalf("mTLS after import: %v", err)
+	}
+}
+
+// TestBootstrapInterceptorRefused: why — without a fingerprint the client
+// fetches the bundle before trusting the server; an interceptor with its own
+// CA that proxies the real (encrypted) bundle must still be refused once the
+// bundle reveals the true CA.
+func TestBootstrapInterceptorRefused(t *testing.T) {
+	f := startBootFixture(t, nil)
+	caKey, ca := cryptoGenerateCA("interceptor CA", time.Hour)
+	k, c := cryptoGenerateLeaf(caKey, ca, "mitm", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	upstream := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	mitm := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp, err := upstream.Get("https://" + f.hp + r.URL.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	mitm.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{c.Raw}, PrivateKey: k}}}
+	mitm.StartTLS()
+	defer mitm.Close()
+	hp := strings.TrimPrefix(mitm.URL, "https://")
+	if _, err := bootstrapFetchBundle(hp, "127.0.0.1", "", f.bs.Key); err == nil || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("an interceptor proxying the real bundle must be refused: %v", err)
+	}
+}
+
+// TestBootstrapStaleOrWrongToken: why — a stale line (daemon restarted) or a
+// mistyped key derives an unknown bundle ID and must fail with an actionable
+// message, never a partial install.
+func TestBootstrapStaleOrWrongToken(t *testing.T) {
+	f := startBootFixture(t, nil)
+	wrong := append([]byte{}, f.bs.Key...)
+	wrong[0] ^= 1
+	if _, err := bootstrapFetchBundle(f.hp, "127.0.0.1", "", wrong); err == nil || !strings.Contains(err.Error(), "does not know this token") {
+		t.Fatalf("wrong key: %v", err)
+	}
+}
+
+// TestBootstrapSwappedBundleCARejected: why — the bundled ca.crt becomes the
+// client's trust anchor, so the server the client actually talked to must hold
+// a certificate from that CA.
+func TestBootstrapSwappedBundleCARejected(t *testing.T) {
+	f := startBootFixture(t, func(f *bootFixture, _ *crlStore) {
+		_, other := cryptoGenerateCA("swapped CA", time.Hour)
+		f.bs.files["ca.crt"] = cryptoPEMCert(other)
+	})
+	if _, err := bootstrapFetchBundle(f.hp, "127.0.0.1", "", f.bs.Key); err == nil || !strings.Contains(err.Error(), "not valid for 127.0.0.1 under the bundled CA") {
+		t.Fatalf("swapped bundled CA must be refused: %v", err)
+	}
+}
+
+// TestBootstrapInstallOverwrite: why — enrolling must not silently replace an
+// existing client identity; identical files (an already-trusted CA) need no -yes.
+func TestBootstrapInstallOverwrite(t *testing.T) {
+	f := startBootFixture(t, nil)
+	files := func() map[string][]byte {
+		m, err := bootstrapFetchBundle(f.hp, "127.0.0.1", "", f.bs.Key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	cli := t.TempDir()
+	writeTestPEM(t, cli, "ca.crt", f.bs.CAPEM)
+	if w, err := bootstrapInstall(cli, files(), "127.0.0.1", f.port, "", false); err != nil || len(w) != 3 {
+		t.Fatalf("identical ca.crt must be left alone: %v %v", w, err)
+	}
+	writeTestPEM(t, cli, "client.key", []byte("old identity"))
+	if _, err := bootstrapInstall(cli, files(), "127.0.0.1", f.port, "", false); err == nil || !strings.Contains(err.Error(), "-yes") {
+		t.Fatalf("differing client.key must need -yes: %v", err)
+	}
+	if string(mustReadFile(t, filepath.Join(cli, "client.key"))) != "old identity" {
+		t.Fatal("a refused install must not write anything")
+	}
+	if _, err := bootstrapInstall(cli, files(), "127.0.0.1", f.port, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if string(mustReadFile(t, filepath.Join(cli, "client.key"))) == "old identity" {
+		t.Fatal("-yes must replace client.key")
+	}
+}
+
+// TestBootstrapImportLines: why — the boot line is the user interface: one line
+// per server address, the readable URL followed by a direct token that parses
+// back to the boot key, whose derived bundle ID is the one the daemon serves.
+func TestBootstrapImportLines(t *testing.T) {
+	f := startBootFixture(t, nil)
+	lines := f.bs.importLines([]string{"kb.example", "10.0.0.5", "::1"}, 9876)
+	if len(lines) != 3 || !strings.Contains(lines[2], "https://[::1]:9876/") {
+		t.Fatalf("import lines: %q", lines)
+	}
+	for _, l := range lines {
+		w := strings.Fields(l)
+		if len(w) != 5 || w[1] != "client" || w[2] != "-import" {
+			t.Fatalf("malformed line %q", l)
+		}
+		if _, _, err := parseImportURL(w[3], defHTTPPort); err != nil {
+			t.Fatalf("URL does not parse back: %q", l)
+		}
+		tok, err := parseEnrollToken(w[4])
+		if err != nil || tok.Host != "" || tok.Session != "" || !bytes.Equal(tok.Key, f.bs.Key) {
+			t.Fatalf("token does not parse back to the boot key: %q %+v %v", l, tok, err)
+		}
+	}
+	if len(f.bs.Key) != 16 || f.bs.ID != bundleIDFromKey(f.bs.Key) {
+		t.Fatalf("key must be 16 bytes and the bundle ID derived from it: %d %q", len(f.bs.Key), f.bs.ID)
+	}
+	hosts, port := bootstrapHosts(filepath.Join(f.dir, "server.crt"), &net.TCPAddr{Port: 4321})
+	if port != 4321 || !reflect.DeepEqual(hosts, []string{"127.0.0.1"}) {
+		t.Fatalf("bootstrapHosts = %v %d", hosts, port)
+	}
+}
+
+// TestDaemonLogPrivateAndRelayed: why — the log now holds the enrollment key, so
+// an existing 0644 log is tightened to 0600; `daemon start` relays each
+// endpoint's command once, from the new daemon's log entries only (not stale
+// ones from earlier boots).
+func TestDaemonLogPrivateAndRelayed(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "daemon.log")
+	if err := os.WriteFile(p, []byte("kbtool client -import https://old:1/ kb1old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	f, off, err := openDaemonLog(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(f, "kbtool daemon: client enrollment enabled")
+	fmt.Fprintln(f, "kbtool daemon: enroll a client via new:2: kbtool client -import https://new:2/ kb1new")
+	fmt.Fprintln(f, "kbtool daemon: enroll a client via 10.0.0.5:2: kbtool client -import https://10.0.0.5:2/ kb1new")
+	fmt.Fprintln(f, "kbtool client -import https://new:2/ kb1new")
+	f.Close()
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0600 {
+		t.Fatalf("log mode %v, want 0600", fi.Mode().Perm())
+	}
+	var buf bytes.Buffer
+	relayImportLines(&buf, p, off)
+	out := buf.String()
+	if strings.Contains(out, "old:1") || strings.Count(out, "  kbtool client -import https://new:2/ ") != 1 ||
+		strings.Count(out, "  kbtool client -import https://10.0.0.5:2/ ") != 1 {
+		t.Fatalf("relay must show each new endpoint's command once:\n%s", out)
+	}
+}
+
+// ---------- 32. kbtool mtls default SANs (plans/mtls-default-sans-plan.md) ----------
+
+// TestDefaultSANs: why — without SAN arguments the certificate must cover every
+// dialable address of the host, its hostname and host.docker.internal, while
+// link-local/unspecified addresses (undialable without a zone, and each SAN
+// becomes a client.json endpoint) are left out.
+func TestDefaultSANs(t *testing.T) {
+	cidr := func(s string) net.Addr {
+		ip, n, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.IP = ip
+		return n
+	}
+	addrs := []net.Addr{
+		cidr("127.0.0.1/8"), cidr("::1/128"), cidr("192.168.1.20/24"), cidr("fe80::1/64"),
+		cidr("169.254.3.4/16"), cidr("10.0.0.5/8"), &net.IPAddr{IP: net.ParseIP("2001:db8::7")},
+		cidr("10.0.0.5/32"), &net.IPAddr{IP: net.IPv4zero}, &net.IPAddr{IP: net.ParseIP("ff02::1")},
+	}
+	ips, names := defaultSANs(addrs, "buildhost")
+	if want := []string{"127.0.0.1", "::1", "192.168.1.20", "10.0.0.5", "2001:db8::7"}; !reflect.DeepEqual(ips, want) {
+		t.Errorf("ips = %v, want %v", ips, want)
+	}
+	if want := []string{"buildhost", "host.docker.internal"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("names = %v, want %v", names, want)
+	}
+	for _, bad := range []string{"", "10.1.2.3", "bad_host-", "-x", "host.docker.internal"} {
+		_, names := defaultSANs(nil, bad)
+		if !reflect.DeepEqual(names, []string{"host.docker.internal"}) {
+			t.Errorf("hostname %q: names = %v, want only host.docker.internal", bad, names)
+		}
+	}
+}
+
+// TestMtlsNoArgsUsesDefaultSANs: why — the user-facing promise: a bare
+// `kbtool mtls` issues a usable certificate for this host (interface IPs,
+// hostname, host.docker.internal), while explicit SANs get no defaults mixed in.
+func TestMtlsNoArgsUsesDefaultSANs(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	issue := func(dir string, args ...string) *x509.Certificate {
+		t.Helper()
+		c := exec.Command(bin, append([]string{"mtls"}, args...)...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work)
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("mtls %v: %v\n%s", args, err, out)
+		}
+		cert, err := cryptoFirstCert(filepath.Join(dir, "server.crt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skip("no interface addresses:", err)
+	}
+	host, _ := os.Hostname()
+	wantIPs, wantNames := defaultSANs(addrs, host)
+	cert := issue(filepath.Join(work, "def"))
+	if err := verifyCertSANs(cert, wantIPs, wantNames); err != nil {
+		t.Fatalf("default cert: %v", err)
+	}
+	if !containsString(cert.DNSNames, "host.docker.internal") || len(cert.IPAddresses) == 0 {
+		t.Fatalf("default cert SANs: ip=%v dns=%v", cert.IPAddresses, cert.DNSNames)
+	}
+	if fileExists(filepath.Join(work, "def", "client.json")) {
+		t.Fatal("kbtool mtls must not write a client.json on the daemon host")
+	}
+	explicit := issue(filepath.Join(work, "exp"), "-ip", "127.0.0.1", "-expire", "48h")
+	if len(explicit.IPAddresses) != 1 || len(explicit.DNSNames) != 0 {
+		t.Fatalf("explicit SANs must not get defaults: ip=%v dns=%v", explicit.IPAddresses, explicit.DNSNames)
+	}
+}
+
+// TestDaemonLogsEnrollmentPerSAN: why — the user picks the address a client can
+// reach, so every SAN endpoint gets its own copyable command, exactly once in
+// the log: bare when stdout is the log, prefixed entries when stdout is separate.
+func TestDaemonLogsEnrollmentPerSAN(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	srv := shortStateDir(t)
+	env := append(os.Environ(), "KBTOOL_DIR="+srv, "HOME="+work, "KB_EMBED_URL=")
+	mt := exec.Command(bin, "mtls", "-ip", "127.0.0.1,::1", "-dns", "localhost,kb.test")
+	mt.Env = env
+	if out, err := mt.CombinedOutput(); err != nil {
+		t.Fatalf("mtls: %v\n%s", err, out)
+	}
+	endpoints := []string{"localhost", "kb.test", "127.0.0.1", "::1"}
+	boot := func(sep bool) (logText, outText string, port int) {
+		t.Helper()
+		port = freePort(t)
+		d := exec.Command(bin, "daemon", "run", "-http", "-mtls", "-bind", fmt.Sprintf("127.0.0.1:%d", port))
+		d.Env = env
+		logPath := filepath.Join(work, fmt.Sprintf("log-%v", sep))
+		outPath := filepath.Join(work, fmt.Sprintf("out-%v", sep))
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lf.Close()
+		d.Stderr = lf
+		d.Stdout = lf
+		if sep {
+			of, err := os.Create(outPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer of.Close()
+			d.Stdout = of
+		}
+		if err := d.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = d.Process.Kill(); _, _ = d.Process.Wait() }()
+		waitImportLine(t, logPath, fmt.Sprintf("https://[::1]:%d/", port), 15*time.Second)
+		lb, _ := os.ReadFile(logPath)
+		ob, _ := os.ReadFile(outPath)
+		return string(lb), string(ob), port
+	}
+	count := func(text, prefix, hp string) int {
+		n := 0
+		for _, l := range strings.Split(text, "\n") {
+			if strings.HasPrefix(l, prefix+"kbtool client -import https://"+hp+"/ kb1") {
+				n++
+			}
+		}
+		return n
+	}
+	entry := func(hp string) string { return "kbtool daemon: enroll a client via " + hp + ": " }
+	// stdout == log: bare commands only, one per endpoint.
+	logText, _, port := boot(false)
+	for _, h := range endpoints {
+		hp := net.JoinHostPort(h, strconv.Itoa(port))
+		if count(logText, "", hp) != 1 || strings.Contains(logText, entry(hp)) {
+			t.Fatalf("stdout == log: want one bare command for %s and no prefixed entry:\n%s", hp, logText)
+		}
+	}
+	// Separate stdout: bare commands there, one prefixed entry per endpoint in the log.
+	logText, outText, port := boot(true)
+	for _, h := range endpoints {
+		hp := net.JoinHostPort(h, strconv.Itoa(port))
+		if count(outText, "", hp) != 1 || count(logText, entry(hp), hp) != 1 {
+			t.Fatalf("separate stdout: want one bare command on stdout and one log entry for %s:\nstdout:\n%s\nlog:\n%s", hp, outText, logText)
+		}
+	}
+}
+
+// ---------- 33. mTLS implies HTTP on all interfaces (plans/mtls-implies-http-plan.md) ----------
+
+// TestResolveHTTP: why — mTLS exists to share the daemon over the network, so
+// with mTLS on HTTP must default on; an explicit -http/-http=false still wins
+// and plain (non-mTLS) daemons keep HTTP off unless asked.
+func TestResolveHTTP(t *testing.T) {
+	on, off := &config{Http: true}, &config{}
+	cases := []struct {
+		name             string
+		flagSet, flagVal bool
+		cfg              *config
+		mtls, want       bool
+	}{
+		{"nothing: off", false, false, nil, false, false},
+		{"config http", false, false, on, false, true},
+		{"mTLS implies HTTP", false, false, off, true, true},
+		{"mTLS, no config", false, false, nil, true, true},
+		{"-http=false wins over mTLS", true, false, on, true, false},
+		{"-http wins without mTLS", true, true, off, false, true},
+	}
+	for _, c := range cases {
+		if got := resolveHTTP(c.flagSet, c.flagVal, c.cfg, c.mtls); got != c.want {
+			t.Errorf("%s: resolveHTTP = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestDaemonMtlsServesHTTPByDefault: why — the user-facing promise through the
+// built binary: `daemon run -mtls` listens on TCP on every interface without
+// -http, and -http=false keeps it unix-socket only.
+func TestDaemonMtlsServesHTTPByDefault(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	srv := shortStateDir(t)
+	env := append(os.Environ(), "KBTOOL_DIR="+srv, "HOME="+work, "KB_EMBED_URL=")
+	mt := exec.Command(bin, "mtls", "-ip", "127.0.0.1")
+	mt.Env = env
+	if out, err := mt.CombinedOutput(); err != nil {
+		t.Fatalf("mtls: %v\n%s", err, out)
+	}
+	// kbtool mtls records http: true; drop it so only mTLS can turn HTTP on.
+	cfgPath := filepath.Join(srv, "config.json")
+	var raw map[string]any
+	if err := json.Unmarshal(mustReadFile(t, cfgPath), &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "http")
+	delete(raw, "http_addr")
+	b, _ := json.Marshal(raw)
+	if err := os.WriteFile(cfgPath, b, 0644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(extra ...string) (string, int) {
+		t.Helper()
+		port := freePort(t)
+		args := append([]string{"daemon", "run", "-bind", fmt.Sprintf(":%d", port)}, extra...)
+		d := exec.Command(bin, args...)
+		d.Env = env
+		logPath := filepath.Join(work, fmt.Sprintf("log-%d", port))
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lf.Close()
+		d.Stdout, d.Stderr = lf, lf
+		if err := d.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = d.Process.Kill(); _, _ = d.Process.Wait() }()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if l := string(mustReadFile(t, logPath)); strings.Contains(l, "serving") || strings.Contains(l, "board-only mode") {
+				return l, port
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("daemon did not come up:\n%s", mustReadFile(t, logPath))
+		return "", 0
+	}
+	logText, port := run()
+	if !strings.Contains(logText, fmt.Sprintf("https://*:%d", port)) {
+		t.Fatalf("mTLS daemon must serve HTTPS on all interfaces by default:\n%s", logText)
+	}
+	logText, port = run("-http=false")
+	if strings.Contains(logText, fmt.Sprintf(":%d", port)) || !strings.Contains(logText, "[mtls]") {
+		t.Fatalf("-http=false must keep the mTLS daemon unix-socket only:\n%s", logText)
+	}
+}
+
+// ---------- 34. mTLS relay (plans/mtls-relay-plan.md) ----------
+
+// startTestRelay serves a relay with a fresh relay PKI on 127.0.0.1; tune may
+// shrink its limits before it serves.
+func startTestRelay(t *testing.T, token string, tune func(*relayServer)) (*relayServer, string) {
+	t.Helper()
+	rs := newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour), token)
+	if tune != nil {
+		tune(rs)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go rs.serve(ln)
+	t.Cleanup(func() { _ = ln.Close(); rs.shutdown() })
+	return rs, ln.Addr().String()
+}
+
+// newRelaySessionID is a well-formed session ID with no key behind it.
+func newRelaySessionID() string {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// newTestRelaySession makes a session key and its ID, expiring at exp.
+func newTestRelaySession(t *testing.T, exp time.Time) (string, *relaySessionAuth) {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(crand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &relaySessionAuth{Key: key, Expires: exp.Unix()}
+	return relaySessionID(key.Public().(ed25519.PublicKey), a.Expires), a
+}
+
+// registerTestSession registers sid with the relay at hp, signed by auth (nil:
+// unsigned), trusting the relay CA fetched over HTTP.
+func registerTestSession(hp, sid string, auth *relaySessionAuth, token string) (net.Conn, error) {
+	pool, _, err := relayFetchCA(hp)
+	if err != nil {
+		return nil, err
+	}
+	var sign func(tls.ConnectionState) (map[string]string, error)
+	if auth != nil {
+		sign = func(cs tls.ConnectionState) (map[string]string, error) { return auth.headers(sid, cs) }
+	}
+	return relayUpgrade(hp, relayTLSClientConfig(pool), "/v1/register",
+		map[string]string{"X-Kbtool-Session": sid, "X-Kbtool-Relay-Token": token}, sign)
+}
+
+// registerNewTestSession registers a fresh valid session for an hour.
+func registerNewTestSession(t *testing.T, hp, token string) (string, net.Conn, error) {
+	t.Helper()
+	sid, auth := newTestRelaySession(t, time.Now().Add(time.Hour))
+	c, err := registerTestSession(hp, sid, auth, token)
+	return sid, c, err
+}
+
+// relayTeam is an in-process daemon behind a relay: its own team PKI, the
+// bootstrap handler and a relayConnector.
+type relayTeam struct {
+	dir, sid string
+	boot     *bootstrapState
+	conn     *relayConnector
+}
+
+func startRelayTeam(t *testing.T, rs *relayServer, hp, token string) *relayTeam {
+	t.Helper()
+	return startRelayTeamTrust(t, rs, hp, token, relayTrust{})
+}
+
+// startRelayTeamTrust is startRelayTeam with the daemon verifying the relay by trust.
+func startRelayTeamTrust(t *testing.T, rs *relayServer, hp, token string, trust relayTrust) *relayTeam {
+	t.Helper()
+	dir := t.TempDir()
+	caKey, caCert := writeTestClientPKI(t, dir)
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	writeTestPEM(t, dir, "server.crt", cryptoPEMCert(srvCert))
+	writeTestPEM(t, dir, "server.key", cryptoPEMKey(srvKey))
+	tlsCfg, err := cryptoServerTLSConfig(filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key"), filepath.Join(dir, "ca.crt"), &crlStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(hp)
+	p, _ := strconv.Atoi(port)
+	boot, err := newBootstrapState(filepath.Join(dir, "ca.crt"), filepath.Join(dir, "client.crt"), filepath.Join(dir, "client.key"), []string{"127.0.0.1"}, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") })
+	ln := newChanListener(&net.TCPAddr{})
+	srv := &http.Server{Handler: boot.tlsHandler(mux), TLSConfig: relayServerTLS(bootstrapTLSConfig(tlsCfg), caCert.Raw)}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	sid, auth := newTestRelaySession(t, caCert.NotAfter)
+	team := &relayTeam{dir: dir, sid: sid, boot: boot}
+	team.conn = &relayConnector{HostPort: hp, Session: team.sid, Token: token, Auth: auth, Trust: trust,
+		Deliver: func(c net.Conn) bool {
+			select {
+			case ln.ch <- c:
+				return true
+			case <-ln.done:
+				return false
+			}
+		},
+		Logf: func(string, ...any) {}}
+	go team.conn.run()
+	t.Cleanup(func() { team.conn.close(); _ = srv.Close(); _ = ln.Close() })
+	waitRelaySession(t, rs, team.sid, true)
+	return team
+}
+
+// waitRelaySession waits until the relay has (or no longer has) a live session.
+func waitRelaySession(t *testing.T, rs *relayServer, sid string, live bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		rs.mu.Lock()
+		s := rs.sessions[sid]
+		ok := s != nil && s.ctrl != nil
+		rs.mu.Unlock()
+		if ok == live {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("relay session %s live=%v never reached", sid, live)
+}
+
+// enrollViaRelay runs the client side of a relay token's `client -import` into a
+// fresh state dir and points KBTOOL_DIR at it.
+func enrollViaRelay(t *testing.T, hp string, team *relayTeam) *clientConfig {
+	t.Helper()
+	cli := t.TempDir()
+	files, err := bootstrapFetchBundle(hp, "127.0.0.1", team.sid, team.boot.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, _ := net.SplitHostPort(hp)
+	p, _ := strconv.Atoi(port)
+	if _, err := bootstrapInstall(cli, files, "127.0.0.1", p, team.sid, false); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KBTOOL_DIR", cli)
+	cc, err := loadClientConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cc
+}
+
+func pingRelayed(cc *clientConfig) error {
+	ep, _, ok := endpointForHostPort(cc, cc.Host)
+	if !ok {
+		return errors.New("client config does not load")
+	}
+	return pingEndpoint(ep)
+}
+
+// relayTapBuf records what the relay copies from clients to daemons.
+type relayTapBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (r *relayTapBuf) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.b.Write(p)
+}
+
+func (r *relayTapBuf) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.b.String()
+}
+
+// captureClientHello returns the first TLS record a Go client sends for serverName.
+func captureClientHello(t *testing.T, serverName string) []byte {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	go func() { _ = tls.Client(c1, &tls.Config{ServerName: serverName, InsecureSkipVerify: true}).Handshake() }()
+	_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(c2, hdr); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, int(hdr[3])<<8|int(hdr[4]))
+	if _, err := io.ReadFull(c2, body); err != nil {
+		t.Fatal(err)
+	}
+	return append(hdr, body...)
+}
+
+// TestRelaySessionIDShape: why — the session ID travels as SNI, so the ID
+// derived from a session key must be a valid lowercase DNS label, and the relay
+// routes only IDs of exactly this shape.
+func TestRelaySessionIDShape(t *testing.T) {
+	a, _ := newTestRelaySession(t, time.Now().Add(time.Hour))
+	b, _ := newTestRelaySession(t, time.Now().Add(time.Hour))
+	if !isRelaySessionID(a) || a == b || len(a) != 32 {
+		t.Fatalf("session IDs must be distinct 32-char lowercase hex: %q %q", a, b)
+	}
+	for _, bad := range []string{"", strings.ToUpper(a), a[:31], a + "0", "g" + a[1:], "localhost"} {
+		if isRelaySessionID(bad) {
+			t.Errorf("isRelaySessionID(%q) must be false", bad)
+		}
+	}
+}
+
+// TestClientHelloSNI: why — the relay routes on SNI it reads without
+// terminating TLS; the parser must find it in a real ClientHello, report its
+// absence, and never panic or over-read on truncated or corrupted input.
+func TestClientHelloSNI(t *testing.T) {
+	sid := newRelaySessionID()
+	rec := captureClientHello(t, sid)
+	got, err := peekClientHelloSNI(bufio.NewReader(bytes.NewReader(rec)))
+	if err != nil || got != sid {
+		t.Fatalf("SNI = %q, %v; want %q", got, err, sid)
+	}
+	if got, err := clientHelloSNI(captureClientHello(t, "")[5:]); err != nil || got != "" {
+		t.Fatalf("no SNI: got %q, %v", got, err)
+	}
+	for n := 0; n < len(rec); n++ {
+		if _, err := peekClientHelloSNI(bufio.NewReader(bytes.NewReader(rec[:n]))); err == nil {
+			t.Fatalf("truncated hello (%d of %d bytes) must be an error", n, len(rec))
+		}
+	}
+	r := rand.New(rand.NewSource(1))
+	for i := 0; i < 2000; i++ {
+		m := append([]byte{}, rec[5:]...)
+		for j := 0; j < 1+r.Intn(4); j++ {
+			m[r.Intn(len(m))] = byte(r.Intn(256))
+		}
+		_, _ = clientHelloSNI(m) // must not panic
+	}
+	if _, err := peekClientHelloSNI(bufio.NewReader(strings.NewReader("GET / HTTP/1.1\r\n\r\n"))); err == nil {
+		t.Fatal("plain HTTP is not a ClientHello")
+	}
+}
+
+// TestRelayPublicEndpoints: why — daemons bootstrap trust in the relay from
+// plain-HTTP /ca.crt, and /healthz serves health checks on both the plain and
+// the TLS side.
+func TestRelayPublicEndpoints(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	resp, err := http.Get("http://" + hp + "/ca.crt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(b, rs.currentPKI().CAPEM) {
+		t.Fatal("plain /ca.crt must serve the relay CA")
+	}
+	if !relayHealthy(hp) {
+		t.Fatal("plain /healthz must answer")
+	}
+	fp, err := relayCheck(hp, relayTrust{})
+	if err != nil || fp != rs.currentPKI().FP {
+		t.Fatalf("relayCheck (CA over HTTP, /healthz over HTTPS) = %q, %v; want %q", fp, err, rs.currentPKI().FP)
+	}
+	if resp, err := http.Get("http://" + hp + "/v1/register"); err != nil || resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("registration must not be reachable over plain HTTP: %v %v", resp, err)
+	}
+}
+
+// TestRelayRegistrationToken: why — with relay_token set only daemons that
+// present it may register a session; without it registration is open.
+func TestRelayRegistrationToken(t *testing.T) {
+	_, hp := startTestRelay(t, "tk", nil)
+	for _, tok := range []string{"", "wrong"} {
+		_, _, err := registerNewTestSession(t, hp, tok)
+		var he *relayHTTPError
+		if !errors.As(err, &he) || he.Code != http.StatusForbidden {
+			t.Fatalf("token %q: want 403, got %v", tok, err)
+		}
+	}
+	_, c, err := registerNewTestSession(t, hp, "tk")
+	if err != nil {
+		t.Fatalf("right token must register: %v", err)
+	}
+	c.Close()
+	_, open := startTestRelay(t, "", nil)
+	_, c, err = registerNewTestSession(t, open, "")
+	if err != nil {
+		t.Fatalf("open relay must accept registration without a token: %v", err)
+	}
+	c.Close()
+}
+
+// TestRelayDuplicateSessionAndForget: why — a live session cannot be taken
+// over by a second registration, and the relay forgets a session (rejecting its
+// SNI) when the daemon disconnects, so the ID can be registered again.
+func TestRelayDuplicateSessionAndForget(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	sid, auth := newTestRelaySession(t, time.Now().Add(time.Hour))
+	c, err := registerTestSession(hp, sid, auth, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRelaySession(t, rs, sid, true)
+	_, err = registerTestSession(hp, sid, auth, "")
+	var he *relayHTTPError
+	if !errors.As(err, &he) || he.Code != http.StatusConflict {
+		t.Fatalf("second live registration: want 409, got %v", err)
+	}
+	c.Close()
+	waitRelaySession(t, rs, sid, false)
+	if _, err := tls.Dial("tcp", hp, &tls.Config{ServerName: sid, InsecureSkipVerify: true}); err == nil {
+		t.Fatal("a forgotten session's SNI must be rejected")
+	}
+	c, err = registerTestSession(hp, sid, auth, "")
+	if err != nil {
+		t.Fatalf("a forgotten session ID must be registrable again: %v", err)
+	}
+	c.Close()
+	if _, err := registerTestSession(hp, "not-a-session", auth, ""); err == nil {
+		t.Fatal("a malformed session ID must be refused")
+	}
+}
+
+// TestRelayEndToEnd: why — the owner's scenario: a client enrolls with an
+// unreachable daemon through the relay (bundle decrypted with the token key,
+// server checked against the bundled CA), then makes mTLS calls with SNI =
+// session; the relay only copies ciphertext, and another session is refused.
+func TestRelayEndToEnd(t *testing.T) {
+	tap := &relayTapBuf{}
+	rs, hp := startTestRelay(t, "tk", func(rs *relayServer) { rs.tap = tap })
+	team := startRelayTeam(t, rs, hp, "tk")
+	cc := enrollViaRelay(t, hp, team)
+	if cc.Session != team.sid || cc.Host != "127.0.0.1" || !cc.TLS {
+		t.Fatalf("client.json must record the relay and session: %+v", cc)
+	}
+	if err := pingRelayed(cc); err != nil {
+		t.Fatalf("mTLS call through the relay: %v", err)
+	}
+	if s := tap.String(); s == "" || strings.Contains(s, "/healthz") || strings.Contains(s, "/bundle/") || strings.Contains(s, team.boot.ID) {
+		t.Fatalf("the relay must see only ciphertext (tap %d bytes)", len(s))
+	}
+	if _, err := bootstrapFetchBundle(hp, "127.0.0.1", newRelaySessionID(), team.boot.Key); err == nil {
+		t.Fatal("a token naming an unknown session must not enroll")
+	}
+	if _, err := tls.Dial("tcp", hp, &tls.Config{ServerName: newRelaySessionID(), InsecureSkipVerify: true}); err == nil {
+		t.Fatal("an unknown session's SNI must be rejected")
+	}
+}
+
+// TestRelayTwoSessionsIsolated: why — one relay carries many teams; a client
+// of team A that aims at team B's session reaches B's daemon but cannot
+// verify it (B's certificate is not signed by A's CA), and A keeps working.
+func TestRelayTwoSessionsIsolated(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	a := startRelayTeam(t, rs, hp, "")
+	b := startRelayTeam(t, rs, hp, "")
+	cc := enrollViaRelay(t, hp, a)
+	if err := pingRelayed(cc); err != nil {
+		t.Fatalf("team A through the relay: %v", err)
+	}
+	wrong := *cc
+	wrong.Session = b.sid
+	if err := pingRelayed(&wrong); err == nil {
+		t.Fatal("team A's client must not verify team B's daemon")
+	}
+}
+
+// TestRelayReconnectSameSession: why — clients keep reaching the daemon via
+// the same SNI, so after the relay drops the control stream the daemon must
+// re-register the SAME session ID, and the session is then usable again.
+func TestRelayReconnectSameSession(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	team := startRelayTeam(t, rs, hp, "")
+	cc := enrollViaRelay(t, hp, team)
+	rs.mu.Lock()
+	old := rs.sessions[team.sid]
+	rs.mu.Unlock()
+	_ = old.ctrl.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		rs.mu.Lock()
+		s := rs.sessions[team.sid]
+		rs.mu.Unlock()
+		if s != nil && s != old && s.ctrl != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon did not re-register its session")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := pingRelayed(cc); err != nil {
+		t.Fatalf("enrolled client after reconnect: %v", err)
+	}
+	team.conn.close()
+	waitRelaySession(t, rs, team.sid, false)
+	if err := pingRelayed(cc); err == nil {
+		t.Fatal("after the daemon disconnects the relay must reject its session")
+	}
+}
+
+// relayRawDial opens a TCP connection to the relay and sends a ClientHello
+// for sid, so the relay routes it without a TLS client finishing a handshake.
+func relayRawDial(t *testing.T, hp, sid string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(captureClientHello(t, sid)); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// relayReadsData reports whether the relay answered with data (true) or closed
+// the connection (false) within d.
+func relayReadsData(c net.Conn, d time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(d))
+	n, err := c.Read(make([]byte, 1))
+	return n > 0 && err == nil
+}
+
+// TestRelayLimits: why — the relay must bound its resources: streams per
+// session, a deadline for the daemon to accept, and an idle timeout on spliced
+// streams; a freed stream slot is reusable.
+func TestRelayLimits(t *testing.T) {
+	rs, hp := startTestRelay(t, "", func(rs *relayServer) {
+		rs.MaxPerSession = 1
+		rs.IdleTimeout = 400 * time.Millisecond
+	})
+	team := startRelayTeam(t, rs, hp, "")
+	first := relayRawDial(t, hp, team.sid)
+	if !relayReadsData(first, 5*time.Second) {
+		t.Fatal("first stream must reach the daemon (ServerHello)")
+	}
+	second := relayRawDial(t, hp, team.sid)
+	if relayReadsData(second, 5*time.Second) {
+		t.Fatal("a stream over the per-session limit must be closed")
+	}
+	second.Close()
+	start := time.Now()
+	_ = first.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _ = io.Copy(io.Discard, first) // the rest of the server flight, then EOF at idle
+	if el := time.Since(start); el < 300*time.Millisecond || el > 4*time.Second {
+		t.Fatalf("idle stream closed after %s, want about the 400ms idle timeout", el)
+	}
+	first.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		third := relayRawDial(t, hp, team.sid)
+		ok := relayReadsData(third, 2*time.Second)
+		third.Close()
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a freed stream slot must be reusable")
+		}
+	}
+
+	// A registered session that never accepts: the client is closed after AcceptTimeout.
+	rs2, hp2 := startTestRelay(t, "", func(rs *relayServer) { rs.AcceptTimeout = 300 * time.Millisecond })
+	sid, ctrl, err := registerNewTestSession(t, hp2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctrl.Close()
+	waitRelaySession(t, rs2, sid, true)
+	start = time.Now()
+	c := relayRawDial(t, hp2, sid)
+	defer c.Close()
+	line, err := bufio.NewReader(ctrl).ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "conn ") {
+		t.Fatalf("the relay must announce the stream on the control stream: %q %v", line, err)
+	}
+	if relayReadsData(c, 5*time.Second) {
+		t.Fatal("an unaccepted stream must be closed")
+	}
+	if el := time.Since(start); el < 250*time.Millisecond || el > 4*time.Second {
+		t.Fatalf("unaccepted stream closed after %s, want about the 300ms accept timeout", el)
+	}
+}
+
+// TestResolveHTTPRelay: why — a daemon with a relay must not open a TCP port
+// that bypasses the relay unless the admin asks (-http or config http).
+func TestResolveHTTPRelay(t *testing.T) {
+	relay := &config{RelayURL: "https://relay:9876/"}
+	relayHTTP := &config{RelayURL: "https://relay:9876/", Http: true}
+	if resolveHTTP(false, false, relay, true) {
+		t.Error("relay + mTLS: HTTP must default off")
+	}
+	if !resolveHTTP(true, true, relay, true) {
+		t.Error("relay: -http must turn HTTP on")
+	}
+	if !resolveHTTP(false, false, relayHTTP, true) {
+		t.Error("relay: config http must turn HTTP on")
+	}
+}
+
+// TestParseMtlsArgsRelay: why — `mtls -relay` takes the relay URL (default
+// port 9876, the daemon's) and an optional token; a token without a relay or a malformed
+// relay URL is a usage error, not silently ignored.
+func TestParseMtlsArgsRelay(t *testing.T) {
+	sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-token", "tk", "-dns", "extra.example"})
+	if err != nil || sa.relay != "https://relay.example/" || sa.token != "tk" || !reflect.DeepEqual(sa.names, []string{"extra.example"}) {
+		t.Fatalf("parse: %+v %v", sa, err)
+	}
+	if h, p, norm, err := relayHostPort(sa.relay); err != nil || h != "relay.example" || p != defRelayPort || norm != "https://relay.example:9876/" {
+		t.Fatalf("relayHostPort = %q %d %q %v", h, p, norm, err)
+	}
+	ca := filepath.Join(t.TempDir(), "relay-ca.pem")
+	_, caCert := cryptoGenerateCA("pinned", time.Hour)
+	writeTestPEM(t, filepath.Dir(ca), filepath.Base(ca), cryptoPEMCert(caCert))
+	if sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-relay-ca", "system"}); err != nil || sa.relayCA != "system" {
+		t.Fatalf("-relay-ca system: %+v %v", sa, err)
+	}
+	if sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-relay-ca", ca}); err != nil || sa.relayCA != ca {
+		t.Fatalf("-relay-ca FILE: %+v %v", sa, err)
+	}
+	for _, bad := range [][]string{{"-token", "tk"}, {"-relay", "http://relay/"}, {"-relay", "https://relay/x"},
+		{"-relay-ca", "system"}, {"-relay", "https://relay/", "-relay-ca", filepath.Join(t.TempDir(), "missing.pem")}} {
+		if _, err := parseMtlsArgs(bad); err == nil {
+			t.Errorf("parseMtlsArgs(%q) must fail", bad)
+		}
+	}
+}
+
+// startTestMtlsUnixDaemon serves the MCP line protocol over mTLS on a unix socket.
+func startTestMtlsUnixDaemon(t *testing.T, socket string, srvCert *x509.Certificate, srvKey *ecdsa.PrivateKey, pool *x509.CertPool) {
+	t.Helper()
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln = tls.NewListener(ln, &tls.Config{MinVersion: tls.VersionTLS12, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvCert.Raw}, PrivateKey: srvKey}}})
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = serveLines(c, c, &fakeExec{})
+			}(c)
+		}
+	}()
+}
+
+// TestLiveDaemonPrefersLocalMtlsSocket: why — the daemon host's CLI talks to
+// its own daemon only over the unix socket, with the socket's mTLS taken from
+// config.json and the state dir's certificates; a leftover client.json naming
+// a relay or HTTP endpoint is never dialed
+// (plans/host-socket-cli-and-live-reindex-plan.md).
+func TestLiveDaemonPrefersLocalMtlsSocket(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	caKey, caCert := writeTestClientPKI(t, dir)
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	writeTestPEM(t, dir, "server.crt", cryptoPEMCert(srvCert))
+	if err := saveConfig(&config{Mtls: true, CaCert: "ca.crt"}); err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	deadPort := freePort(t)
+	remote := mtlsHostConfig(deadPort)
+	remote.Session = newRelaySessionID()
+	if err := saveClientConfig(remote); err != nil {
+		t.Fatal(err)
+	}
+	if remoteClient() || !isDaemonHost() {
+		t.Fatal("a state dir with config.json is a daemon host, whatever client.json says")
+	}
+	if _, _, ok, err := liveDaemon(); ok || (err != nil && strings.Contains(err.Error(), strconv.Itoa(deadPort))) {
+		t.Fatalf("with the daemon down the host must not dial client.json endpoints: ok=%v err=%v", ok, err)
+	}
+	startTestMtlsUnixDaemon(t, filepath.Join(dir, "daemon.sock"), srvCert, srvKey, pool)
+	_, desc, ok, err := liveDaemon()
+	if !ok || desc != "unix "+filepath.Join(dir, "daemon.sock")+" (mtls)" {
+		t.Fatalf("the local mTLS daemon socket must be used, got ok=%v desc=%q err=%v", ok, desc, err)
+	}
+}
+
+// TestRelayCLI: why — the user-facing flow through the built binary: a relay
+// service, `mtls -relay` (relay-only SAN, stored session, http off, no host
+// client.json), a daemon that opens no TCP port and prints the relay token
+// import line, the refusals (establish while running, relay and daemon in one state
+// dir, unreachable relay), enrollment and calls from a third state dir, the same
+// session after a daemon restart, and a new one from the next `mtls -relay`.
+func TestRelayCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, srvDir, cliDir := shortStateDir(t), shortStateDir(t), shortStateDir(t)
+	env := func(dir string) []string {
+		return append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=")
+	}
+	run := func(dir string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = env(dir)
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	spawn := func(dir, logName string, args ...string) (*exec.Cmd, string) {
+		t.Helper()
+		logPath := filepath.Join(work, logName)
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := exec.Command(bin, args...)
+		c.Env = env(dir)
+		c.Stdout, c.Stderr = lf, lf
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); lf.Close() })
+		return c, logPath
+	}
+	stop := func(c *exec.Cmd) {
+		_ = c.Process.Signal(syscall.SIGTERM)
+		_, _ = c.Process.Wait()
+	}
+
+	port := freePort(t)
+	hp := fmt.Sprintf("127.0.0.1:%d", port)
+	relayURL := "https://" + hp + "/"
+	relay, relayLog := spawn(relayDir, "relay.log", "relay", "run", "-bind", hp, "-token", "tk")
+	deadline := time.Now().Add(15 * time.Second)
+	for !relayHealthy(hp) {
+		if time.Now().After(deadline) {
+			t.Fatalf("relay did not come up:\n%s", mustReadFile(t, relayLog))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if out, err := run(relayDir, "daemon", "run"); err == nil || !strings.Contains(out, "cannot share one state dir") {
+		t.Fatalf("a daemon must refuse a state dir with a running relay: %v\n%s", err, out)
+	}
+	fresh := shortStateDir(t)
+	if out, err := run(fresh, "relay", "establish", fmt.Sprintf("https://127.0.0.1:%d/", freePort(t))); err == nil || !strings.Contains(out, "not usable") || fileExists(filepath.Join(fresh, "ca.crt")) {
+		t.Fatalf("establish must check the relay before issuing certificates: %v\n%s", err, out)
+	}
+
+	if err := os.WriteFile(filepath.Join(srvDir, "config.json"), []byte(`{"message_board": false}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(srvDir, "mtls", "-relay", relayURL, "-token", "tk", "-expire", "1h"); err != nil || !strings.Contains(out, "message board is on") {
+		t.Fatalf("mtls -relay: %v\n%s", err, out)
+	}
+	var cfg config
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MessageBoard == nil || !*cfg.MessageBoard {
+		t.Fatalf("relay setup must turn the message board on (plans/relay-message-board-default-plan.md): %+v", cfg.MessageBoard)
+	}
+	if cfg.RelayURL != relayURL || !isRelaySessionID(cfg.RelaySession) || cfg.RelayToken != "tk" || cfg.Http || cfg.HTTPAddr != "" || !cfg.Mtls {
+		t.Fatalf("mtls -relay config: %+v", cfg)
+	}
+	sid := cfg.RelaySession
+	if fi, err := os.Stat(filepath.Join(srvDir, relaySessionKeyFile)); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("mtls -relay must write %s with mode 0600: %v", relaySessionKeyFile, err)
+	}
+	if _, err := loadRelayAuth(srvDir, filepath.Join(srvDir, "ca.crt"), sid); err != nil {
+		t.Fatalf("the session ID must derive from the session key and the CA expiry: %v", err)
+	}
+	crt, err := cryptoFirstCert(filepath.Join(srvDir, "server.crt"))
+	if err != nil || !reflect.DeepEqual(mapIps(crt.IPAddresses), []string{"127.0.0.1"}) || len(crt.DNSNames) != 0 {
+		t.Fatalf("server SAN must be only the relay host: %v %v %v", err, crt.IPAddresses, crt.DNSNames)
+	}
+	if fileExists(filepath.Join(srvDir, "client.json")) {
+		t.Fatal("the daemon host must keep no client.json: it uses its unix socket")
+	}
+
+	daemon, daemonLog := spawn(srvDir, "daemon1.log", "daemon", "run")
+	line := waitImportLine(t, daemonLog, enrollTokenPrefix, 20*time.Second)
+	if w := strings.Fields(line); len(w) != 4 {
+		t.Fatalf("the relay import line must be `kbtool client -import kb1…`: %q", line)
+	} else if tok, err := parseEnrollToken(w[3]); err != nil || tok.Host != "127.0.0.1" || tok.Port != port || tok.Session != sid {
+		t.Fatalf("the relay token must carry the relay address and session: %+v %v", tok, err)
+	}
+	waitLog := func(path, want string) string {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if l := string(mustReadFile(t, path)); strings.Contains(l, want) {
+				return l
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("%q not in log:\n%s", want, mustReadFile(t, path))
+		return ""
+	}
+	logText := waitLog(daemonLog, "session "+sid+" registered")
+	if strings.Contains(logText, "https://*") || !strings.Contains(logText, "relay "+relayURL) {
+		t.Fatalf("relay-mode daemon must not open a TCP port by default:\n%s", logText)
+	}
+	if out, err := run(srvDir, "relay", "establish", relayURL); err == nil || !strings.Contains(out, "the daemon must not be running to establish a relay connection") {
+		t.Fatalf("establish must refuse while the daemon runs: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "relay", "run", "-bind", "127.0.0.1:0"); err == nil || !strings.Contains(out, "cannot share one state dir") {
+		t.Fatalf("a relay must refuse a state dir with a running daemon: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "status"); err != nil || !strings.Contains(out, "socket "+filepath.Join(srvDir, "daemon.sock")) ||
+		!strings.Contains(out, "relay:    "+relayURL+" session "+sid) || !strings.Contains(out, "unix socket only") {
+		t.Fatalf("the daemon host's CLI must use the unix socket: %v\n%s", err, out)
+	}
+
+	f := strings.Fields(line)
+	if out, err := run(cliDir, f[1:]...); err != nil || !strings.Contains(out, "enrolled") {
+		t.Fatalf("client import through the relay: %v\n%s", err, out)
+	}
+	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "reachable at https://"+hp+" (relay session "+sid+")") {
+		t.Fatalf("enrolled client must reach the daemon via the relay: %v\n%s", err, out)
+	}
+	if out, err := run(cliDir, "tools"); err != nil || !strings.Contains(out, "board_post") {
+		t.Fatalf("a relay daemon must serve the board tools without a config edit: %v\n%s", err, out)
+	}
+
+	stop(daemon)
+	_, daemonLog2 := spawn(srvDir, "daemon2.log", "daemon", "run")
+	if line2 := waitImportLine(t, daemonLog2, enrollTokenPrefix, 20*time.Second); line2 == line {
+		t.Fatal("a restarted daemon must print a new token (new boot key)")
+	}
+	waitLog(daemonLog2, "session "+sid+" registered")
+	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "reachable at https://"+hp) {
+		t.Fatalf("an enrolled client must keep working after a daemon restart: %v\n%s", err, out)
+	}
+	stop(relay)
+	if out, err := run(srvDir, "mtls", "-relay", relayURL); err != nil {
+		t.Fatalf("mtls -relay again: %v\n%s", err, out)
+	}
+	var cfg2 config
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg2)
+	if !isRelaySessionID(cfg2.RelaySession) || cfg2.RelaySession == sid || cfg2.RelayToken != "" {
+		t.Fatalf("a new mtls -relay must issue a new session (and drop the old token): %+v", cfg2)
+	}
+	if out, err := run(srvDir, "mtls", "-relay", relayURL, "-relay-ca", "system"); err != nil {
+		t.Fatalf("mtls -relay -relay-ca system: %v\n%s", err, out)
+	}
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg2)
+	if cfg2.RelayCA != "system" {
+		t.Fatalf("mtls -relay-ca must record relay_ca: %+v", cfg2)
+	}
+	if err := os.Remove(filepath.Join(srvDir, relaySessionKeyFile)); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(srvDir, "daemon", "run"); err == nil || !strings.Contains(out, "relay session key") {
+		t.Fatalf("a relay session without its key (pre-key config) must be refused at daemon start: %v\n%s", err, out)
+	}
+	off := false
+	cfg2.MessageBoard = &off
+	if b, err := json.Marshal(cfg2); err != nil || os.WriteFile(filepath.Join(srvDir, "config.json"), b, 0600) != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(srvDir, "mtls", "-ip", "127.0.0.1"); err != nil {
+		t.Fatalf("mtls (leaving relay mode): %v\n%s", err, out)
+	}
+	var cfg3 config
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg3)
+	if cfg3.RelayURL != "" || cfg3.MessageBoard == nil || *cfg3.MessageBoard {
+		t.Fatalf("plain mtls must leave relay mode and keep the user's message_board=false: %+v", cfg3)
+	}
+	if cfg3.RelayCA != "" || fileExists(filepath.Join(srvDir, relaySessionKeyFile)) {
+		t.Fatalf("plain mtls must drop relay_ca and the session key: %+v", cfg3)
+	}
+}
+
+// TestRelayDefaultPortIsDaemonPort: why — a relay and a daemon never share a
+// state dir, so the relay uses the daemon's port (9876) for its bind and for
+// relay URLs without a port; an explicit -bind still wins.
+func TestRelayDefaultPortIsDaemonPort(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	if defRelayPort != defHTTPPort || defHTTPPort != 9876 {
+		t.Fatalf("relay default port %d, daemon %d: want both 9876", defRelayPort, defHTTPPort)
+	}
+	if o := parseRelayOpts(nil); o.bind != ":9876" {
+		t.Fatalf("relay default bind = %q, want :9876", o.bind)
+	}
+	if o := parseRelayOpts([]string{"-bind", "127.0.0.1:7000"}); o.bind != "127.0.0.1:7000" {
+		t.Fatalf("explicit -bind must win, got %q", o.bind)
+	}
+	if _, p, norm, err := relayHostPort("https://relay.example/"); err != nil || p != 9876 || norm != "https://relay.example:9876/" {
+		t.Fatalf("relay URL without a port: %d %q %v", p, norm, err)
+	}
+}
+
+// ---------- 35. PBKDF2 cost (plans/pbkdf2-derive-once-plan.md) ----------
+
+// TestBundlePBKDF2Iterations: why — KBX1 keys are stretched with 600,000
+// PBKDF2-HMAC-SHA256 iterations, changed in place without a version bump: a
+// bundle keyed with the old 100,000 iterations must not decrypt, and the
+// header still says version 1.
+func TestBundlePBKDF2Iterations(t *testing.T) {
+	if bundlePBKDF2 != 600000 || bundleVersion != 1 {
+		t.Fatalf("iterations %d version %d: want 600000, 1", bundlePBKDF2, bundleVersion)
+	}
+	key := []byte("pass")
+	ct := cryptoEncryptBundle([]byte("data"), key)
+	if v := binary.LittleEndian.Uint16(ct[4:6]); v != 1 {
+		t.Fatalf("header version %d, want 1", v)
+	}
+	want := cryptoBundleAEAD(key, ct[6:22], 600000)
+	if pt, err := want.Open(nil, ct[22:34], ct[34:], nil); err != nil || string(pt) != "data" {
+		t.Fatalf("bundle must be keyed with 600k iterations: %q %v", pt, err)
+	}
+	old := cryptoBundleAEAD(key, ct[6:22], 100000)
+	legacy := append(append([]byte{}, ct[:34]...), old.Seal(nil, ct[22:34], []byte("data"), nil)...)
+	if _, err := cryptoDecryptBundle(legacy, key); err == nil {
+		t.Fatal("a 100k-iteration bundle must no longer decrypt")
+	}
+}
+
+// TestBootstrapBundleNoServerPBKDF2: why — the enrollment bundle is encrypted
+// per request with the boot key; the daemon must derive that key once at boot
+// and keep it, so requests cost no PBKDF2 (and cannot be used to burn server
+// CPU), while each client still pays one 600k derivation to decrypt.
+func TestBootstrapBundleNoServerPBKDF2(t *testing.T) {
+	before := pbkdf2Derivations.Load()
+	f := startBootFixture(t, nil)
+	if n := pbkdf2Derivations.Load() - before; n != 1 {
+		t.Fatalf("daemon boot ran %d PBKDF2 derivations, want exactly 1", n)
+	}
+	hc := f.httpsClient(t, false)
+	var bodies [][]byte
+	before = pbkdf2Derivations.Load()
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		resp, err := hc.Get("https://" + f.hp + "/bundle/" + f.bs.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("bundle request: %s", resp.Status)
+		}
+		bodies = append(bodies, b)
+	}
+	served := time.Since(start)
+	if n := pbkdf2Derivations.Load() - before; n != 0 {
+		t.Fatalf("serving 20 bundles ran %d PBKDF2 derivations, want 0", n)
+	}
+	nonces := map[string]bool{}
+	for _, b := range bodies {
+		if !bytes.Equal(b[6:22], bodies[0][6:22]) {
+			t.Fatal("served bundles must share the boot salt (one derived key)")
+		}
+		nonces[string(b[22:34])] = true
+	}
+	if len(nonces) != len(bodies) {
+		t.Fatal("every served bundle needs a fresh nonce")
+	}
+	start = time.Now()
+	if _, err := cryptoDecryptBundle(bodies[0], f.bs.Key); err != nil {
+		t.Fatalf("client decrypt: %v", err)
+	}
+	t.Logf("server: 20 bundles in %s; client: one 600k-iteration decrypt in %s", served, time.Since(start))
+	if n := pbkdf2Derivations.Load() - before; n != 1 {
+		t.Fatalf("client decrypt ran %d derivations, want 1", n)
+	}
+	if _, err := cryptoDecryptBundle(bodies[1], []byte("wrong")); err == nil {
+		t.Fatal("a wrong key must fail")
+	}
+}
+
+// TestEncryptedStoreDerivesOnce: why — the encrypted store is server-side
+// state read and rewritten on every board operation; it must derive its key
+// once per open, not on every read or save.
+func TestEncryptedStoreDerivesOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	path := filepath.Join(dir, "kb.db")
+	key := []byte("store-pass")
+	st, err := openKBStore(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := pbkdf2Derivations.Load()
+	b := newBoard()
+	for i := 0; i < 5; i++ {
+		if err := st.saveBoard(b); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.loadBoard(false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := pbkdf2Derivations.Load() - before; n != 1 {
+		t.Fatalf("5 saves + 5 loads ran %d PBKDF2 derivations, want 1", n)
+	}
+	before = pbkdf2Derivations.Load()
+	st2, err := openKBStore(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := st2.loadBoard(false); err != nil {
+			t.Fatal(err)
+		}
+		if err := st2.saveBoard(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := pbkdf2Derivations.Load() - before; n != 1 {
+		t.Fatalf("reopen + 3 loads + 3 saves ran %d PBKDF2 derivations, want 1", n)
+	}
+	if _, err := openKBStore(path, []byte("wrong")); err == nil {
+		t.Fatal("a wrong store key must fail")
+	}
+}
+
+// ---------- 36. compact enrollment token (plans/compact-enrollment-token-plan.md) ----------
+
+// TestEnrollTokenRoundTrip: why — every host kind, with and without a custom
+// port and session, must decode to exactly what was encoded (the default port
+// decodes as 0, which the client reads as 9876).
+func TestEnrollTokenRoundTrip(t *testing.T) {
+	key := bytes.Repeat([]byte{0xab}, enrollKeyLen)
+	sid := newRelaySessionID()
+	for _, host := range []string{"", "10.0.0.5", "2001:db8::1", "relay.example.net"} {
+		for _, port := range []int{0, defRelayPort, 443, 65535} {
+			for _, session := range []string{"", sid} {
+				in := enrollToken{Host: host, Port: port, Session: session, Key: key}
+				s := in.encode()
+				out, err := parseEnrollToken(s)
+				want := in
+				if want.Port == defRelayPort {
+					want.Port = 0
+				}
+				if err != nil || !reflect.DeepEqual(out, want) {
+					t.Fatalf("round trip %+v -> %q -> %+v %v", in, s, out, err)
+				}
+				if !strings.HasPrefix(s, enrollTokenPrefix) || strings.ContainsAny(s, "+/= ") {
+					t.Fatalf("token %q must be kb1 + unpadded base64url", s)
+				}
+			}
+		}
+	}
+}
+
+// TestEnrollTokenRejects: why — the token is pasted by hand, so a truncated,
+// extended or corrupted one must fail up front with a pointer to the daemon's
+// line rather than dial somewhere unexpected.
+func TestEnrollTokenRejects(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, enrollKeyLen)
+	sid, _ := hex.DecodeString(newRelaySessionID())
+	raw := func(b ...[]byte) string {
+		return enrollTokenPrefix + base64.RawURLEncoding.EncodeToString(bytes.Join(b, nil))
+	}
+	good := enrollToken{Host: "relay.example.net", Port: 443, Session: hex.EncodeToString(sid), Key: key}.encode()
+	for name, s := range map[string]string{
+		"empty":          "",
+		"no prefix":      strings.TrimPrefix(good, enrollTokenPrefix),
+		"other version":  "kb2" + strings.TrimPrefix(good, enrollTokenPrefix),
+		"not base64url":  good[:10] + "!" + good[11:],
+		"padded":         good + "==",
+		"prefix only":    enrollTokenPrefix,
+		"truncated":      good[:len(good)-4],
+		"trailing byte":  raw([]byte{0}, key, []byte{0}),
+		"short key":      raw([]byte{0}, key[:15]),
+		"unknown flag":   raw([]byte{1 << 4}, key),
+		"port 0":         raw([]byte{tokFlagPort}, []byte{0, 0}, key),
+		"bad DNS name":   raw([]byte{tokHostDNS, 4}, []byte("a b."), key),
+		"IP as DNS name": raw([]byte{tokHostDNS, 8}, []byte("10.0.0.5"), key),
+		"empty DNS name": raw([]byte{tokHostDNS, 0}, key),
+		"short session":  raw([]byte{tokFlagSession}, sid[:8], key),
+	} {
+		if _, err := parseEnrollToken(s); err == nil || !strings.Contains(err.Error(), "invalid enrollment token") {
+			t.Errorf("%s (%q) must be rejected: %v", name, s, err)
+		}
+	}
+}
+
+// TestEnrollTokenSize: why — the point of the format is the shortest paste: a
+// direct token is the bare 128-bit key plus one flag byte, and a relay token
+// only adds the host, the session and a non-default port.
+func TestEnrollTokenSize(t *testing.T) {
+	key := make([]byte, enrollKeyLen)
+	if s := (enrollToken{Key: key}).encode(); len(s) != 3+23 {
+		t.Fatalf("direct token %q is %d chars, want 26", s, len(s))
+	}
+	relay := enrollToken{Host: "relay.example.net", Port: defRelayPort, Session: newRelaySessionID(), Key: key}
+	if s := relay.encode(); len(s) != 3+68 {
+		t.Fatalf("relay token %q is %d chars, want 71", s, len(s))
+	}
+	relay.Host = "10.0.0.5"
+	if s := relay.encode(); len(s) != 3+50 {
+		t.Fatalf("IPv4 relay token %q is %d chars, want 53", s, len(s))
+	}
+}
+
+// TestBundleIDFromKey: why — the bundle ID no longer travels, so client and
+// daemon must derive the same 22-char ID, distinct per key and not the key.
+func TestBundleIDFromKey(t *testing.T) {
+	a, b := bytes.Repeat([]byte{1}, enrollKeyLen), bytes.Repeat([]byte{2}, enrollKeyLen)
+	id := bundleIDFromKey(a)
+	if id != bundleIDFromKey(a) || len(id) != 22 || id == bundleIDFromKey(b) || id == base64.RawURLEncoding.EncodeToString(a) {
+		t.Fatalf("bundle ID %q must be a stable, key-specific 22-char derivation", id)
+	}
+	bs1, bs2 := startBootFixture(t, nil).bs, startBootFixture(t, nil).bs
+	if bytes.Equal(bs1.Key, bs2.Key) || bs1.ID != bundleIDFromKey(bs1.Key) {
+		t.Fatal("each boot must draw a fresh key and serve its derived ID")
+	}
+}
+
+// ---------- 37. relay mode turns the message board on (plans/relay-message-board-default-plan.md) ----------
+
+// TestBoardEnabledRule: why — an explicit message_board value always wins; only
+// a missing value follows the mode (on with a relay, off without), so turning
+// the board off in relay mode is possible and sticks.
+func TestBoardEnabledRule(t *testing.T) {
+	on, off := true, false
+	for _, tc := range []struct {
+		board *bool
+		relay string
+		want  bool
+	}{
+		{nil, "", false}, {nil, "https://relay.example.net:9876/", true},
+		{&on, "", true}, {&on, "https://relay.example.net:9876/", true},
+		{&off, "", false}, {&off, "https://relay.example.net:9876/", false},
+	} {
+		c := &config{MessageBoard: tc.board, RelayURL: tc.relay}
+		if got := boardEnabled(c); got != tc.want {
+			t.Errorf("boardEnabled(board=%v relay=%q) = %v, want %v", tc.board, tc.relay, got, tc.want)
+		}
+		disabled := effectiveDisabledSet(c)["board_post"]
+		if disabled == tc.want {
+			t.Errorf("board_post disabled=%v for board=%v relay=%q", disabled, tc.board, tc.relay)
+		}
+	}
+	if boardEnabled(nil) {
+		t.Fatal("no config must keep the board off")
+	}
+}
+
+// TestEnsureToolOptionsRelaySeed: why — config writes seed the board option so
+// the file documents it; in relay mode the seed must be true, and a present
+// value is never re-stamped either way.
+func TestEnsureToolOptionsRelaySeed(t *testing.T) {
+	relay := &config{RelayURL: "https://relay.example.net:9876/"}
+	ensureToolOptions(relay)
+	plain := &config{}
+	ensureToolOptions(plain)
+	if relay.MessageBoard == nil || !*relay.MessageBoard || plain.MessageBoard == nil || *plain.MessageBoard {
+		t.Fatalf("seed: relay=%v plain=%v, want true and false", relay.MessageBoard, plain.MessageBoard)
+	}
+	off := false
+	kept := &config{RelayURL: "https://relay.example.net:9876/", MessageBoard: &off}
+	ensureToolOptions(kept)
+	if *kept.MessageBoard {
+		t.Fatal("an explicit false must not be re-stamped in relay mode")
+	}
+}
+
+// TestRelayBoardFalseSurvivesDaemonArgs: why — after relay setup turned the
+// board on, a user's later false must survive the config writes a
+// `daemon start` with flags performs.
+func TestRelayBoardFalseSurvivesDaemonArgs(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	off := false
+	if err := saveConfig(&config{RelayURL: "https://relay.example.net:9876/", MessageBoard: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if !persistDaemonArgs([]string{"-board-max-memory", "512MiB"}) {
+		t.Fatal("explicit flag should write the config")
+	}
+	c, err := loadConfig()
+	if err != nil || c == nil || c.MessageBoard == nil || *c.MessageBoard || boardEnabled(c) {
+		t.Fatalf("message_board=false must survive: %+v %v", c, err)
+	}
+}
+
+// ---------- 38. host socket CLI, remote-client guard, live reindex (plans/host-socket-cli-and-live-reindex-plan.md) ----------
+
+// TestStateDirRoles: why — every routing and refusal decision keys off the
+// state dir's role, so each host marker must make a host (even next to a
+// client.json), client.json alone makes a remote client, and neither is plain.
+func TestStateDirRoles(t *testing.T) {
+	for _, marker := range hostStateMarkers {
+		dir := t.TempDir()
+		t.Setenv("KBTOOL_DIR", dir)
+		writeTestPEM(t, dir, "client.json", []byte(`{"version":1,"host":"127.0.0.1"}`))
+		writeTestPEM(t, dir, marker, []byte("x"))
+		if !isDaemonHost() || remoteClient() {
+			t.Fatalf("%s next to client.json must make a daemon host", marker)
+		}
+	}
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	if isDaemonHost() || remoteClient() {
+		t.Fatal("an empty state dir is plain local")
+	}
+	writeTestPEM(t, dir, "client.json", []byte(`{"version":1,"host":"127.0.0.1"}`))
+	if isDaemonHost() || !remoteClient() {
+		t.Fatal("client.json alone makes a remote client")
+	}
+}
+
+// TestHostNeverDialsNetwork: why — the host CLI must reach its daemon only
+// through the unix socket: a leftover client.json naming a LIVE HTTPS daemon is
+// ignored, so a down local daemon means local fallback, never a network call.
+func TestHostNeverDialsNetwork(t *testing.T) {
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_SOCKET", "")
+	caKey, caCert := writeTestClientPKI(t, dir)
+	srvKey, srvCert := cryptoGenerateLeaf(caKey, caCert, "srv", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	port, stop := startTestTLSHTTPServer(t, srvCert, srvKey, pool)
+	defer stop()
+	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
+		t.Fatal(err)
+	}
+	if _, desc, ok, err := liveDaemon(); !ok || !strings.HasPrefix(desc, "https://") {
+		t.Fatalf("control: as a remote client the live HTTPS daemon is used, got ok=%v desc=%q err=%v", ok, desc, err)
+	}
+	if err := saveConfig(&config{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, desc, ok, err := liveDaemon(); ok || err != nil {
+		t.Fatalf("a host with no daemon socket must fall back locally, got ok=%v desc=%q err=%v", ok, desc, err)
+	}
+	startTestUnixDaemon(t, filepath.Join(dir, "daemon.sock"))
+	if _, desc, ok, _ := liveDaemon(); !ok || desc != "unix "+filepath.Join(dir, "daemon.sock") {
+		t.Fatalf("the host must use its plain socket, got ok=%v desc=%q", ok, desc)
+	}
+}
+
+// swapTestDB builds a small index whose only file is named after word, so a
+// test can tell which index is being served.
+func swapTestDB(t *testing.T, word string) (*DB, []byte) {
+	t.Helper()
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, word+".go"), []byte("package x\n\nfunc "+word+"() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KB_EMBED_URL", "")
+	db, err := buildDB(BuildOpts{Sources: []string{src}, Dim: testDim, Chunk: 48, MaxKB: 512, Embed: localEmbed, KWPath: boolPtr(false)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, dbMarshal(db)
+}
+
+// servesFile reports whether db holds a chunk from a file named word.go.
+func servesFile(db *DB, word string) bool {
+	for _, c := range db.Chunks {
+		if strings.HasSuffix(c.Path, word+".go") {
+			return true
+		}
+	}
+	return false
+}
+
+// newSwapToolbox serves db1 from a store in a fresh state dir (encrypted when
+// key != nil) over a unix socket, and returns the toolbox and a client for it.
+func newSwapToolbox(t *testing.T, db1 []byte, key []byte) (*Toolbox, *remoteExec) {
+	t.Helper()
+	dir := shortStateDir(t)
+	t.Setenv("KBTOOL_DIR", dir)
+	t.Setenv("KBTOOL_BOARD", "")
+	t.Setenv("KBTOOL_DB", "")
+	st, err := openKBStore(filepath.Join(dir, "kb.db"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.saveDBBytes(db1); err != nil {
+		t.Fatal(err)
+	}
+	db, err := st.db()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb := &Toolbox{DB: db, Store: st, BoardPath: st.boardPath}
+	tb.Trust = newTrustPolicy(db, nil, nil)
+	sock := filepath.Join(dir, "daemon.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go serveUnix(ln, tb, make(chan error, 1))
+	return tb, &remoteExec{ep: endpoint{kind: "unix", socket: sock}}
+}
+
+// TestIndexSwapPlain: why — the core of live reindexing on a plain store: the
+// new index is served at once and replaces kb.db on disk, so a daemon restart
+// would serve the same index.
+func TestIndexSwapPlain(t *testing.T) {
+	_, b1 := swapTestDB(t, "alphaOne")
+	db2, b2 := swapTestDB(t, "betaTwo")
+	tb, rex := newSwapToolbox(t, b1, nil)
+	res, err := swapIndexVia(rex, b2)
+	if err != nil || res.Encrypted || res.Chunks != len(db2.Chunks) || res.DB != tb.Store.path {
+		t.Fatalf("swap: %+v %v", res, err)
+	}
+	if !servesFile(tb.DB, "betaTwo") || servesFile(tb.DB, "alphaOne") {
+		t.Fatal("the daemon must serve the swapped index")
+	}
+	if !bytes.Equal(mustReadFile(t, tb.Store.path), b2) {
+		t.Fatal("kb.db on disk must be the swapped index")
+	}
+	if out, isErr := tb.Execute("search_codebase", mustMarshal(map[string]any{"q": "betaTwo"})); isErr || !strings.Contains(out, "betaTwo.go") {
+		t.Fatalf("search must find the new index: %s", out)
+	}
+}
+
+// TestIndexSwapEncryptedKeepsNewIndex: why — the bug the save lock prevents: in
+// an encrypted store every board save re-bundles kb.db, so after a swap a board
+// post must carry the NEW index (and the old board), the client never needs the
+// key, and no plaintext index or board ever lands on disk.
+func TestIndexSwapEncryptedKeepsNewIndex(t *testing.T) {
+	_, b1 := swapTestDB(t, "alphaOne")
+	_, b2 := swapTestDB(t, "betaTwo")
+	tb, rex := newSwapToolbox(t, b1, []byte("correct horse"))
+	out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "alice"}))
+	m := regexp.MustCompile(`seed: ([0-9a-f]{64})`).FindStringSubmatch(out)
+	if isErr || m == nil {
+		t.Fatalf("signup: %s", out)
+	}
+	if res, err := swapIndexVia(rex, b2); err != nil || !res.Encrypted {
+		t.Fatalf("swap: %+v %v", res, err)
+	}
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "t", "text": "after swap", "seed": m[1]})); isErr {
+		t.Fatalf("post: %s", out)
+	}
+	dbB, boardB, err := readStoreBundle(tb.Store.path, tb.Store.sealer)
+	if err != nil || !bytes.Equal(dbB, b2) {
+		t.Fatalf("a board save after the swap must keep the new index in the bundle (err=%v)", err)
+	}
+	b, err := readBoard(bytes.NewReader(boardB))
+	if err != nil || b.Agents["alice"] == nil || b.Threads["t"] == nil {
+		t.Fatalf("the board must survive the swap: %v", err)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(tb.Store.path))
+	for _, e := range entries {
+		if n := e.Name(); n != "kb.db" && n != "kb.db.lock" && n != "daemon.sock" {
+			t.Fatalf("unexpected file %s next to the encrypted store", n)
+		}
+	}
+}
+
+// TestIndexSwapRacesBoardPosts: why — swaps and board posts run concurrently in
+// a live daemon; every post must survive and the final bundle must hold the
+// last swapped index (run with -race).
+func TestIndexSwapRacesBoardPosts(t *testing.T) {
+	_, b1 := swapTestDB(t, "alphaOne")
+	_, b2 := swapTestDB(t, "betaTwo")
+	_, b3 := swapTestDB(t, "gammaThree")
+	tb, rex := newSwapToolbox(t, b1, []byte("correct horse"))
+	out, _ := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "alice"}))
+	seed := regexp.MustCompile(`seed: ([0-9a-f]{64})`).FindStringSubmatch(out)[1]
+	const posts = 12
+	var wg sync.WaitGroup
+	errs := make(chan string, posts+2)
+	for i := 0; i < posts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "t", "text": fmt.Sprintf("m%d", i), "seed": seed})); isErr {
+				errs <- out
+			}
+		}(i)
+	}
+	for _, b := range [][]byte{b2, b3} {
+		if _, err := swapIndexVia(rex, b); err != nil {
+			errs <- err.Error()
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+	dbB, boardB, err := readStoreBundle(tb.Store.path, tb.Store.sealer)
+	if res, _ := swapIndexVia(rex, b3); res.Chunks != 1 {
+		t.Fatalf("the swap must report the index's own chunks, not merged board messages: %+v", res)
+	}
+	if err != nil || !bytes.Equal(dbB, b3) || !servesFile(tb.DB, "gammaThree") {
+		t.Fatalf("the last swapped index must be served and stored (err=%v)", err)
+	}
+	b, err := readBoard(bytes.NewReader(boardB))
+	if err != nil || b.Threads["t"] == nil || len(b.Threads["t"].Msgs) != posts {
+		t.Fatalf("every post must survive the swaps: %v", err)
+	}
+}
+
+// TestIndexSwapRejectsBadPayloads: why — a truncated, corrupted or non-index
+// payload must be refused before anything is touched: the served index and
+// kb.db stay exactly as they were.
+func TestIndexSwapRejectsBadPayloads(t *testing.T) {
+	db1, b1 := swapTestDB(t, "alphaOne")
+	_, b2 := swapTestDB(t, "betaTwo")
+	tb, rex := newSwapToolbox(t, b1, nil)
+	sum := sha256.Sum256(b2)
+	good := hex.EncodeToString(sum[:])
+	junk := []byte("not an index at all")
+	junkSum := sha256.Sum256(junk)
+	cases := []struct {
+		name    string
+		params  map[string]any
+		payload []byte
+		want    string
+	}{
+		{"zero size", map[string]any{"size": 0, "sha256": good}, nil, "out of range"},
+		{"too large", map[string]any{"size": int64(maxIndexSwap) + 1, "sha256": good}, nil, "out of range"},
+		{"bad hash", map[string]any{"size": len(b2), "sha256": strings.Repeat("0", 64)}, b2, "checksum mismatch"},
+		{"not an index", map[string]any{"size": len(junk), "sha256": hex.EncodeToString(junkSum[:])}, junk, "not a valid index"},
+	}
+	for _, c := range cases {
+		res, err := rex.callPayload(methodIndexSwap, mustMarshal(c.params), c.payload)
+		if err != nil {
+			t.Fatalf("%s: transport error %v", c.name, err)
+		}
+		if res.Error == nil || !strings.Contains(res.Error.Message, c.want) {
+			t.Fatalf("%s: want an error containing %q, got %+v", c.name, c.want, res)
+		}
+		if len(tb.DB.Chunks) != len(db1.Chunks) || !servesFile(tb.DB, "alphaOne") || !bytes.Equal(mustReadFile(t, tb.Store.path), b1) {
+			t.Fatalf("%s: a refused swap must change nothing", c.name)
+		}
+	}
+}
+
+// TestIndexMethodsSocketOnly: why — swapping the index is a host-only power:
+// over HTTP (mTLS or relay) and stdio the methods must not exist, whatever the
+// caller's certificate.
+func TestIndexMethodsSocketOnly(t *testing.T) {
+	_, b1 := swapTestDB(t, "alphaOne")
+	tb, rex := newSwapToolbox(t, b1, nil)
+	if res, err := rex.call(methodIndexInfo, json.RawMessage(`{}`)); err != nil || res.Error != nil {
+		t.Fatalf("control: index_info over the unix socket: %+v %v", res, err)
+	}
+	for _, m := range []string{methodIndexInfo, methodIndexSwap} {
+		if _, err := dispatch(tb, m, json.RawMessage(`{"size":1,"sha256":"00"}`)); err == nil || !strings.Contains(err.Error(), "method not found") {
+			t.Fatalf("%s must not be dispatched (HTTP path): %v", m, err)
+		}
+		srv := httptest.NewServer(httpHandler(tb))
+		resp, err := http.Post(srv.URL+"/mcp", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"`+m+`","params":{}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		srv.Close()
+		if !strings.Contains(string(body), "method not found") {
+			t.Fatalf("%s over HTTP: %s", m, body)
+		}
+		var out bytes.Buffer
+		if err := serveLines(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"`+m+`","params":{}}`+"\n"), &out, tb); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out.String(), "method not found") {
+			t.Fatalf("%s over stdio: %s", m, out.String())
+		}
+	}
+}
+
+// TestHostSocketCLI: why — the user-facing flow through the built binary: the
+// host's CLI ignores a leftover client.json (local fallback while the daemon is
+// down, removed at daemon start), `build` swaps into the running daemon with no
+// restart, at-rest encryption can't be changed under it, another -db is just
+// written; a remote client refuses every daemon-side command and a host dir
+// refuses `client -import`.
+func TestHostSocketCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	host, remote := shortStateDir(t), shortStateDir(t)
+	run := func(dir string, args ...string) (string, error) {
+		c := exec.Command(bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_DBKEY=", "KB_EMBED_URL=")
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	src := filepath.Join(work, "src")
+	writeSrc := func(name string) {
+		if err := os.MkdirAll(src, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, name+".go"), []byte("package x\n\nfunc "+name+"() {}\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSrc("alphaOne")
+	if out, err := run(host, "build", "-dim", strconv.Itoa(testDim), src); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	t.Setenv("KBTOOL_DIR", host)
+	if err := saveClientConfig(mtlsHostConfig(freePort(t))); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(host, "query", "alphaOne"); err != nil || !strings.Contains(out, "alphaOne.go") {
+		t.Fatalf("a host with its daemon down queries locally, ignoring client.json: %v\n%s", err, out)
+	}
+	if out, err := run(host, "status"); err != nil || !strings.Contains(out, "ignoring leftover") || !strings.Contains(out, "unix socket only") {
+		t.Fatalf("host status: %v\n%s", err, out)
+	}
+
+	daemonLog := filepath.Join(work, "daemon.log")
+	lf, err := os.Create(daemonLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon := exec.Command(bin, "daemon", "run")
+	daemon.Env = append(os.Environ(), "KBTOOL_DIR="+host, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_DBKEY=", "KB_EMBED_URL=")
+	daemon.Stdout, daemon.Stderr = lf, lf
+	if err := daemon.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = daemon.Process.Kill()
+		_, _ = daemon.Process.Wait()
+		_ = lf.Close()
+	})
+	sock := filepath.Join(host, "daemon.sock")
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		if c, err := net.Dial("unix", sock); err == nil {
+			_ = c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon socket never came up:\n%s", mustReadFile(t, daemonLog))
+		}
+	}
+	if fileExists(filepath.Join(host, "client.json")) || !strings.Contains(string(mustReadFile(t, daemonLog)), "removed leftover") {
+		t.Fatalf("daemon start must remove the host's leftover client.json:\n%s", mustReadFile(t, daemonLog))
+	}
+
+	writeSrc("betaTwo")
+	if out, err := run(host, "build", "-dim", strconv.Itoa(testDim), src); err != nil || !strings.Contains(out, "swapped into the running daemon") {
+		t.Fatalf("build with the daemon running must swap: %v\n%s", err, out)
+	}
+	if out, err := run(host, "query", "betaTwo"); err != nil || !strings.Contains(out, "betaTwo.go") {
+		t.Fatalf("the daemon must serve the swapped index without a restart: %v\n%s", err, out)
+	}
+	if out, err := run(host, "build", "-encrypt", src); err == nil || !strings.Contains(out, "stop the daemon to change at-rest encryption") {
+		t.Fatalf("-encrypt under a running plain daemon must be refused: %v\n%s", err, out)
+	}
+	other := filepath.Join(work, "other.db")
+	if out, err := run(host, "build", "-dim", strconv.Itoa(testDim), "-db", other, src); err != nil || strings.Contains(out, "swapped") || !fileExists(other) {
+		t.Fatalf("a build to another -db just writes that file: %v\n%s", err, out)
+	}
+
+	writeTestClientPKI(t, remote)
+	t.Setenv("KBTOOL_DIR", remote)
+	if err := saveClientConfig(mtlsHostConfig(freePort(t))); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"build", src}, {"bench"}, {"daemon", "start"}, {"daemon", "status"}, {"mcp", "start"},
+		{"mtls"}, {"relay", "status"}, {"relay", "run"},
+	} {
+		out, err := run(remote, args...)
+		if err == nil || !strings.Contains(out, "this state dir is a remote client") {
+			t.Fatalf("%v on a remote client must be refused: %v\n%s", args, err, out)
+		}
+		assertOnlyClientFiles(t, remote)
+	}
+	tok := enrollToken{Key: bytes.Repeat([]byte{7}, 16)}.encode()
+	if out, err := run(host, "client", "-import", "https://127.0.0.1:1/", tok); err == nil || !strings.Contains(out, "belongs to a daemon host") {
+		t.Fatalf("client -import into a host dir must be refused: %v\n%s", err, out)
+	}
+}
+
+// ---------- 39. relay in-memory rotating CA and systemd (plans/relay-ephemeral-ca-and-systemd-plan.md) ----------
+
+// relayLeafVia completes a TLS handshake with the relay itself (no session SNI)
+// and returns the leaf it presented.
+func relayLeafVia(t *testing.T, hp string) *x509.Certificate {
+	t.Helper()
+	c, err := tls.Dial("tcp", hp, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return c.ConnectionState().PeerCertificates[0]
+}
+
+// chainsTo reports whether leaf verifies under the PEM CA.
+func chainsTo(leaf *x509.Certificate, caPEM []byte) bool {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return false
+	}
+	_, err := leaf.Verify(x509.VerifyOptions{Roots: pool})
+	return err == nil
+}
+
+// TestRelayPKIInMemory: why — the relay's CA is generated per start, never
+// written, valid for the configured lifetime, and its leaf chains to it; two
+// generations never share a CA.
+func TestRelayPKIInMemory(t *testing.T) {
+	before := time.Now()
+	p1 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, []string{"relay.test"}, 3*time.Hour)
+	p2 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, 3*time.Hour)
+	if p1.FP == p2.FP || bytes.Equal(p1.CAPEM, p2.CAPEM) {
+		t.Fatal("two generations must have different CAs")
+	}
+	if !chainsTo(p1.Leaf.Leaf, p1.CAPEM) || chainsTo(p1.Leaf.Leaf, p2.CAPEM) {
+		t.Fatal("the leaf must chain to its own CA only")
+	}
+	for _, na := range []time.Time{p1.Expires, p1.Leaf.Leaf.NotAfter} {
+		if d := na.Sub(before); d < 3*time.Hour-time.Minute || d > 3*time.Hour+time.Minute {
+			t.Fatalf("validity %s, want about 3h", d)
+		}
+	}
+	if !containsString(p1.Leaf.Leaf.DNSNames, "relay.test") {
+		t.Fatalf("extra DNS SAN missing: %v", p1.Leaf.Leaf.DNSNames)
+	}
+}
+
+// TestRelayRotationServesNewCA: why — after a rotation /ca.crt and the leaf
+// presented to new handshakes change together, so a daemon that fetches the
+// CA can always verify the relay.
+func TestRelayRotationServesNewCA(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	_, fp1, err := relayFetchCA(hp)
+	if err != nil || fp1 != rs.currentPKI().FP {
+		t.Fatalf("first CA: %q %v", fp1, err)
+	}
+	old := rs.currentPKI().CAPEM
+	if !chainsTo(relayLeafVia(t, hp), old) {
+		t.Fatal("the presented leaf must chain to the served CA")
+	}
+	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour))
+	_, fp2, err := relayFetchCA(hp)
+	if err != nil || fp2 == fp1 || fp2 != rs.currentPKI().FP {
+		t.Fatalf("after rotation /ca.crt must serve the new CA: %q (old %q) %v", fp2, fp1, err)
+	}
+	leaf := relayLeafVia(t, hp)
+	if !chainsTo(leaf, rs.currentPKI().CAPEM) || chainsTo(leaf, old) {
+		t.Fatal("new handshakes must get the new leaf")
+	}
+}
+
+// TestRelayRotationGraceful: why — rotation must not disturb a team: the
+// daemon's control stream and an established client stream survive it, and a
+// new client call works because the daemon's accept fetches the new CA.
+func TestRelayRotationGraceful(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	team := startRelayTeam(t, rs, hp, "")
+	cc := enrollViaRelay(t, hp, team)
+	if err := pingRelayed(cc); err != nil {
+		t.Fatalf("before rotation: %v", err)
+	}
+	ep, _, ok := endpointForHostPort(cc, cc.Host)
+	if !ok {
+		t.Fatal("client config does not load")
+	}
+	tcfg := ep.tlsCfg.Clone()
+	tcfg.NextProtos = []string{"http/1.1"}
+	raw, err := net.Dial("tcp", hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	est := tls.Client(raw, tcfg)
+	defer est.Close()
+	if err := est.Handshake(); err != nil {
+		t.Fatalf("established stream: %v", err)
+	}
+	rs.mu.Lock()
+	ctrl := rs.sessions[team.sid].ctrl
+	rs.mu.Unlock()
+
+	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour))
+
+	_ = est.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(est, "GET /healthz HTTP/1.1\r\nHost: kb\r\n\r\n"); err != nil {
+		t.Fatalf("established stream after rotation: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(est), nil)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("established stream must survive the rotation: %v %v", resp, err)
+	}
+	if err := pingRelayed(cc); err != nil {
+		t.Fatalf("a new client call after rotation (accept must fetch the new CA): %v", err)
+	}
+	rs.mu.Lock()
+	same := rs.sessions[team.sid] != nil && rs.sessions[team.sid].ctrl == ctrl
+	rs.mu.Unlock()
+	if !same {
+		t.Fatal("the daemon's control stream must survive the rotation (no re-registration)")
+	}
+}
+
+// TestRelayEnvOptions: why — under systemd the relay is configured from the
+// environment; the precedence flag > environment > config > default must hold
+// and a bad value must stop it with the variable named.
+func TestRelayEnvOptions(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	for _, v := range relayEnv {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	if err := saveConfig(&config{RelayBind: "127.0.0.1:7000", RelayToken: "cfg"}); err != nil {
+		t.Fatal(err)
+	}
+	o, err := parseRelayOptsErr(nil)
+	if err != nil || o.bind != "127.0.0.1:7000" || o.token != "cfg" || o.rotate != relayDefaultRotate || o.caTTL != relayDefaultCATTL {
+		t.Fatalf("config and defaults: %+v %v", o, err)
+	}
+	t.Setenv("KBTOOL_RELAY_PORT", "7100")
+	t.Setenv("KBTOOL_RELAY_TOKEN", "env")
+	t.Setenv("KBTOOL_RELAY_ROTATE", "1h")
+	t.Setenv("KBTOOL_RELAY_CA_TTL", "3h")
+	if o, err = parseRelayOptsErr(nil); err != nil || o.bind != ":7100" || o.token != "env" || o.rotate != time.Hour || o.caTTL != 3*time.Hour {
+		t.Fatalf("environment over config: %+v %v", o, err)
+	}
+	t.Setenv("KBTOOL_RELAY_BIND", "127.0.0.1:7200")
+	if o, _ = parseRelayOptsErr(nil); o.bind != "127.0.0.1:7200" {
+		t.Fatalf("KBTOOL_RELAY_BIND wins over KBTOOL_RELAY_PORT: %q", o.bind)
+	}
+	if o, err = parseRelayOptsErr([]string{"-bind", ":7300", "-token", "flag", "-rotate", "2h", "-ca-ttl", "5h"}); err != nil ||
+		o.bind != ":7300" || o.token != "flag" || o.rotate != 2*time.Hour || o.caTTL != 5*time.Hour {
+		t.Fatalf("flags over environment: %+v %v", o, err)
+	}
+	t.Setenv("KBTOOL_RELAY_BIND", "")
+	for env, bad := range map[string]string{"KBTOOL_RELAY_PORT": "http", "KBTOOL_RELAY_ROTATE": "soon", "KBTOOL_RELAY_CA_TTL": "-1h"} {
+		t.Setenv(env, bad)
+		if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), env) {
+			t.Fatalf("%s=%q must be refused naming the variable: %v", env, bad, err)
+		}
+		t.Setenv(env, map[string]string{"KBTOOL_RELAY_PORT": "7100", "KBTOOL_RELAY_ROTATE": "1h", "KBTOOL_RELAY_CA_TTL": "3h"}[env])
+	}
+	t.Setenv("KBTOOL_RELAY_BIND", "no-port")
+	if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), "KBTOOL_RELAY_BIND") {
+		t.Fatalf("a bad KBTOOL_RELAY_BIND must be refused: %v", err)
+	}
+	t.Setenv("KBTOOL_RELAY_BIND", "")
+	if _, err := parseRelayOptsErr([]string{"-rotate", "3h"}); err == nil || !strings.Contains(err.Error(), "longer than the rotation") {
+		t.Fatalf("a CA lifetime not longer than the rotation must be refused: %v", err)
+	}
+}
+
+// TestSdNotify: why — Type=notify units wait for READY=1; the datagram must
+// reach NOTIFY_SOCKET, and without it nothing is sent.
+func TestSdNotify(t *testing.T) {
+	path := filepath.Join(shortStateDir(t), "notify")
+	pc, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: path, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	t.Setenv("NOTIFY_SOCKET", "")
+	sdNotify("READY=1") // no socket: must not panic or block
+	t.Setenv("NOTIFY_SOCKET", path)
+	sdNotify("READY=1\nSTATUS=x")
+	buf := make([]byte, 256)
+	_ = pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := pc.Read(buf)
+	if err != nil || string(buf[:n]) != "READY=1\nSTATUS=x" {
+		t.Fatalf("notify datagram: %q %v", buf[:n], err)
+	}
+}
+
+// docsUnitBlock returns the ini block under "## 3. The unit file" in
+// docs/relay-systemd.md.
+func docsUnitBlock(t *testing.T) string {
+	t.Helper()
+	doc := string(mustReadFile(t, filepath.Join("docs", "relay-systemd.md")))
+	i := strings.Index(doc, "## 3. The unit file")
+	if i < 0 {
+		t.Fatal("docs/relay-systemd.md: no '## 3. The unit file' section")
+	}
+	rest := doc[i:]
+	a := strings.Index(rest, "```ini\n")
+	b := strings.Index(rest[a+7:], "```")
+	if a < 0 || b < 0 {
+		t.Fatal("docs/relay-systemd.md: no ini block in the unit file section")
+	}
+	return rest[a+7 : a+7+b]
+}
+
+// TestRelayUnitAndDocsInSync: why — the unit the docs show and the one `relay
+// unit` prints must not drift, every KBTOOL_RELAY_* variable the code reads is
+// documented, and the generator's options produce a valid unit without the
+// token in it.
+func TestRelayUnitAndDocsInSync(t *testing.T) {
+	def := relayUnitText("/usr/local/bin/kbtool", defRelayPort, "", relayUnitName)
+	if got := docsUnitBlock(t); got != def {
+		t.Fatalf("docs/relay-systemd.md unit block and relayUnitText differ:\n--- docs\n%s\n--- code\n%s", got, def)
+	}
+	doc := string(mustReadFile(t, filepath.Join("docs", "relay-systemd.md")))
+	src := string(mustReadFile(t, "kbtool.go"))
+	for _, m := range regexp.MustCompile(`"(KBTOOL_RELAY_[A-Z_]+)"`).FindAllStringSubmatch(src, -1) {
+		if !containsString(relayEnv, m[1]) {
+			t.Fatalf("%s is read but missing from relayEnv", m[1])
+		}
+	}
+	for _, v := range relayEnv {
+		if !strings.Contains(doc, "`"+v+"`") {
+			t.Fatalf("%s is not documented in docs/relay-systemd.md", v)
+		}
+	}
+	low := relayUnitText("/opt/kbtool", 443, "", "edge-relay")
+	for _, want := range []string{"ExecStart=/opt/kbtool relay run", "Environment=KBTOOL_RELAY_PORT=443\n", "\nAmbientCapabilities=CAP_NET_BIND_SERVICE",
+		"StateDirectory=edge-relay", "Environment=KBTOOL_DIR=%S/edge-relay", "EnvironmentFile=-/etc/kbtool/edge-relay.env", "Description=kbtool relay (edge-relay)"} {
+		if !strings.Contains(low, want) {
+			t.Fatalf("relay unit -port 443 -name edge-relay: missing %q\n%s", want, low)
+		}
+	}
+	if b := relayUnitText("/opt/kbtool", defRelayPort, "10.0.0.5:9876", relayUnitName); !strings.Contains(b, "Environment=KBTOOL_RELAY_BIND=10.0.0.5:9876\n") || !strings.Contains(b, "#AmbientCapabilities") {
+		t.Fatalf("relay unit -bind: %s", b)
+	}
+	for _, u := range []string{def, low} {
+		if strings.Contains(u, "TOKEN") {
+			t.Fatal("the unit must not carry a token")
+		}
+		section := ""
+		for _, line := range strings.Split(u, "\n") {
+			switch l := strings.TrimSpace(line); {
+			case l == "" || strings.HasPrefix(l, "#"):
+			case strings.HasPrefix(l, "[") && strings.HasSuffix(l, "]"):
+				section = l
+			case section != "" && strings.Contains(l, "=") && !strings.HasPrefix(l, "="):
+			default:
+				t.Fatalf("not a unit line: %q", line)
+			}
+		}
+	}
+}
+
+// TestRelayServiceCLI: why — the systemd flow through the built binary: the port
+// from KBTOOL_RELAY_PORT, READY=1 / STATUS / STOPPING=1 on NOTIFY_SOCKET, the old
+// on-disk PKI removed and nothing written, SIGHUP rotating the served CA, a
+// restart serving another CA, and `relay unit` naming this binary.
+func TestRelayServiceCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	dir := shortStateDir(t)
+	for _, n := range relayLegacyPKIFiles {
+		writeTestPEM(t, dir, n, []byte("old"))
+	}
+	notify := filepath.Join(dir, "notify")
+	pc, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: notify, Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	next := func(want string) string {
+		t.Helper()
+		buf := make([]byte, 1024)
+		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+			_ = pc.SetReadDeadline(deadline)
+			n, err := pc.Read(buf)
+			if err != nil {
+				break
+			}
+			if m := string(buf[:n]); strings.Contains(m, want) {
+				return m
+			}
+		}
+		t.Fatalf("no %q on NOTIFY_SOCKET", want)
+		return ""
+	}
+	port := freePort(t)
+	hp := fmt.Sprintf("127.0.0.1:%d", port)
+	start := func(logName string) (*exec.Cmd, string) {
+		t.Helper()
+		lf, err := os.Create(filepath.Join(work, logName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := exec.Command(bin, "relay", "run")
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "KBTOOL_RELAY_PORT="+strconv.Itoa(port), "KBTOOL_RELAY_BIND=", "NOTIFY_SOCKET="+notify)
+		c.Stdout, c.Stderr = lf, lf
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); _ = lf.Close() })
+		ready := next("READY=1")
+		_, fp, err := relayFetchCA(hp)
+		if err != nil || !strings.Contains(ready, fp) {
+			t.Fatalf("READY status must name the served CA %q: %q %v", fp, ready, err)
+		}
+		return c, fp
+	}
+	relay, fp1 := start("relay1.log")
+	for _, n := range relayLegacyPKIFiles {
+		if fileExists(filepath.Join(dir, n)) {
+			t.Fatalf("%s from an older relay must be removed", n)
+		}
+	}
+	if err := relay.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	rotated := next("STATUS=")
+	_, fp2, err := relayFetchCA(hp)
+	if err != nil || fp2 == fp1 || !strings.Contains(rotated, fp2) {
+		t.Fatalf("SIGHUP must rotate the served CA: %q -> %q (%q) %v", fp1, fp2, rotated, err)
+	}
+	if err := relay.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	next("STOPPING=1")
+	_, _ = relay.Process.Wait()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if n := e.Name(); n != "notify" && n != "config.json" {
+			t.Fatalf("the relay must leave nothing in its state dir after a clean stop, found %s", n)
+		}
+	}
+	_, fp3 := start("relay2.log")
+	if fp3 == fp1 || fp3 == fp2 {
+		t.Fatal("a restarted relay must serve a new CA")
+	}
+	unit := exec.Command(bin, "relay", "unit", "-port", "443")
+	unit.Env = append(os.Environ(), "KBTOOL_DIR="+dir)
+	out, err := unit.CombinedOutput()
+	exe, _ := filepath.EvalSymlinks(bin)
+	if err != nil || !strings.Contains(string(out), "ExecStart="+exe+" relay run\n") || !strings.Contains(string(out), "KBTOOL_RELAY_PORT=443") {
+		t.Fatalf("relay unit: %v\n%s", err, out)
+	}
+}
+
+// ---------- 40. relay reconnect jitter (plans/relay-reconnect-jitter-plan.md) ----------
+
+// TestRelayJitter: why — the reconnect wait must stay within [ceiling/2,
+// ceiling] (never faster than half the schedule, never slower than it) and
+// vary, so daemons of a restarted relay spread out.
+func TestRelayJitter(t *testing.T) {
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 200; i++ {
+		d := relayJitter(8 * time.Second)
+		if d < 4*time.Second || d > 8*time.Second {
+			t.Fatalf("jitter %s outside [4s, 8s]", d)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 50 {
+		t.Fatalf("jitter barely varies: %d distinct waits in 200", len(seen))
+	}
+	if relayJitter(0) != 0 || relayJitter(1) != 1 {
+		t.Fatal("tiny ceilings must not panic")
+	}
+}
+
+// TestRelayConnectorKeepsRetrying: why — a daemon must never give up on its
+// relay: against a dead relay it keeps retrying with jittered, growing waits
+// capped at the maximum, and stops only on close().
+func TestRelayConnectorKeepsRetrying(t *testing.T) {
+	var mu sync.Mutex
+	var waits []time.Duration
+	re := regexp.MustCompile(`reconnecting in (\S+)$`)
+	rc := &relayConnector{HostPort: fmt.Sprintf("127.0.0.1:%d", freePort(t)), Session: newRelaySessionID(),
+		Deliver: func(net.Conn) bool { return false }, minBackoff: 10 * time.Millisecond, maxBackoff: 40 * time.Millisecond,
+		Logf: func(f string, a ...any) {
+			if m := re.FindStringSubmatch(fmt.Sprintf(f, a...)); m != nil {
+				d, _ := time.ParseDuration(m[1])
+				mu.Lock()
+				waits = append(waits, d)
+				mu.Unlock()
+			}
+		}}
+	done := make(chan struct{})
+	go func() { rc.run(); close(done) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := len(waits)
+		mu.Unlock()
+		if n >= 12 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d retries logged", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rc.close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("close() must stop the retry loop")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	distinct := map[time.Duration]bool{}
+	for i, w := range waits {
+		ceiling := 10 * time.Millisecond << i
+		if ceiling > 40*time.Millisecond {
+			ceiling = 40 * time.Millisecond
+		}
+		if w < ceiling/2-time.Millisecond || w > ceiling+time.Millisecond {
+			t.Fatalf("retry %d waited %s, want within [%s, %s]", i, w, ceiling/2, ceiling)
+		}
+		distinct[w] = true
+	}
+	if len(distinct) < 3 {
+		t.Fatalf("waits must be jittered: %v", waits)
+	}
+}
+
+// ---------- 41. relay hardening (plans/relay-hardening-plan.md) ----------
+
+// TestRelaySessionKeyDerivation: why — the session ID is bound to the session
+// key and the team CA's expiry, so it cannot be claimed without the key and
+// changes with the CA; the key file is private and a stale or keyless config is
+// caught before the daemon serves.
+func TestRelaySessionKeyDerivation(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
+	sid, auth := newTestRelaySession(t, exp)
+	pub := auth.Key.Public().(ed25519.PublicKey)
+	if relaySessionID(pub, exp.Unix()) != sid || !isRelaySessionID(sid) {
+		t.Fatal("derivation must be deterministic and SNI-shaped")
+	}
+	if relaySessionID(pub, exp.Unix()+1) == sid {
+		t.Fatal("another expiry must give another ID")
+	}
+	if other, _ := newTestRelaySession(t, exp); other == sid {
+		t.Fatal("another key must give another ID")
+	}
+	dir := t.TempDir()
+	key, err := writeRelaySessionKey(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, relaySessionKeyFile)); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("session key mode: %v", err)
+	}
+	if back, err := loadRelaySessionKey(dir); err != nil || !back.Equal(key) {
+		t.Fatalf("session key round trip: %v", err)
+	}
+	_, caCert := writeTestClientPKI(t, dir)
+	good := relaySessionID(key.Public().(ed25519.PublicKey), caCert.NotAfter.Unix())
+	if a, err := loadRelayAuth(dir, filepath.Join(dir, "ca.crt"), good); err != nil || a.Expires != caCert.NotAfter.Unix() {
+		t.Fatalf("loadRelayAuth: %v", err)
+	}
+	if _, err := loadRelayAuth(dir, filepath.Join(dir, "ca.crt"), newRelaySessionID()); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a session ID not derived from the key and CA must be refused: %v", err)
+	}
+	writeTestPEM(t, dir, relaySessionKeyFile, []byte("zz\n"))
+	if _, err := loadRelayAuth(dir, filepath.Join(dir, "ca.crt"), good); err == nil {
+		t.Fatal("a corrupt session key must be refused")
+	}
+	if _, err := loadRelayAuth(t.TempDir(), filepath.Join(dir, "ca.crt"), good); err == nil || !strings.Contains(err.Error(), "relay session key") {
+		t.Fatalf("a missing session key must be refused: %v", err)
+	}
+}
+
+// registerSigned registers sid with headers from sign (nil: none) on a fresh
+// relay TLS connection and returns the status code (101 on success).
+func registerSigned(t *testing.T, hp, sid string, sign func(tls.ConnectionState) (map[string]string, error)) (int, net.Conn) {
+	t.Helper()
+	pool, _, err := relayFetchCA(hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := relayUpgrade(hp, relayTLSClientConfig(pool), "/v1/register", map[string]string{"X-Kbtool-Session": sid}, sign)
+	var he *relayHTTPError
+	switch {
+	case err == nil:
+		return http.StatusSwitchingProtocols, c
+	case errors.As(err, &he):
+		return he.Code, nil
+	}
+	t.Fatalf("register %s: %v", sid, err)
+	return 0, nil
+}
+
+// TestRelayRegistrationProof: why — only the holder of a session's key may
+// register it, the signature is good for one TLS connection only, and an
+// expired session (team CA expired) is refused; so a stolen session ID, a
+// replayed registration or an old key cannot take over or squat a session.
+func TestRelayRegistrationProof(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	sid, auth := newTestRelaySession(t, time.Now().Add(time.Hour))
+	_, other := newTestRelaySession(t, time.Now().Add(time.Hour))
+	signWith := func(a *relaySessionAuth, mutate func(map[string]string)) func(tls.ConnectionState) (map[string]string, error) {
+		return func(cs tls.ConnectionState) (map[string]string, error) {
+			h, err := a.headers(sid, cs)
+			if err == nil && mutate != nil {
+				mutate(h)
+			}
+			return h, err
+		}
+	}
+	flip := func(h map[string]string) {
+		b, _ := base64.RawURLEncoding.DecodeString(h["X-Kbtool-Session-Sig"])
+		b[0] ^= 1
+		h["X-Kbtool-Session-Sig"] = base64.RawURLEncoding.EncodeToString(b)
+	}
+	for name, sign := range map[string]func(tls.ConnectionState) (map[string]string, error){
+		"no proof (legacy daemon)": nil,
+		"another key":              signWith(other, nil),
+		"another expiry":           signWith(auth, func(h map[string]string) { h["X-Kbtool-Session-Expires"] = strconv.FormatInt(auth.Expires+60, 10) }),
+		"bad signature":            signWith(auth, flip),
+		"malformed key":            signWith(auth, func(h map[string]string) { h["X-Kbtool-Session-Key"] = "AAAA" }),
+	} {
+		if code, _ := registerSigned(t, hp, sid, sign); code != http.StatusForbidden && code != http.StatusBadRequest {
+			t.Errorf("%s: want 403/400, got %d", name, code)
+		}
+	}
+	var captured map[string]string
+	code, c := registerSigned(t, hp, sid, func(cs tls.ConnectionState) (map[string]string, error) {
+		h, err := auth.headers(sid, cs)
+		captured = h
+		return h, err
+	})
+	if code != http.StatusSwitchingProtocols {
+		t.Fatalf("a valid registration must succeed: %d", code)
+	}
+	waitRelaySession(t, rs, sid, true)
+	squat := func(when string) {
+		if code, _ := registerSigned(t, hp, sid, signWith(other, nil)); code != http.StatusForbidden {
+			t.Fatalf("squatting a %s session without its key: want 403, got %d", when, code)
+		}
+		replay := func(tls.ConnectionState) (map[string]string, error) { return captured, nil }
+		if code, _ := registerSigned(t, hp, sid, replay); code != http.StatusForbidden {
+			t.Fatalf("replaying a %s session's registration on another connection: want 403, got %d", when, code)
+		}
+	}
+	squat("live")
+	c.Close()
+	waitRelaySession(t, rs, sid, false)
+	squat("disconnected")
+	old, oldAuth := newTestRelaySession(t, time.Now().Add(-time.Minute))
+	if code, _ := registerSigned(t, hp, old, func(cs tls.ConnectionState) (map[string]string, error) { return oldAuth.headers(old, cs) }); code != http.StatusForbidden {
+		t.Fatalf("an expired session: want 403, got %d", code)
+	}
+}
+
+// TestRelaySessionExpiresWithCA: why — a session lives no longer than the team
+// CA it was derived from; the relay closes it at that moment.
+func TestRelaySessionExpiresWithCA(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	sid, auth := newTestRelaySession(t, time.Now().Add(2*time.Second))
+	c, err := registerTestSession(hp, sid, auth, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	waitRelaySession(t, rs, sid, true)
+	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.Copy(io.Discard, c); err != nil {
+		t.Fatalf("the relay must end the control stream at expiry, not time out: %v", err)
+	}
+	waitRelaySession(t, rs, sid, false)
+}
+
+// TestRelaySessionCap: why — the number of sessions is bounded (default 5000)
+// so registrations cannot exhaust the relay; at the cap it answers 503 and a
+// freed slot is usable again.
+func TestRelaySessionCap(t *testing.T) {
+	if newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour), "").MaxSessions != 5000 {
+		t.Fatal("the default session cap must be 5000")
+	}
+	rs, hp := startTestRelay(t, "", func(rs *relayServer) { rs.MaxSessions = 2 })
+	var conns []net.Conn
+	for i := 0; i < 2; i++ {
+		sid, c, err := registerNewTestSession(t, hp, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitRelaySession(t, rs, sid, true)
+		conns = append(conns, c)
+	}
+	_, _, err := registerNewTestSession(t, hp, "")
+	var he *relayHTTPError
+	if !errors.As(err, &he) || he.Code != http.StatusServiceUnavailable {
+		t.Fatalf("over the cap: want 503, got %v", err)
+	}
+	conns[0].Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, c, err := registerNewTestSession(t, hp, "")
+		if err == nil {
+			c.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a freed slot must be usable: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	conns[1].Close()
+}
+
+// TestRelayControlLineLimit: why — control lines are tiny ("ping", "pong",
+// "conn <id>"); neither end may buffer an unbounded line from the other.
+func TestRelayControlLineLimit(t *testing.T) {
+	if l, err := readCtrlLine(bufio.NewReaderSize(strings.NewReader("conn abc\n"), relayCtrlMaxLine)); err != nil || l != "conn abc\n" {
+		t.Fatalf("a short line: %q %v", l, err)
+	}
+	long := strings.Repeat("x", 4*relayCtrlMaxLine) + "\n"
+	if _, err := readCtrlLine(bufio.NewReaderSize(strings.NewReader(long), relayCtrlMaxLine)); err == nil {
+		t.Fatal("an over-long line must be an error")
+	}
+	rs, hp := startTestRelay(t, "", nil)
+	sid, c, err := registerNewTestSession(t, hp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	waitRelaySession(t, rs, sid, true)
+	if _, err := io.WriteString(c, strings.Repeat("y", 4*relayCtrlMaxLine)); err != nil {
+		t.Fatal(err)
+	}
+	waitRelaySession(t, rs, sid, false)
+}
+
+// TestIPLimiter: why — the per-IP token bucket must allow the burst, refuse
+// beyond it, refill at the rate, keep IPs independent, forget idle IPs, and
+// bound its table.
+func TestIPLimiter(t *testing.T) {
+	if l := newIPLimiter(0, time.Second, 5); l != nil || !l.allow("a") {
+		t.Fatal("rate 0 must mean unlimited")
+	}
+	l := newIPLimiter(10, time.Second, 2)
+	if !l.allow("a") || !l.allow("a") || l.allow("a") {
+		t.Fatal("burst 2 then refuse")
+	}
+	if !l.allow("b") {
+		t.Fatal("IPs are independent")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if !l.allow("a") {
+		t.Fatal("tokens must refill")
+	}
+	time.Sleep(300 * time.Millisecond)
+	l.sweep()
+	if len(l.m) != 0 {
+		t.Fatalf("full buckets must be swept: %d left", len(l.m))
+	}
+	l.max = 1
+	if !l.allow("c") || l.allow("d") {
+		t.Fatal("a full table must refuse unknown IPs")
+	}
+}
+
+// TestRelayRateLimits: why — one source address cannot open connections or
+// register sessions faster than the configured rates.
+func TestRelayRateLimits(t *testing.T) {
+	_, hp := startTestRelay(t, "", func(rs *relayServer) { rs.ConnLimit = newIPLimiter(1, time.Hour, 3) })
+	hc := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	ok := 0
+	for i := 0; i < 6; i++ {
+		if resp, err := hc.Get("http://" + hp + "/healthz"); err == nil {
+			resp.Body.Close()
+			ok++
+		}
+	}
+	if ok != 3 {
+		t.Fatalf("connection burst 3: %d of 6 connections served", ok)
+	}
+	_, hp2 := startTestRelay(t, "", func(rs *relayServer) { rs.RegLimit = newIPLimiter(1, time.Hour, 1) })
+	if _, c, err := registerNewTestSession(t, hp2, ""); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+	_, _, err := registerNewTestSession(t, hp2, "")
+	var he *relayHTTPError
+	if !errors.As(err, &he) || he.Code != http.StatusTooManyRequests {
+		t.Fatalf("over the registration rate: want 429, got %v", err)
+	}
+}
+
+// writeOperatorCert writes a relay certificate for 127.0.0.1 signed by a new CA
+// into dir and returns the CA file.
+func writeOperatorCert(t *testing.T, dir string) string {
+	t.Helper()
+	caKey, caCert := cryptoGenerateCA("operator CA", time.Hour)
+	k, c := cryptoGenerateLeaf(caKey, caCert, "relay.test", []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour)
+	writeTestPEM(t, dir, "relay.crt", append(cryptoPEMCert(c), cryptoPEMCert(caCert)...))
+	writeTestPEM(t, dir, "relay.key", cryptoPEMKey(k))
+	writeTestPEM(t, dir, "operator-ca.crt", cryptoPEMCert(caCert))
+	return filepath.Join(dir, "operator-ca.crt")
+}
+
+// TestRelayOperatorCertPinned: why — a relay on the internet can present an
+// operator certificate, and a daemon with relay_ca pinned verifies it (host
+// name included) without trusting plain-HTTP /ca.crt at all.
+func TestRelayOperatorCertPinned(t *testing.T) {
+	dir := t.TempDir()
+	caFile := writeOperatorCert(t, dir)
+	pki, err := loadRelayOperatorPKI(filepath.Join(dir, "relay.crt"), filepath.Join(dir, "relay.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM := mustReadFile(t, caFile)
+	if !bytes.Equal(pki.CAPEM, caPEM) {
+		t.Fatal("/ca.crt must serve the last certificate of the operator chain")
+	}
+	var fetches atomic.Int32
+	rs := newRelayServer(pki, "")
+	inner := rs.plainSrv.Handler
+	rs.plainSrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ca.crt" {
+			fetches.Add(1)
+		}
+		inner.ServeHTTP(w, r)
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go rs.serve(ln)
+	t.Cleanup(func() { _ = ln.Close(); rs.shutdown() })
+	hp := ln.Addr().String()
+	trust, err := loadRelayTrust(caFile, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp, err := relayCheck(hp, trust); err != nil || fp != "" {
+		t.Fatalf("relayCheck with a pinned CA: %q %v", fp, err)
+	}
+	if _, err := relayCheck(hp, relayTrust{Mode: "file", Pool: trust.Pool, Host: "elsewhere.example"}); err == nil {
+		t.Fatal("a pinned CA must still check the relay's host name")
+	}
+	if _, err := relayCheck(hp, relayTrust{Mode: "system", Host: "127.0.0.1"}); err == nil {
+		t.Fatal("system roots must not trust a private operator CA")
+	}
+	team := startRelayTeamTrust(t, rs, hp, "", trust)
+	if err := pingRelayed(enrollViaRelay(t, hp, team)); err != nil {
+		t.Fatalf("mTLS through an operator-certificate relay: %v", err)
+	}
+	if n := fetches.Load(); n != 0 {
+		t.Fatalf("a pinned-CA daemon must not fetch /ca.crt (%d fetches)", n)
+	}
+	if fp, err := relayCheck(hp, relayTrust{}); err != nil || fp != caFingerprint(pki.Leaf.Certificate[1]) {
+		t.Fatalf("fetch-mode daemons must keep working with an operator certificate: %q %v", fp, err)
+	}
+}
+
+// TestRelayHardeningOptions: why — the cap, the rates and the operator
+// certificate follow flag > environment > config > default, bad values name
+// their source, and the certificate options cannot be half-set or mixed with
+// the in-memory CA's.
+func TestRelayHardeningOptions(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	for _, v := range relayEnv {
+		t.Setenv(v, "")
+		os.Unsetenv(v)
+	}
+	o, err := parseRelayOptsErr(nil)
+	if err != nil || o.maxSessions != 5000 || o.connRate != 20 || o.regRate != 30 || o.certFile != "" {
+		t.Fatalf("defaults: %+v %v", o, err)
+	}
+	if err := saveConfig(&config{RelayMaxSessions: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ = parseRelayOptsErr(nil); o.maxSessions != 7 {
+		t.Fatalf("config relay_max_sessions: %d", o.maxSessions)
+	}
+	t.Setenv("KBTOOL_RELAY_MAX_SESSIONS", "8")
+	t.Setenv("KBTOOL_RELAY_CONN_RATE", "0")
+	t.Setenv("KBTOOL_RELAY_REGISTER_RATE", "2.5")
+	if o, err = parseRelayOptsErr(nil); err != nil || o.maxSessions != 8 || o.connRate != 0 || o.regRate != 2.5 {
+		t.Fatalf("environment over config: %+v %v", o, err)
+	}
+	if o, err = parseRelayOptsErr([]string{"-max-sessions", "9", "-conn-rate", "4", "-register-rate", "0"}); err != nil || o.maxSessions != 9 || o.connRate != 4 || o.regRate != 0 {
+		t.Fatalf("flags over environment: %+v %v", o, err)
+	}
+	for env, bad := range map[string]string{"KBTOOL_RELAY_MAX_SESSIONS": "lots", "KBTOOL_RELAY_CONN_RATE": "-1", "KBTOOL_RELAY_REGISTER_RATE": "NaN"} {
+		t.Setenv(env, bad)
+		if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), env) {
+			t.Fatalf("%s=%q must be refused naming the variable: %v", env, bad, err)
+		}
+		t.Setenv(env, "1")
+	}
+	if _, err := parseRelayOptsErr([]string{"-max-sessions", "-3"}); err == nil {
+		t.Fatal("a session cap below 1 must be refused")
+	}
+	dir := t.TempDir()
+	writeOperatorCert(t, dir)
+	crt, key := filepath.Join(dir, "relay.crt"), filepath.Join(dir, "relay.key")
+	t.Setenv("KBTOOL_RELAY_CERT", crt)
+	if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), "both") {
+		t.Fatalf("a certificate without a key must be refused: %v", err)
+	}
+	t.Setenv("KBTOOL_RELAY_KEY", key)
+	if o, err = parseRelayOptsErr(nil); err != nil || o.certFile != crt || o.keyFile != key {
+		t.Fatalf("certificate from the environment: %+v %v", o, err)
+	}
+	if _, err := parseRelayOptsErr([]string{"-rotate", "1h"}); err == nil {
+		t.Fatal("-rotate with an operator certificate must be refused")
+	}
+	if _, err := parseRelayOptsErr([]string{"-cert", key}); err == nil {
+		t.Fatal("an unreadable certificate must be refused at startup")
+	}
+}
+
+// TestRelayOperatorCLI: why — through the built binary: a relay with an
+// operator certificate from the environment, a daemon set up with `mtls -relay
+// -relay-ca FILE` registering through it, and SIGHUP reloading a replaced
+// certificate from disk without dropping the daemon's session.
+func TestRelayOperatorCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, srvDir, certDir := shortStateDir(t), shortStateDir(t), t.TempDir()
+	caFile := writeOperatorCert(t, certDir)
+	port := freePort(t)
+	hp := fmt.Sprintf("127.0.0.1:%d", port)
+	base := append(os.Environ(), "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=")
+	spawn := func(env []string, logName string, args ...string) (*exec.Cmd, string) {
+		t.Helper()
+		logPath := filepath.Join(work, logName)
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := exec.Command(bin, args...)
+		c.Env = env
+		c.Stdout, c.Stderr = lf, lf
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); lf.Close() })
+		return c, logPath
+	}
+	waitLog := func(path, want string) {
+		t.Helper()
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if strings.Contains(string(mustReadFile(t, path)), want) {
+				return
+			}
+		}
+		t.Fatalf("%q not in log:\n%s", want, mustReadFile(t, path))
+	}
+	relay, relayLog := spawn(append(base, "KBTOOL_DIR="+relayDir, "KBTOOL_RELAY_CERT="+filepath.Join(certDir, "relay.crt"),
+		"KBTOOL_RELAY_KEY="+filepath.Join(certDir, "relay.key")), "relay.log", "relay", "run", "-bind", hp)
+	waitLog(relayLog, "operator certificate")
+	_, fp1, err := relayFetchCA(hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt := exec.Command(bin, "mtls", "-relay", "https://"+hp+"/", "-relay-ca", caFile, "-expire", "1h")
+	mt.Env = append(base, "KBTOOL_DIR="+srvDir)
+	if out, err := mt.CombinedOutput(); err != nil {
+		t.Fatalf("mtls -relay -relay-ca: %v\n%s", err, out)
+	}
+	var cfg config
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg)
+	if cfg.RelayCA != caFile {
+		t.Fatalf("relay_ca must record the pinned CA: %+v", cfg)
+	}
+	_, daemonLog := spawn(append(base, "KBTOOL_DIR="+srvDir), "daemon.log", "daemon", "run")
+	waitLog(daemonLog, "session "+cfg.RelaySession+" registered")
+	writeOperatorCert(t, certDir)
+	if err := relay.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	waitLog(relayLog, "rotated the CA (SIGHUP)")
+	if _, fp2, err := relayFetchCA(hp); err != nil || fp2 == fp1 {
+		t.Fatalf("SIGHUP must reload the operator certificate: %q -> %q %v", fp1, fp2, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := strings.Count(string(mustReadFile(t, daemonLog)), "registered"); n != 1 {
+		t.Fatalf("a reload must not drop the daemon's session (%d registrations)", n)
+	}
+}
+
+// FuzzPeekClientHelloSNI: why — the relay parses ClientHellos from anyone on
+// the internet before any authentication; no input may panic or hang it.
+func FuzzPeekClientHelloSNI(f *testing.F) {
+	f.Add([]byte{0x16, 0x03, 0x01, 0x00, 0x00})
+	f.Add([]byte("GET / HTTP/1.1\r\n\r\n"))
+	c1, c2 := net.Pipe()
+	go func() {
+		_ = tls.Client(c1, &tls.Config{ServerName: "0123456789abcdef0123456789abcdef", InsecureSkipVerify: true}).Handshake()
+	}()
+	_ = c2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 16384)
+	if n, err := c2.Read(buf); err == nil {
+		f.Add(append([]byte{}, buf[:n]...))
+	}
+	c1.Close()
+	c2.Close()
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _ = peekClientHelloSNI(bufio.NewReaderSize(bytes.NewReader(b), 5+16384+2048))
+	})
 }

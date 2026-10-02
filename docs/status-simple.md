@@ -18,13 +18,14 @@ tool options: git_tools=true message_board=true disable_tools=[kb_status, board_
 disabled tools: kb_status, board_sign
 path trust:   trusted_paths=[]  forbidden_paths=[]
 network:  http=true mtls=true insecure=false bind=kb.example.net:9876 crl=… (exists=false, refresh=false)
-client:   https://kb.example.net:9876 (mtls)  (/home/you/.config/kbtool/client.json)
+client:   this host's CLI uses the daemon's unix socket only (remote clients enroll with the line the daemon prints)
 board:    3 threads, 12 messages, 2 agents
 daemon: running (pid 12345), socket /home/you/.config/kbtool/daemon.sock
 mcp: stopped
 ```
 
 Useful for answering: *is my daemon up? which tools are enabled? where does
-the CLI connect?*
+the CLI connect?* On an enrolled remote client, status instead shows the
+daemon it reaches (`https://host:port`, or the relay session).
 
 Full reference: [status.md](status.md) · back to [README](../README.md)

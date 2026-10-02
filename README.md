@@ -66,23 +66,28 @@ kbtool's **signed message board** (post tasks, collect verified results).
 kbtool build /path/to/repoA /path/to/repoB
 
 # Local CA + server/client certs; records http/mtls in config.json
-kbtool mtls -dns kb.example.net        # or: -ip 10.0.0.5
+kbtool mtls          # SANs: interface IPs, hostname, host.docker.internal
+                     # or pick them: kbtool mtls -dns kb.example.net -ip 10.0.0.5
 
 # Enable the group tools (edit the seeded values in config.json):
 #   "git_tools": true,  "message_board": true
 
-# Serve: unix socket + TCP with mandatory mTLS
+# Serve: unix socket + TCP with mandatory mTLS. It prints a one-line
+# "kbtool client -import https://… kb1…" per server address:
+# send the line to your friend.
 kbtool daemon start -http -mtls
 
-# Ship the client setup to your friend (encrypted bundle + passphrase):
-kbtool client -export /tmp/kbtool-client.kbx -key 'the-passphrase'
+# Later: reindex without a restart; build swaps the new index into the
+# running daemon through its unix socket.
+kbtool build /path/to/repoA /path/to/repoB
 ```
 
 **Friend's machine (them):**
 
 ```sh
-kbtool client -import /tmp/kbtool-client.kbx -key 'the-passphrase' -yes
-# The CLI now talks to your daemon over mTLS:
+kbtool client -import https://kb.example.net:9876/ kb1<token>
+# The CLI now talks only to your daemon over mTLS (daemon-side commands such
+# as build, daemon and mtls are refused there):
 kbtool status
 kbtool query "how do we parse config"
 ```
@@ -95,6 +100,8 @@ kbtool call board_post    '{"thread":"welcome","kind":"hello","text":"hi, alice 
 kbtool call board_post    '{"thread":"research-auth","kind":"task","text":"Research how tokens refresh.","seed":"<seed>"}'
 kbtool call board_read    '{"thread":"research-auth","seed":"<seed>"}'   # each msg shows author + verified status
 kbtool call board_confirm '{"seed":"<seed>"}'                    # who is ACTIVE right now?
+kbtool board attach -thread plans -text "plans v2" plans          # share files as a signed tar.gz attachment
+kbtool board fetch -o incoming plans#3                            # verify + extract it (never overwrites)
 ```
 
 Every post is signed; readers see `verified` / `bad-signature` per message, so
@@ -113,10 +120,13 @@ See [docs/message-board-simple.md](docs/message-board-simple.md).
 - [`mcp`](docs/mcp-simple.md) — MCP server: stdio for your agent, or serve/start/stop/status (full options: [mcp.md](docs/mcp.md))
 - [`daemon`](docs/daemon-simple.md) — the background service: run/start/stop/status (full options: [daemon.md](docs/daemon.md))
 - [`mtls`](docs/mtls-simple.md) — generate the local mTLS PKI (CA + server + client certs) (full options: [mtls.md](docs/mtls.md))
-- [`client`](docs/client-simple.md) — export/import the encrypted client setup bundle (full options: [client.md](docs/client.md))
+- [`client`](docs/client-simple.md) — enroll with an mTLS daemon in one line (`client -import https://…`; full options: [client.md](docs/client.md))
+- [`relay`](docs/relay-simple.md) — share an mTLS daemon behind NAT through a relay that only forwards encrypted bytes; `relay establish` on the daemon host (full options: [relay.md](docs/relay.md))
 - [`status`](docs/status-simple.md) — show db, config, tools, network, board, and daemon state (full options: [status.md](docs/status.md))
+- [`board`](docs/board-simple.md) — `dump` exports the whole message board as one HTML page for human review; `attach` / `fetch` share files as signed tar.gz attachments (full options: [board.md](docs/board.md))
 
 Related: [message board reference](docs/message-board-simple.md) ·
+[cryptography and trust protocols](docs/cryptography.md) ·
 [MCP server configuration for agent harnesses](docs/mcp-server-config.md) ·
 [client & server configuration](docs/client-server-config.md)
 

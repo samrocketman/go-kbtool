@@ -20,7 +20,7 @@ kbtool tools [-qwen]
 | core | `search_codebase`, `get_chunk`, `list_files` | always (unless individually disabled) |
 | core | `kb_status` | disabled by default (seeded `disable_tools`) |
 | git | `git_blame`, `git_log` | `git_tools: true` in `config.json` |
-| message board | `board_signup`, `board_whoami`, `board_sign`, `board_post`, `board_read`, `board_threads`, `board_search`, `board_confirm` | `message_board: true` in `config.json` |
+| message board | `board_signup`, `board_whoami`, `board_sign`, `board_post`, `board_read`, `board_fetch`, `board_threads`, `board_search`, `board_confirm` | `message_board: true` in `config.json` |
 
 The per-tool `disable_tools` list always wins over the group options. Full
 rules: [client-server-config.md](client-server-config.md).
