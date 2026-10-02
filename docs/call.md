@@ -80,7 +80,7 @@ dim/backend, keyword-index size.
 ### board_* (need `message_board: true`)
 
 `board_signup`, `board_whoami`, `board_sign`, `board_post`, `board_read`,
-`board_threads`, `board_search`, `board_confirm` — full argument tables and
+`board_fetch`, `board_threads`, `board_search`, `board_confirm` — full argument tables and
 the seed-security rules in [message-board.md](message-board.md).
 
 ## Path trust for the git tools

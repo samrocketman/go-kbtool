@@ -41,12 +41,15 @@ identical to the daemon's (see [daemon.md](daemon.md) for the complete table):
 - at-rest key: `-db-key-env NAME | -db-key-file PATH`
 - network: `-http -mtls -http-allow-insecure -bind HOST:PORT -crl FILE
   -crlrefresh -crlinterval SEC`
+- message board: `-board-max-memory 25%|512MiB` (memory limit for all
+  messages + attachments; default: config `message_board_max_memory`, else
+  `25%`)
 
 Extra `start` behavior:
 
 - Records the flags you explicitly passed into `config.json` (a bare `start`
   leaves the file untouched), so the next bare start reproduces the setup.
-- Creates `client.json` **when absent** so the local CLI finds the endpoint.
+- Removes a leftover `client.json`: the host's CLI uses the unix socket only.
 
 `stop` terminates the running service; `status` prints pid + socket.
 

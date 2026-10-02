@@ -1,24 +1,32 @@
 # kbtool client — quick start
 
-Move a working mTLS client setup between machines as an encrypted bundle.
+Enroll another machine with an mTLS daemon in one line.
 
-**Server host — export:**
+**Server host:**
 
 ```sh
 kbtool mtls -dns kb.example.net          # first, if not done
-kbtool client -export /tmp/kbtool.kbx -key 'the-passphrase'
-# send /tmp/kbtool.kbx + the passphrase to the other machine
+kbtool daemon start -http -mtls
+# prints, among other lines:
+#   enroll a client with one of:
+#     kbtool client -import https://kb.example.net:9876/ kb1…
 ```
 
-**Other machine — import:**
+**Other machine — paste that line:**
 
 ```sh
-kbtool client -import /tmp/kbtool.kbx -key 'the-passphrase' -yes
+kbtool client -import https://kb.example.net:9876/ kb1AJ2gMRkuJr1FmCx8tX0gkRg
 kbtool status                            # now shows the mTLS endpoint
 kbtool query "how do we parse config"    # routed over mTLS to the daemon
 ```
 
-The bundle contains `ca.crt`, `client.crt`, `client.key`, `client.json` —
-everything the local CLI needs to authenticate to the daemon.
+The `kb1…` token carries the bundle key. The client downloads the encrypted
+bundle (`ca.crt`, `client.crt`, `client.key`, `client.json`) over TLS,
+decrypts it with the key, checks the daemon against the bundled CA, and
+confirms an mTLS connection. The line is valid until the daemon restarts.
+
+Daemon behind NAT? Through a relay the line is just `kbtool client -import
+kb1…`, with the relay address baked into the token; see
+[relay-simple.md](relay-simple.md).
 
 Full reference: [client.md](client.md) · back to [README](../README.md)

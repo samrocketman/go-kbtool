@@ -12,6 +12,7 @@ deliberately a **one-file, zero-dependency** program.
 
 ```
 kbtool.go          ALL production code (package main, ~8k lines)
+message_board.gohtml  html/template for `kbtool board dump`, embedded via //go:embed
 kbtool_test.go     ALL tests (package main, ~4.3k lines, 200+ tests)
 .goreleaser.yaml   cross-compile + release packaging (linux/darwin only)
 .github/workflows/ ci.yml (PR gate) + release.yml (auto semver tag + publish)
@@ -29,6 +30,15 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
    the package. Never split it into multiple files, never add a `pkg/`
    directory, never vendor code. Enforced by
    `TestSingleFilePackage` / `TestSingleCommandBuild`.
+
+   **Exception: `message_board.gohtml`** is the one allowed additional
+   build input. It is not Go code; it is compiled into the binary with
+   `//go:embed` from `kbtool.go` and must never be read from disk at runtime
+   or shipped as a separate release asset. It must sit next to `kbtool.go`
+   so the single build command still works, and it must stay covered by a
+   test that runs the built binary from a directory without the template.
+   Do not add other embedded or non-`.go` build inputs without the owner's
+   approval.
 2. **Go standard library only.** No third-party modules, no `go.sum`.
    `go.mod` must remain dependency-free. If a feature seems to need an
    external library, inline a minimal stdlib implementation instead (as was

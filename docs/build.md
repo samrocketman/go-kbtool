@@ -51,13 +51,39 @@ Key precedence: `-encrypt` (prompt) > `-db-key-env` > `-db-key-file` >
 `$KBTOOL_DBKEY` > plain (no key).
 
 With any key, `build` writes the db file as a **KBX1 bundle** (PBKDF2-HMAC-SHA256
-+ AES-256-GCM over a tar.gz) holding both the database and the message board.
+with 600,000 iterations + AES-256-GCM over a tar.gz) holding both the database
+and the message board. The key is derived once per process that opens the
+store, not on every board read or save. KBX1 files written before the
+iteration count rose from 100,000 do not open (they fail like a wrong key):
+move the old db file aside and build again; its board cannot be carried over.
 Without a key the store stays plain. The key is held in memory only; it is
 never written to `config.json`, argv, or any file kbtool owns. A pre-existing
 plain `board.bin` is absorbed into the bundle and removed. Rebuilding an
 encrypted store requires its key (`-db-key-env`, `-db-key-file`, or
 `-encrypt`); the key is resolved **before** the (expensive) build, so a wrong
 key fails fast.
+
+## Rebuilding while the daemon runs
+
+On the daemon host, when the daemon serves the same db file, `build` indexes
+on the client side and then swaps the new index into the running daemon
+through its unix socket: no restart, and clients see the new index at once.
+
+```
+built 1 source(s): 1234 chunks -> swapped into the running daemon (unix /home/you/.config/kbtool/daemon.sock, plain); no restart needed
+```
+
+- The daemon writes the new index under its save lock (`kb.db.lock` when
+  encrypted, `board.bin.lock` when plain), so a message-board save can never
+  re-bundle the old index. With an encrypted store the daemon re-seals with
+  its in-memory key: `build` needs no key, and no plaintext touches the disk.
+- The at-rest shape can't change under a running daemon: `-encrypt`, or a key
+  for a plain store, is refused (stop the daemon first).
+- A different `-db` is just written to that file.
+- The swap only goes through the unix socket; it is not available over HTTP,
+  a relay or stdio. A remote client refuses `build` altogether.
+- An older daemon that can't swap gets the file written instead, with a
+  warning to restart it.
 
 ## Config side effects
 

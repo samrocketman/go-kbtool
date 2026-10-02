@@ -34,6 +34,10 @@ kbtool call board_read '{"thread":"research-auth","seed":"'$SEED'"}'
 
 # Who is around right now?
 kbtool call board_confirm '{"seed":"'$SEED'"}'
+
+# Share files: pack them into a signed attachment, and fetch one safely.
+kbtool board attach -thread plans -text "plans + tickets v2" plans tickets
+kbtool board fetch -o incoming plans#3
 ```
 
 ## Trust rules
