@@ -1,0 +1,13 @@
+blank.gif, folder.gif and back.gif are unmodified copies of Apache httpd's
+docs/icons (https://github.com/apache/httpd/tree/trunk/docs/icons). The relay
+honeypot serves them under /icons/ so its directory listing looks stock.
+
+From httpd's docs/icons/README:
+
+     Public Domain Icons
+
+     These icons were originally made for Mosaic for X and have been
+     included in the NCSA httpd and Apache server distributions in the
+     past. They are in the public domain and may be freely included in any
+     application. The originals were done by Kevin Hughes (kevinh@kevcom.com).
+     Andy Polyakov tuned the icon colors and added a few new images.

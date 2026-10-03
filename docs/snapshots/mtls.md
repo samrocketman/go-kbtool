@@ -1,13 +1,28 @@
 # kbtool mtls — full reference
 
+Applies to snapshot builds only (`make release-snapshot` or `go build`); release builds refuse this command.
+
 Generate the local mTLS PKI: an ECDSA P-256 CA plus server and client leaf
 certificates, all under the state dir. This is the prerequisite for
 `daemon start -http -mtls` (shared, authenticated network access).
 
 ```
 kbtool mtls [-ip IP[,IP…]] [-dns NAME[,NAME…]] [-expire 24h] [IP-or-NAME …]
-kbtool mtls -relay https://RELAY[:PORT]/ [-token T] [-relay-ca system|FILE] [-ip …] [-dns …] [-expire 24h]
 ```
+
+`kbtool collaborate host` runs this for you; use `kbtool mtls` directly to
+share a daemon outside a collaboration session.
+
+When relays are enabled and at least one is joined (`<state>/relay.json`,
+written by `kbtool relay join`; see `relay enable|disable`), the PKI is for
+**relay mode** ([relay.md](../relay.md)): the server SANs are every joined relay
+host plus any `-ip`/`-dns` (no default SANs), and `config.json` gets a new
+`relay_session` (derived from a new `relay-session.key` and the CA's expiry),
+an empty `relay_url` (the daemon picks the relay round robin and sticks to
+it) and `http` off. While self-hosting (`kbtool relay self-host start`), the
+default SANs below are added to the relay hosts, so clients can reach the
+daemon's own relay at any address of this machine, and `relay_url` is left
+as it is.
 
 With no SAN arguments (only `-expire`, or nothing), the server certificate
 gets the **default SANs**:
@@ -29,9 +44,6 @@ replaces the defaults entirely.
 | `-ip LIST` | default SANs | IP SANs, comma-separated (IPv4/IPv6); repeatable, and bare IP tokens are accepted too (`-ip 10.0.0.1 10.0.0.2`). Entries must be valid IP addresses. |
 | `-dns LIST` | default SANs | DNS SANs, comma-separated; repeatable, and bare name tokens are accepted. A bare token that parses as an IP is classified as an IP SAN. |
 | `-expire D` | 24h | CA + server + client certificate validity (e.g. `24h`, `720h`). Must be > 0. |
-| `-relay URL` | — | Relay mode ([relay.md](relay.md)): the server SAN is the relay host plus any `-ip`/`-dns` (no default SANs); `config.json` gets `relay_url`, a new `relay_session` (derived from a new `relay-session.key` and the CA's expiry), `http` off, `message_board` on; `client.json` points at the unix socket. |
-| `-token T` | — | With `-relay`: the relay registration token, stored as `relay_token`. |
-| `-relay-ca system\|FILE` | fetch `/ca.crt` | With `-relay`: verify the relay with the system roots or this PEM CA (host name checked), stored as `relay_ca`. |
 
 **Nothing is silently dropped.** Flags may appear in any order; a name passed
 where an IP is expected (or vice versa), an unknown flag, or a bad `-expire`
@@ -98,17 +110,17 @@ certificate's SAN. In order of likelihood:
   ([client-simple.md](client-simple.md)). The port then also answers plain
   HTTP `GET /ca.crt` and certificate-less TLS `GET /bundle/<id>`; every API
   route still requires a client certificate.
-- Without `-relay`, `kbtool mtls` clears `relay_url`, `relay_session` and
-  `relay_ca` and deletes `relay-session.key` (relay mode off).
+- Without enabled, joined relays, `kbtool mtls` clears `relay_session` and
+  `relay_url` and deletes `relay-session.key` (relay mode off).
 - Re-running `kbtool mtls` regenerates **all** keys; previously enrolled
-  clients stop validating (new CA) and must enroll again. Plan accordingly.
+  clients stop validating (new CA) and must enroll again.
 
 ## Related
 
 - Simple example: [mtls-simple.md](mtls-simple.md)
 - Serving with it: [daemon.md](daemon.md)
 - Sharing the client side: [client.md](client.md)
-- Daemon behind NAT: [relay.md](relay.md)
-- All config files: [client-server-config.md](client-server-config.md)
-- Cryptography and trust protocols: [cryptography.md](cryptography.md)
-- Back to [README](../README.md)
+- Daemon behind NAT: [relay.md](../relay.md)
+- All config files: [client-server-config.md](../client-server-config.md)
+- Cryptography and trust protocols: [cryptography.md](../cryptography.md)
+- Back to [README](../../README.md)

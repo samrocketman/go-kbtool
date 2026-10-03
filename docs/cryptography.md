@@ -14,13 +14,16 @@ crypto).
 | Certificates (team PKI, relay PKI) | ECDSA | P-256, random 159-bit serials | `crypto/ecdsa`, `crypto/x509` |
 | Transport security | TLS | 1.2 minimum (1.3 negotiated when both sides can) | `crypto/tls` |
 | Encrypted bundles (enrollment, store at rest) | AES-256-GCM | 12-byte random nonce, 16-byte tag | `crypto/aes`, `crypto/cipher` |
+| Session archives (KBX2) | AES-256-GCM per record | nonce = record index ‖ flags, the 38-byte header as associated data, ≤ 64 KiB records | `crypto/aes`, `crypto/cipher` |
 | Passphrase to key | PBKDF2-HMAC-SHA256 | 600,000 iterations, 16-byte random salt, 32-byte key | own RFC 2898 code over `crypto/hmac` |
+| KBX2 file key | HMAC-SHA256 | key = PBKDF2 master, message `"kbtool kbx2 file key"` ‖ 0 ‖ 16-byte random file ID | `crypto/hmac` |
 | Message board signatures, relay session proof | Ed25519 | 32-byte seed, 64-byte signature | `crypto/ed25519` |
 | Relay registration channel binding | TLS keying-material exporter | label `"kbtool relay register v1"`, 32 bytes (RFC 5705 / RFC 8446 §7.5) | `crypto/tls` |
 | Bundle ID derivation | HMAC-SHA256 | key = enrollment key, message `"kbtool bundle id"`, truncated to 16 bytes | `crypto/hmac` |
 | Fingerprints, digests, relay session ID | SHA-256 | CA fingerprint as 43-char base64url; attachment and index digests as hex; session ID = first 16 bytes | `crypto/sha256` |
+| Relay honeypot listing | HMAC-SHA256 | key = 32 random bytes per relay boot, message = the client's address; its bytes pick a 32-bit mask with 1 to 5 bits set over the 32 boot words | `crypto/hmac` |
 | Secret comparison | constant time | bundle ID, relay token | `crypto/subtle` |
-| Randomness | OS CSPRNG | all keys, salts, nonces, serials, session IDs, seeds | `crypto/rand` |
+| Randomness | OS CSPRNG | all keys, salts, nonces, KBX2 file IDs, serials, session IDs, seeds, honeypot key and words | `crypto/rand` |
 
 ```mermaid
 mindmap
@@ -38,10 +41,18 @@ mindmap
       AES-256-GCM
       Enrollment bundle
       Encrypted store
+    Session archives KBX2
+      streamed records
+      per-file HMAC key
+      head record for session ls
     Relay sessions
       Ed25519 session key
       ID from SHA-256 of key and CA expiry
       Signature bound to the TLS exporter
+    Relay honeypot
+      Apache disguise
+      per-client listing from HMAC
+      blocks and drops probers
     Board
       Ed25519 identities
       Signed canonical messages
@@ -57,17 +68,20 @@ Every secret kbtool handles, where it lives, and how long it lives:
 
 | Secret | Created by | Stored | Lifetime |
 |---|---|---|---|
-| Team CA key `ca.key` | `kbtool mtls` | state dir, mode 0600 | until the next `kbtool mtls` (certificates default to 24h, `-expire`) |
-| Server key `server.key` | `kbtool mtls` | state dir, 0600 | same |
-| Client key `client.key` | `kbtool mtls` (host), `client -import` (remote) | state dir, 0600 | same as its certificate |
+| Team CA key `ca.key` | the session host, when it issues the session's certificates (`collaborate host`; `collaborate resume` and `relay move` when they renew) | state dir, mode 0600 | until the session issues new certificates (they default to 24h, `-expire`) |
+| Server key `server.key` | the session host, with the CA | state dir, 0600 | same |
+| Client key `client.key` | the session host; attendees receive it at `collaborate attend` | state dir, 0600 | same as its certificate |
 | Enrollment key (16 bytes) | daemon at every boot | memory only; printed inside the `kb1…` token and the daemon log (0600) | until the daemon restarts |
-| Relay CA and leaf keys | relay at start and every rotation | memory only | `-ca-ttl` (24h), replaced every `-rotate` (12h) |
+| Relay CA and leaf keys | relay at start and every rotation | memory only | replaced every `-rotate` (12h); the certificates show a disguised ten-year validity |
 | Relay operator certificate key (optional) | operator (`-cert`/`-key`) | operator's file; read at start and on `SIGHUP` | operator-managed |
-| Relay session key (Ed25519 seed) | `mtls -relay`, `relay establish` | daemon state dir `relay-session.key`, 0600 | until the next `mtls` (the session it proves expires with the team CA) |
-| Relay registration token | operator | `config.json`, or `KBTOOL_RELAY_TOKEN` | operator-managed |
-| Store passphrase | operator | memory only; supplied by prompt, `-db-key-env`, `-db-key-file` or `KBTOOL_DBKEY` | per process |
-| Board seed (32 bytes) | `board_signup` | returned once to the agent; kbtool keeps only the public key | as long as the agent keeps it |
-| Relay session ID (128 bits) | derived: SHA-256(label, session public key, CA expiry) | `config.json`, every client's `client.json` | until the team CA expires or the next `mtls -relay`; **not a secret** (it travels as SNI) |
+| Relay session key (Ed25519 seed) | the session host, with the certificates | daemon state dir `relay-session.key`, 0600 | until the session issues new certificates (the session it proves expires with the team CA) |
+| Relay registration token | operator | relay: `config.json` or `KBTOOL_RELAY_TOKEN`; daemon host: `relay.json` (0600) | operator-managed |
+| State dir key (`KBTOOL_SECRET`) | operator | memory only; supplied by `-db-key-env`, `-db-key-file`, `KBTOOL_SECRET`, or a prompt (never in an encrypted state dir); the session's daemon receives it in its environment; one key for `kb.db` and every session archive | until `kbtool kbx rekey` |
+| Relay honeypot key (32 bytes) | relay at start | memory only | until the relay stops |
+| Board seed (32 bytes) | `board_signup` / `kbtool board signup` | `kbtool board signup` and `board_signup` through `kbtool mcp` or `kbtool call` write it to the session directory's `.kbtool-seed` (0600) and strip it from what the agent sees; the board keeps only the public key | as long as the seed file keeps it |
+| Finished session state | `collaborate finish` | `sessions/<id>/state/` (0700, file modes kept): the session's keys, certificates, index and board. In an encrypted state dir the whole session is sealed into a randomly named `sessions/<random>.kbx` and the plain directory removed | until the session is resumed |
+| Inner `kb.db` key | `collaborate finish` (encrypted state dir) | the final keys record of the session's `.kbx`, never extracted to disk | until the session is resumed (the `kb.db` is then re-encrypted with the current key) |
+| Relay session ID (128 bits) | derived: SHA-256(label, session public key, CA expiry) | `config.json`, every client's `client.json` | until the team CA expires or the session issues new certificates; **not a secret** (it travels as SNI) |
 
 ```mermaid
 flowchart TB
@@ -79,10 +93,12 @@ flowchart TB
   subgraph mem["Daemon memory (per boot)"]
     EK["enrollment key, 16 bytes"] -->|HMAC-SHA256| BID["bundle ID"]
     EK -->|PBKDF2 600k| BK["AES-256 bundle key"]
-    PP["store passphrase"] -->|PBKDF2 600k| SK["AES-256 store key"]
+    PP["state dir key (KBTOOL_SECRET)"] -->|PBKDF2 600k| SK["AES-256 store key"]
+    PP -->|"PBKDF2 600k, once per salt"| MK["KBX2 master key"]
+    MK -->|"HMAC-SHA256 with file ID"| FK["per-archive AES-256 key"]
   end
   subgraph relay["Relay memory"]
-    RCA["relay CA key (24h)"] -->|signs| RL["relay leaf"]
+    RCA["relay CA key (12h)"] -->|signs| RL["relay leaf"]
   end
   subgraph sess["Daemon host: relay session"]
     RSK["relay-session.key (Ed25519)"] -->|"SHA-256 with ca.crt NotAfter"| SID["session ID"]
@@ -99,24 +115,31 @@ flowchart TB
 
 All secrets and unique values come from `crypto/rand` (the operating system's
 CSPRNG): ECDSA keys, certificate serials (uniform below 2^159, as RFC 5280
-allows), the 16-byte enrollment key, PBKDF2 salts, GCM nonces, relay session
-keys, relay connection IDs, and board seeds. The only use of `math/rand` is
-the jitter on the daemon's relay reconnect delay, which protects nothing.
+allows), the 16-byte enrollment key, PBKDF2 salts, KBX1 GCM nonces, KBX2
+file IDs, relay session keys, relay connection IDs, board seeds, and the
+relay honeypot's key and words. KBX2 nonces are not random: they are the
+record index and flags under a key that is unique to the file, so they never
+repeat under one key. `math/rand` is used only for the jitter on the
+daemon's relay reconnect delay, where it protects nothing.
 
-## 4. The team PKI (`kbtool mtls`)
+## 4. The team PKI (session certificates)
 
-`kbtool mtls` creates a private certificate authority for one daemon and its
-clients. Nothing is signed by a public CA.
+A session host with relays enabled (`kbtool relay self-host start` or
+`kbtool relay join URL`) creates a private certificate authority for its
+daemon and the session's attendees: at `collaborate host`, and again when
+`collaborate resume` (expired certificates, or a local session opened to
+collaborators) or `relay move` renews them. A local session (no relay
+enabled) issues none. Nothing is signed by a public CA.
 
 ```mermaid
 flowchart LR
-  A["kbtool mtls [-ip …] [-dns …] [-expire 24h]"] --> B["generate CA key (P-256)"]
+  A["collaborate host / resume [-expire 24h] (relays enabled)"] --> B["generate CA key (P-256)"]
   B --> C["self-sign CA certificate"]
   C --> D["generate server key, sign server.crt with SANs"]
   C --> E["generate client key, sign client.crt"]
   D --> F["verify every requested SAN is in server.crt"]
   F --> G["write ca.crt, ca.key, server.*, client.* (keys 0600)"]
-  G --> H["config.json: mtls=true (http=true, or relay mode)"]
+  G --> H["config.json: mtls=true, relay mode, new relay session"]
 ```
 
 Certificate profiles:
@@ -126,17 +149,26 @@ Certificate profiles:
 | Key | ECDSA P-256 | ECDSA P-256 (one key each) |
 | Signature | ECDSA with SHA-256 | ECDSA with SHA-256, by the CA |
 | Serial | random, below 2^159 | random, below 2^159 |
-| Subject | `CN=kbtool local CA, O=kbtool` (relay: `kbtool relay CA`) | `CN=<role>, O=kbtool` |
+| Subject | `CN=kbtool local CA, O=kbtool` | `CN=<role>, O=kbtool` |
 | Validity | 1 hour back-dated to `-expire` (default 24h) | same |
 | Key usage | CertSign, CRLSign; `IsCA` | DigitalSignature |
 | Extended key usage | — | ServerAuth **and** ClientAuth |
-| SANs | — | server: the requested or default IPs and DNS names (relay mode: the relay host) |
+| SANs | — | server: every joined relay host, plus this machine's addresses when self-hosting |
+
+The relay's own in-memory certificates differ on purpose, so that they look
+like a sysadmin's self-signed ones and never name kbtool (section 12.7): CA
+`CN=Easy-RSA CA` with no organization; leaf `CN=<host name>`, SANs the host
+name plus `-ip`/`-dns`, ServerAuth only; both valid for ten years from a
+random date 30 to 365 days before the relay started.
 
 Notes:
 
-- **Default SANs:** every interface IP (not link-local), the host name, and
-  `host.docker.internal`. Each requested SAN is checked in the issued
-  certificate before anything is written.
+- **SANs:** attendees verify the relay host they dial, so every joined relay
+  host is a SAN, and the session can start on (or move to) any of them.
+  With the self-hosted relay, attendees dial this machine, so its addresses
+  are SANs too: every interface IP (not link-local), the host name, and
+  `host.docker.internal`. Each SAN is checked in the issued certificate
+  before anything is written.
 - **One client certificate for everyone:** every enrolled client receives the
   same `client.crt` and `client.key`. TLS has no per-certificate uniqueness,
   and the CRL revokes that one shared identity (section 10).
@@ -222,28 +254,123 @@ never written in plaintext.
 
 ```mermaid
 flowchart TB
-  K1["build -encrypt (hidden prompt)"] --> R{"key source<br/>precedence"}
+  K1["collaborate host -encrypt (hidden prompt)"] --> R{"key source<br/>precedence"}
   K2["-db-key-env NAME"] --> R
   K3["-db-key-file PATH"] --> R
-  K4["$KBTOOL_DBKEY"] --> R
+  K4["$KBTOOL_SECRET"] --> R
   R --> ST["kbStore: key in memory, sealer"]
   ST -->|"save index or board"| W["tar.gz {kb.db, board.bin} then seal, atomic write 0600"]
   ST -->|"open"| O["decrypt; wrong key fails before serving"]
 ```
 
 - **The key never touches disk.** It is not written to `config.json`, argv
-  or any file kbtool owns. `daemon start` hands it to its child process
-  through the `KBTOOL_DBKEY` environment variable.
+  or any file kbtool owns. The session's daemon receives it from kbtool
+  through the `KBTOOL_SECRET` environment variable.
 - **Every save re-seals both parts** under the in-memory key. Saves run under
   the store lock (`kb.db.lock`), so concurrent board writers cannot lose each
   other's updates.
-- **Live reindex.** `kbtool build` next to a running daemon builds the index
+- **Live reindex.** `kbtool build` on the session host builds the index
   in the client process and streams it over the unix socket. The daemon
   re-seals it with the current board under its own key and the store lock.
   The client never needs the passphrase, and no plaintext is written
   (section 11).
 - **Mixed states are refused.** An encrypted `kb.db` next to a stray plain
   `board.bin`, or the reverse, stops the daemon.
+- **No prompt in an encrypted state dir.** In a plain state dir a command
+  that opens an encrypted store may ask for the key on a terminal. Once
+  session.json has `"encrypt": true`, every command that needs the key fails
+  without one instead of prompting.
+
+## 6a. Session archives (KBX2)
+
+In an encrypted state dir (`collaborate host -encrypt`, session.json
+`"encrypt": true`) a finished session is one KBX2 file,
+`sessions/<random>.kbx`, named with 128 random bits (32 lowercase hex
+characters). Unlike KBX1 it is a stream of records, so a reader can stop
+early: `kbtool session ls` decrypts only the head record. The name carries
+nothing: the session's ID and everything else come only from the
+authenticated head, and `kbx rekey` gives every archive a new random name.
+
+```mermaid
+flowchart LR
+  H["'KBX1' | version u16 LE = 2 | salt 16 | file id 16<br/>(the AAD of every record)"] --> R0["record 0: head<br/>JSON: meta.json + about.json"]
+  R0 --> RD["data records<br/>tar.gz of the session dir, ≤ 64 KiB each"]
+  RD --> RK["final record: keys<br/>JSON: key of the inner state/kb.db"]
+```
+
+- **Record:** `flags u8 | length u32 LE | AES-256-GCM ciphertext+tag`. The
+  nonce is the record index (u64 BE) followed by the flags (u32 BE), and the
+  header is the associated data, so records cannot be reordered, dropped,
+  moved to another file or re-flagged. A file without its final record is
+  reported as truncated.
+- **Keys:** master key = PBKDF2-HMAC-SHA256(secret, salt, 600,000); file key
+  = HMAC-SHA256(master, `"kbtool kbx2 file key"` ‖ 0 ‖ file id). The random
+  file id gives every file its own key even when files share a salt. New
+  archives in a state dir reuse the salt of an existing one, so listing many
+  sessions costs one derivation.
+- **Head:** the session's `meta.json` (ID, role, dates, working directory,
+  certificate options) and `about.json`. The board seed is in the payload, not the
+  head, so listing never decrypts it.
+- **Payload:** a tar.gz made from inside the session directory (paths
+  relative to it), with the kbtool state in `state/`. The inner `kb.db` is
+  still a KBX1 store.
+- **Keys record:** the key of the inner `kb.db`. `kbtool kbx rekey` re-encrypts
+  only outer files record by record and keeps this record, so no inner file
+  is rewritten. On `resume` the inner `kb.db` is re-encrypted with the
+  current key as it moves to `<state>/kb.db`; the recorded key is never
+  written to disk.
+- **Reading a sealed session without resuming it.** `kbtool board dump
+  -session ID` streams the archive, decrypts it in memory, and opens the
+  inner `kb.db` with the key from the keys record. `kbtool memory export`,
+  `consensus export` and `deliverables export` with `-session ID` copy that
+  one directory out of the stream. Nothing is extracted to the state dir,
+  but what they produce (the HTML page, the tar.gz) is plaintext wherever
+  you write it.
+- **Rekeying** (`kbtool kbx rekey`) gives all files of the state dir one new
+  salt, and skips files that already open with the new key, so an
+  interrupted run can be repeated ([kbx.md](kbx.md)).
+
+## 6b. What is plaintext on disk (encrypted state dir)
+
+Encryption at rest covers the store and finished sessions. Everything the
+running team needs in the clear is protected by file permissions only (0600
+files, 0700 directories):
+
+| When | Encrypted | Plain |
+|---|---|---|
+| No session active | `kb.db` is not present (it is sealed inside a session); every `sessions/*.kbx` | `session.json` (the current session's ID); `relay.json` (holds the relay registration token) |
+| A session is active | `kb.db` (index and board); the other sessions' `.kbx` | the session directory (`.kbtool-seed`, `memory/`, `consensus/`, `deliverables/`, `meta.json`, `about.json`); the team PKI keys (`ca.key`, `server.key`, `client.key`), `relay-session.key`, `config.json`, `client.json`; the daemon log (it holds the `kb1…` enrollment token) |
+| After an unclean shutdown | as for an active session | as for an active session, until `kbtool session validate` seals it |
+
+**Finishing** (`collaborate finish`, `daemon stop`, SIGTERM or SIGINT on the
+daemon) moves the state into `sessions/<id>/state/`, writes
+`sessions/<random>.kbx.tmp`, reads it back and authenticates every record through
+the final one, renames it
+into place, and only then removes the plain directory. A crash at any point
+leaves either the plain directory or a verified archive, never neither.
+
+**Unclean shutdown.** A host daemon that dies without finishing (SIGKILL,
+a crash, power loss) leaves the active session and the state plain. kbtool
+detects this (encrypted state dir, an active host session whose plain
+directory exists, no daemon process or socket answering) and then refuses
+every command except `kbtool session validate`, `help` and `version`, so no
+new plain state is created on top. `session validate`, given the key:
+
+- removes leftovers of interrupted work (`*.kbx.tmp`, `*.rekey`,
+  `.<id>.extract`) and the dead daemon's pid file and socket;
+- completes a finish that had already sealed a verified archive;
+- otherwise requires the state to be sound before sealing it: `kb.db` is KBX1,
+  opens with the key, and its index and board parse; no plain `board.bin`;
+  `config.json` and the certificates parse;
+- on success seals the session exactly like `finish`.
+
+The daemon removes its pid file only after it has sealed, so a graceful stop
+in progress is never mistaken for an unclean shutdown.
+
+**Removal is not erasure.** Plain files are deleted with ordinary unlinks.
+Their blocks may survive on the disk, in file system journals, on SSDs after
+wear levelling, and in backups or snapshots taken while a session was
+active. Use full-disk encryption where that matters.
 
 ## 7. The daemon's listeners
 
@@ -251,45 +378,41 @@ flowchart TB
 flowchart TB
   D(("daemon"))
   D --> U["unix socket daemon.sock<br/>mode 0600"]
-  D --> T["TCP port (with -http)"]
-  D --> RL["relay streams (relay mode)"]
+  D --> RL["relay streams (relayed session)"]
   U -->|"config.json mtls=true"| UT["TLS 1.2+, client certificate required"]
-  U -->|"otherwise"| UP["plain; owner-only file permission is the access control"]
-  T --> DM{"first byte<br/>0x16?"}
-  DM -->|"no: plain HTTP"| CA["GET /ca.crt only"]
-  DM -->|"yes: TLS"| TL["TLS 1.2+, client certificate verified if given"]
+  U -->|"local session"| UP["plain; owner-only file permission is the access control"]
+  RL --> TL["TLS 1.2+, client certificate verified if given"]
   TL --> G{"route"}
   G -->|"/bundle/ID"| BUN["encrypted enrollment bundle, no certificate needed"]
   G -->|"anything else"| MT["requires a verified client chain (mTLS)"]
-  RL --> TL
 ```
 
 - **Unix socket.** The socket is created with umask 0177, so it is
-  `srw-------`. With mTLS on, the socket also speaks TLS and requires the
-  client certificate. The host's own CLI then presents the state dir's
-  `client.crt`/`client.key` and expects the server certificate's first SAN.
-- **TCP.** One port carries three protocols, split on the first byte (`0x16`
-  starts a TLS handshake):
-  - plain HTTP serves only the public team CA (`/ca.crt`);
+  `srw-------`. In a relayed session (mTLS on) the socket also speaks TLS
+  and requires the client certificate. The host's own CLI then presents the
+  state dir's `client.crt`/`client.key` and expects the server
+  certificate's first SAN.
+- **Relay streams.** The daemon opens no TCP port of its own. Attendees
+  reach it only through the session's relay (section 12), which splices
+  their TLS to the daemon unopened:
   - TLS without a client certificate reaches only `/bundle/<id>`;
   - every API route requires a verified client chain.
-- **Without enrollment** (no `client.crt`/`client.key` to hand out), TLS
-  requires a client certificate at the handshake itself.
-- **Plaintext guard.** A non-loopback TCP listener requires `-mtls` or the
-  explicit `-http-allow-insecure` opt-in.
+- **No plain-HTTP API.** Through the relay every API route needs a client
+  certificate; only a local session's owner-only socket is plain.
 
-## 8. Direct mTLS connection
+## 8. Mutual TLS between attendee and daemon
 
-A remote client that has enrolled talks to the daemon over mutual TLS:
+An enrolled attendee talks to the daemon over mutual TLS, end to end through
+the relay's splice (section 12.3):
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant C as Remote client
-  participant D as Daemon TCP port
-  C->>D: TCP connect, ClientHello (SNI = dialed host)
+  participant C as Attendee
+  participant D as Daemon (through the relay)
+  C->>D: ClientHello (SNI = session ID)
   D-->>C: server.crt (signed by team CA)
-  C->>C: verify chain to ca.crt and SAN matches the dialed host or IP
+  C->>C: verify chain to ca.crt and SAN matches the relay host
   D->>C: CertificateRequest
   C-->>D: client.crt + proof of possession of client.key
   D->>D: verify chain to ca.crt
@@ -300,16 +423,20 @@ sequenceDiagram
   D-->>C: result
 ```
 
-- The client trusts **only** `ca.crt` from its state dir (no system roots).
-- The client checks the server's **name**: the dialed host must be one of the
-  server certificate's SANs. `client.json` lists every SAN, so a
-  multi-homed server is reachable by each address.
-- The server checks the client certificate against the same CA and the CRL.
+- The attendee trusts **only** `ca.crt` from its state dir (no system roots).
+- The attendee checks the server's **name**: the relay host it dials must be
+  one of the server certificate's SANs. With the self-hosted relay the host
+  prints one enrollment line per address of its machine, and each is a SAN.
+- The daemon checks the client certificate against the same CA and the CRL
+  (section 10).
 
-## 9. Enrollment (`kbtool client -import`)
+## 9. Enrollment (`kbtool collaborate attend`)
 
 Enrollment gives a new machine the team's `ca.crt`, `client.crt` and
-`client.key` with one pasted line, without trusting the network.
+`client.key` with one pasted line, without trusting the network. The host's
+daemon prints the line (`kbtool collaborate attend kb1…`) at every start;
+an attendee whose certificates were renewed re-enrolls with
+`kbtool collaborate resume kb1…`.
 
 ### 9.1 The token
 
@@ -322,11 +449,8 @@ flowchart LR
   SE --> K["enrollment key (16 bytes)"]
 ```
 
-- Everything after `kb1` is unpadded base64url. A **direct** token carries
-  only the flags byte and the key. The daemon URL is written in front of it:
-  `kbtool client -import https://HOST:PORT/ kb1…`.
-- A **relay** token also carries the relay host, port and session, so it is
-  pasted alone.
+- Everything after `kb1` is unpadded base64url. The token carries the relay
+  host, port and session as well as the key, so it is pasted alone.
 - Parsing is strict: unknown flag bits, wrong lengths, an invalid host name,
   port 0 or trailing bytes are all refused.
 - **The key is the only secret.** It is 128 random bits, generated at daemon
@@ -338,28 +462,31 @@ flowchart LR
   - The team CA arrives inside the encrypted bundle, so no fingerprint is
     needed.
 
-### 9.2 The protocol (direct)
+### 9.2 The protocol
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor U as User
-  participant C as New client
-  participant D as Daemon :9876
-  U->>C: kbtool client -import https://kb.example.net:9876/ kb1…
+  participant C as New attendee
+  participant R as Relay
+  participant D as Daemon
+  U->>C: kbtool collaborate attend kb1…
   C->>C: parse token, id = HMAC-SHA256(key, "kbtool bundle id")[:16]
-  C->>D: TLS (no verification yet), GET /bundle/<id>
+  C->>R: TLS (SNI = session, no verification yet), GET /bundle/<id>
+  R->>D: conn <id> / accept / splice (unopened)
   D->>D: constant-time compare id
-  D-->>C: KBX1 bundle (sealed with the boot key's AES key)
+  D-->>C: KBX1 bundle (sealed with the boot key's AES key), through the splice
   Note over C: remembers the server certificate seen on this connection
   C->>C: PBKDF2 600k + AES-GCM open (fails = wrong or stale token, or tampering)
   C->>C: extract only the 4 allowed files (1 MiB cap)
-  C->>C: verify the seen server certificate chains to the bundled ca.crt and is valid for kb.example.net
+  C->>C: verify the seen server certificate chains to the bundled ca.crt and is valid for the relay host
   alt not valid
     C-->>U: refuse, write nothing (tampered connection?)
   else valid
     C->>C: write files (client.key 0600), client.json
-    C->>D: mTLS GET /healthz with the new certificate
+    C->>R: mTLS (SNI = session) GET /healthz with the new certificate
+    R->>D: splice
     D-->>C: 200 ok
     C-->>U: enrolled
   end
@@ -379,7 +506,7 @@ flowchart TB
   E -->|"no: 128-bit derived ID, constant-time compare, same 404 as any probe"| X4["404"]
 ```
 
-The token is a **bearer secret** while its daemon runs: anyone who has it can
+The token is a **bearer secret** while its daemon is up: anyone who has it can
 enroll. Daemon logs that contain it are mode 0600. Restarting the daemon
 revokes all outstanding tokens; the CRL revokes the shared client
 certificate itself (section 10).
@@ -401,9 +528,8 @@ flowchart TB
   STORE --> I
 ```
 
-- **Refresh:** `crl_refresh=false` (the default) watches the file and
-  reloads on change. `crl_refresh=true` reloads every `crl_interval`
-  seconds.
+- **File:** `crl.pem` in the session host's state dir. The daemon watches
+  it and reloads it when it changes.
 - **Missing file:** no revocation data. Deleting the file clears the store.
 - **Corrupt file:** the previous lists are kept, so a read hiccup never
   releases revocations.
@@ -412,15 +538,15 @@ flowchart TB
 
 ## 11. The host's unix socket and live reindex
 
-On the daemon host the CLI reaches the daemon only through `daemon.sock`
-(never TCP or the relay). Socket-only methods let `kbtool build` hand over a
+On the session host the CLI reaches the daemon only through `daemon.sock`
+(never the relay). Socket-only methods let `kbtool build` hand over a
 new index:
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant B as kbtool build (host)
-  participant S as daemon.sock (0600, TLS if mtls)
+  participant S as daemon.sock (0600, TLS in a relayed session)
   participant D as Daemon
   B->>S: kbtool/index_info
   S-->>B: {db, encrypted}
@@ -433,14 +559,34 @@ sequenceDiagram
 
 - The SHA-256 here is an **integrity check** against truncation and
   corruption, not authentication. The socket's owner-only permission (and
-  mTLS when enabled) decides who may swap.
-- The swap methods do not exist over HTTP, the relay, or stdio.
+  mTLS in a relayed session) decides who may swap.
+- The swap methods do not exist over the relay or stdio.
+- Two more socket-only methods follow the same rule:
+  - **`kbtool/sessions`** serves the daemon's catalog of sealed session heads
+    to a caller that presents `HMAC-SHA256(key, "kbtool session list v1")`
+    (section 6a);
+  - **`kbtool/steer`** has the `system` account post the session host's
+    steering message and its attachments (`kbtool steer`). Only a process
+    that can open the owner-only socket can steer, which is what makes it
+    the host's privilege. Each attachment's SHA-256 is checked against the
+    announced digest before anything is posted. The posts are signed with
+    the `system` key like every system message, and agents cannot post
+    `kind=steer`.
+- **The session host's agent** is whoever last signed up through the
+  socket. That is how the board knows which agent works for the host (the
+  `[host agent]` tag in `board dump`). Only that agent, and only through the
+  socket, may propose a consensus change with `host_accepted`, which
+  accepts it without a vote. The same call from a remote client, or from
+  another agent, is refused.
 
 ## 12. The relay
 
-A relay lets clients reach a daemon that cannot accept connections. The
-daemon connects **out** to the relay; clients connect to the relay; the
-relay copies bytes without decrypting the team's traffic.
+Attendees reach the session host's daemon only through a relay: a remote
+one the host joined (`kbtool relay join URL`, run with `kbtool relay
+run|start`), or the self-hosted relay inside the host's own daemon for a
+LAN or VPN (`kbtool relay self-host start`, section 12.9). The daemon
+connects **out** to the relay; attendees connect to the relay; the relay
+copies bytes without decrypting the team's traffic.
 
 ### 12.1 Two layers of trust
 
@@ -454,37 +600,44 @@ flowchart TB
     direction LR
     CL["client"] -- "SNI = session ID; relay cannot decrypt" --> DM2["daemon"]
   end
-  TA1["trust anchor: relay CA fetched over plain HTTP (default), or system roots / pinned CA (relay_ca)"] -.- outer
+  TA1["trust anchor: the certificate the relay presents (default), or system roots / pinned CA (relay.json ca)"] -.- outer
   TA3["who may register: holder of the session key (signature bound to the TLS connection)"] -.- outer
   TA2["trust anchor: team CA (from the enrollment bundle) and client certificates"] -.- inner
 ```
 
 | Layer | Protects | Trust anchor |
 |---|---|---|
-| Relay TLS | the daemon's registration and its accept streams | by default the relay CA, fetched over plain HTTP from `/ca.crt`, host names not checked; with `relay_ca` the system roots or a pinned CA, host name checked |
+| Relay TLS | the daemon's registration and its accept streams | by default whatever certificate the relay presents in the handshake (its CA fingerprint is reported), host names not checked; with the `relay.json` `ca` setting the system roots or a pinned CA, host name checked |
 | Session proof | that only the session's daemon registers it | the daemon's Ed25519 session key; the session ID commits to its public key |
 | Team TLS / mTLS | everything that matters: the enrollment bundle and all MCP traffic | the team CA and the shared client certificate |
 
-In the default mode the relay CA only keeps registrations private from
-passive observers: an attacker who swaps the relay CA in transit could read
+In the default mode the relay TLS only keeps registrations private from
+passive observers: an active attacker between daemon and relay could present
+its own certificate and read
 session IDs and the relay token, but never team traffic, and cannot enroll
 or impersonate a daemon. Even that attacker cannot register a session: the
 proof is signed over keying material of the TLS connection it travels on, so
 it is useless on the attacker's own connection to the real relay. With
-`relay_ca` set, the token is protected too. The registration token is
+the `relay.json` `ca` setting, the token is protected too. The registration token is
 compared in constant time.
 
 ### 12.2 One port, routed by the first bytes
 
 ```mermaid
 flowchart TB
-  IN["connection to the relay port"] --> P{"first byte 0x16 (TLS)?"}
-  P -->|"no"| HTTP["plain HTTP: GET /ca.crt (current relay CA), GET /healthz"]
+  IN["connection to the relay port"] --> B{"source address<br/>blocked by the honeypot?"}
+  B -->|"yes"| DROP["held silently, then reset"]
+  B -->|"no"| P{"first byte 0x16 (TLS)?"}
+  P -->|"no"| HTTP["plain HTTP: GET /healthz (rate-limited); anything else: honeypot"]
   P -->|"yes"| SNI{"SNI in the ClientHello<br/>(peeked, not consumed)"}
   SNI -->|"live session ID"| PASS["passthrough: splice to that daemon, never terminated"]
   SNI -->|"session-shaped but unknown"| CLOSE["closed"]
-  SNI -->|"anything else"| TERM["terminated by the relay: /healthz, POST /v1/register, POST /v1/accept/ID"]
+  SNI -->|"anything else"| TERM["terminated by the relay: /healthz, POST /v1/register, POST /v1/accept/ID; anything else: honeypot"]
 ```
+
+Every answer the relay itself gives, on either layer, carries the header
+`Server: Apache` (no version, like `ServerTokens Prod`; no page signature, like `ServerSignature Off`). Paths that are not kbtool endpoints get
+the honeypot (section 12.8), never a kbtool error.
 
 ### 12.3 Registration and a relayed client connection
 
@@ -494,9 +647,7 @@ sequenceDiagram
   participant D as Daemon
   participant R as Relay
   participant C as Client
-  D->>R: plain HTTP GET /ca.crt (default trust mode only)
-  R-->>D: current relay CA
-  D->>R: TLS handshake (verify the relay certificate)
+  D->>R: TLS handshake (default: accept the presented certificate; pinned: verify it and the host name)
   D->>D: ekm = TLS exporter("kbtool relay register v1", 32 bytes)<br/>sig = Ed25519(session key, label, session, expiry, ekm)
   D->>R: POST /v1/register, Upgrade, X-Kbtool-Session, X-Kbtool-Session-Key, -Expires, -Sig, X-Kbtool-Relay-Token
   R->>R: per-IP rate, token (constant time), ID = SHA-256(key, expiry), same ekm, verify sig, not expired, under the cap, not already live
@@ -521,7 +672,10 @@ Inside the splice:
 - The daemon presents `server.crt` with the team CA appended to the chain.
 - The client sends SNI = session (the relay's routing key). It still
   verifies the server certificate against the team CA **for the relay's host
-  name**, which `mtls -relay` puts in the server certificate's SANs.
+  name**. The session host puts every joined relay host in the server
+  certificate's SANs (section 4), so the session can start on (or be moved
+  to) any of them without new certificates. That gives a relay nothing: presenting the
+  certificate still takes the daemon's private key.
 - The relay sees only TLS records. It learns metadata: session IDs, timing
   and byte counts.
 
@@ -529,7 +683,7 @@ Inside the splice:
 
 ```mermaid
 flowchart TB
-  subgraph setup["mtls -relay (once)"]
+  subgraph setup["session certificates (each time the host issues them)"]
     K["new Ed25519 key -> relay-session.key (0600)"]
     E["team CA NotAfter = expiry"]
     K --> H["SHA-256('kbtool relay session v1' || public key || expiry as 8-byte BE)"]
@@ -573,38 +727,27 @@ flowchart TB
 | Registrations per source IP | 30/min, burst 10 (429) | `-register-rate`, `KBTOOL_RELAY_REGISTER_RATE` |
 | Control line | 128 bytes, both ends | — |
 | Streams per session / total | 64 / 1024 | — |
+| `/healthz` answers | one per interval for all callers together, 1000 ms (429 with `Retry-After`); 0 = unlimited | `-healthz-interval`, `KBTOOL_RELAY_HEALTHZ_INTERVAL` |
+| Honeypot blocks | 15 min on becoming suspicious, 1 h for each probe while suspicious | `-honeypot-block`, `-honeypot-reblock` (ms), `KBTOOL_RELAY_HONEYPOT_BLOCK`, `KBTOOL_RELAY_HONEYPOT_REBLOCK` |
+| Honeypot memory | clients remembered 2 h after their last answered request; table capped at 10% of the memory available at start (512 bytes a client, at least 1024 clients), oldest evicted first | `-honeypot-remember` (ms), `-honeypot-max-memory`, `KBTOOL_RELAY_HONEYPOT_REMEMBER`, `KBTOOL_RELAY_HONEYPOT_MAX_MEMORY` |
+| Held dropped connections | 4096 at once, each held 1 min; beyond that, reset at once | — |
 
 ### 12.6 Enrollment through a relay
 
-The same protocol as section 9.2, with these differences:
+Enrollment (section 9.2) always goes through the session's relay:
 
 - the token carries the relay host, port and session;
 - the bundle download uses SNI = session, so the relay routes it to the
   daemon unopened;
-- the client verifies the server certificate it saw against the bundled CA
+- the attendee verifies the server certificate it saw against the bundled CA
   for the relay host.
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant C as New client
-  participant R as Relay
-  participant D as Daemon
-  C->>R: TLS (SNI = session), GET /bundle/<id>
-  R->>D: conn <id> / accept / splice
-  D-->>C: KBX1 bundle through the splice
-  C->>C: PBKDF2 + AES-GCM open, verify server cert vs bundled CA for the relay host
-  C->>R: mTLS (SNI = session) GET /healthz
-  R->>D: splice
-  D-->>C: 200 ok
-```
 
 ### 12.7 The relay's certificate: in memory and rotating, or the operator's
 
 ```mermaid
 stateDiagram-v2
   [*] --> Gen0: relay start
-  Gen0: CA generation N (in memory, valid 24h)
+  Gen0: CA generation N (in memory)
   Gen0 --> GenNext: every 12h (-rotate) or SIGHUP
   GenNext: CA generation N+1
   GenNext --> GenNext: next rotation
@@ -612,44 +755,114 @@ stateDiagram-v2
   GenNext --> [*]: stop (keys gone)
 ```
 
-- At every start the relay generates a new CA and leaf (ECDSA P-256, valid
-  `-ca-ttl`, 24h by default). It never writes them, and it deletes any
-  `relay-ca.*`/`relay.*` files older versions left behind.
-- **Rotation** swaps the CA served on `/ca.crt` and the leaf presented to
-  new handshakes together. Established connections are untouched, because
-  certificates are only checked at the handshake.
-- **The CA lifetime is longer than the rotation interval**, so a CA stays
-  valid for at least one interval after it is replaced.
+- At every start the relay generates a new CA and leaf (ECDSA P-256). It
+  never writes them, and it deletes any `relay-ca.*`/`relay.*` files older
+  versions left behind.
+- **Disguise.** Anyone can open a TLS connection to the relay, so its
+  certificates must not give it away. The CA is `CN=Easy-RSA CA`; the leaf's
+  CN is the host name and its SANs are the host name plus `-ip`/`-dns` (no
+  interface addresses, so no internal network leaks), ServerAuth only. The
+  handshake sends `[leaf, CA]`, like a server configured with its own CA.
+  Every certificate of one relay process carries the same validity, chosen
+  once per process: from a random 30 to 365 days before the start, for ten
+  years. A 12-hour certificate would mark the relay as unusual; this one
+  looks like a long-lived self-made certificate, while the keys behind it
+  still change at every rotation. The relay serves no `/ca.crt`: that path
+  is an ordinary honeypot 404.
+- **Rotation** swaps the chain presented to new handshakes. Established
+  connections are untouched, because certificates are only checked at the
+  handshake. Default-mode daemons accept the presented certificate, so they
+  follow a rotation with nothing to fetch.
 - **Operator certificate.** With `-cert`/`-key` the relay serves that chain
-  instead and never rotates; `SIGHUP` reads the files again. `/ca.crt` serves
-  the chain's last certificate, so default-mode daemons keep working, and
-  daemons with `relay_ca` (`system` or a file) verify it properly, host name
-  included, without fetching anything over plain HTTP.
-
-How a default-mode daemon follows a rotation (with `relay_ca` there is
-nothing to fetch):
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant D as Daemon
-  participant R as Relay
-  Note over R: SIGHUP or 12h timer: new CA and leaf
-  R->>D: control: conn <id>
-  D->>R: TLS for /v1/accept with the cached old CA
-  R-->>D: new leaf: verification fails
-  D->>R: plain HTTP GET /ca.crt
-  R-->>D: new CA (kept for later accepts)
-  D->>R: TLS for /v1/accept with the new CA: succeeds
-  R-->>D: 101: stream spliced to the client
-```
+  instead and never rotates; `SIGHUP` reads the files again. Default-mode
+  daemons report the chain's last certificate as the fingerprint, and
+  daemons whose `relay.json` sets `ca` (`system` or a file) verify it
+  properly, host name included.
 
 **Reconnects.** If the control stream drops, or the relay is down, the daemon
 re-registers the same session forever. It waits with jittered exponential
 backoff: the ceiling doubles from 1 s to 30 s, and each wait is between half
-the ceiling and the ceiling. In the default trust mode every attempt fetches
-the CA again, so a restarted relay with a brand-new CA is picked up
-automatically.
+the ceiling and the ceiling. In the default trust mode a restarted relay with
+a brand-new CA is accepted as presented.
+
+### 12.8 The honeypot: an Apache disguise for probers
+
+The relay's public port must answer anyone, so it is scanned. It does not
+announce itself. Every answer it gives itself claims to be Apache httpd,
+and any path that is not a kbtool endpoint gets an Apache directory listing
+or an Apache error page; the listing's icons are Apache's own files under
+`/icons/`, so hashing them also says httpd. kbtool's own clients and daemons only use
+`/healthz`, `/v1/register`, `/v1/accept/…` and SNI passthrough,
+so no kbtool workflow ever touches the honeypot.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unknown
+  Unknown --> Seen: GET /
+  Seen --> Suspicious: GET /<fake dir>, blocked 15 min
+  Unknown --> Suspicious: GET /<fake dir>, blocked 15 min
+  Suspicious --> Suspicious: a fake dir again after the block, blocked 1 h
+  Seen --> [*]: 2 h with no answered request, or evicted
+  Suspicious --> [*]: 2 h with no answered request (never while blocked), or evicted
+```
+
+- **The listing.** At start the relay makes 32 random words, a fake date
+  for each, and a 32-byte key (all `crypto/rand`; no word is `ca.crt`,
+  `healthz`, `v1` or another name a real server would have). Each client
+  sees 1 to 5 of the words as directories: the bits of a 32-bit mask taken
+  from HMAC-SHA256(key, client address). The mask is computed on each
+  request and never stored, so the listing costs no memory per client
+  (4 bytes while it is being rendered). It is the same over HTTP and
+  HTTPS and for as long as the relay runs, so reloading or switching
+  scheme gives nothing away. It reveals nothing about sessions, daemons or
+  the relay's configuration. The word count is fixed.
+- **Seen and suspicious.** `GET /` marks a client seen. Requesting any of
+  the 32 fake directories, which only someone who read a fake listing
+  would do, makes it suspicious and blocks it. Other unknown paths get a
+  404 and change nothing.
+- **Blocking.** A blocked address is refused before anything else,
+  including passthrough to daemons. A user-space process cannot drop
+  packets, so the relay accepts the connection, never reads or writes a
+  byte, holds it for a minute and then resets it. To the client it looks
+  like a dead server. Dropped traffic does not count as activity; only
+  answered requests refresh a client's last-seen time.
+- **Bounded memory.** The client table is a least-recently-seen list capped
+  by a memory budget (section 12.5). A swarm of new addresses evicts the
+  oldest clients instead of growing memory, so a relay on a small host
+  stays up, and more memory makes the protection longer-lived. Eviction can
+  release a blocked address early. This table is separate from the
+  per-IP rate limiter, which keeps refusing new addresses when its own
+  100,000-entry table is full.
+- **`/healthz` rate limit.** `/healthz` answers at most once per interval,
+  whoever asks, so it cannot be used to measure the relay or burn its CPU.
+  `kbtool relay join`, which checks `/healthz`, waits for `Retry-After`
+  and retries.
+- **Local control.** `kbtool relay honeypot ls | rm IP… | clear
+  [-suspicious]` talks to the running relay over `<state>/relay.sock`. The
+  socket is created under umask 077 and set to mode 0600, so file
+  permissions are its only access control, as for the daemon socket.
+  `ls -json` can feed an external firewall that drops packets for real.
+
+### 12.9 The self-hosted relay (LAN or VPN)
+
+With `kbtool relay self-host start` the session host's daemon hosts the relay
+itself, in memory, and its sessions use it instead of any joined relay.
+
+- **Same relay server.** It is the relay of sections 12.2 to 12.8 (session
+  proof, SNI passthrough, honeypot, `Server: Apache`), listening on all
+  interfaces at `relay.json` `selfhost_port` (drawn once from 20000-32767
+  and kept).
+- **Its own certificate.** A disguised in-memory CA and leaf as in section
+  12.7, with this machine's addresses as SANs, replaced every 12 hours. It
+  has no pid file, log, control socket or operator certificate.
+- **Registration.** The daemon registers over loopback with the
+  `relay.json` `selfhost_token`: 128 random bits made once and kept (mode
+  0600). Port and token are kept, so the relay stays personal and enrolled
+  attendees keep working across restarts and resumes.
+- **Attendees** dial one of this machine's addresses, one enrollment line
+  per address. The team certificates name those addresses (section 4); a
+  session whose certificates do not cover them is served locally only until
+  `collaborate resume` issues new ones.
 
 ## 13. Message board signatures
 
@@ -663,16 +876,32 @@ verification status on each message.
 sequenceDiagram
   autonumber
   participant A as Agent
+  participant K as kbtool (session layer)
   participant B as Board (daemon)
-  A->>B: board_signup {"name":"alice"}
+  A->>K: board_signup {"name":"alice"}
+  K->>B: board_signup
   B->>B: seed = 32 random bytes, Ed25519 key from seed
   B->>B: under the board lock: bind name <-> public key permanently
-  B-->>A: seed (64 hex) — shown once, kbtool keeps only the public key
-  Note over A: the agent stores its seed privately (it is its identity)
+  B-->>K: seed (64 hex) — shown once, the board keeps only the public key
+  K->>K: store the seed in the session's .kbtool-seed (0600)
+  K-->>A: reply without the seed
 ```
 
 A name is bound to one public key for the life of the board; a second
 signup with the same name is refused.
+
+- **Seed custody.** `kbtool mcp` (stdio), `kbtool call` and
+  `kbtool board` wrap the board tools in a session layer. It
+  stores the seed from `board_signup` in the session's `.kbtool-seed`
+  (0600), removes it from the reply, and adds it to every later board call,
+  so the agent never sees or repeats its seed. The seed still travels from
+  the daemon to the client once, inside the team's mTLS (on the session
+  host, over the owner-only socket).
+- **Platform.** The signup also records the OS and CPU of the client binary
+  (`GOOS/GOARCH`, fixed at build time; 64 bytes at most, checked before any
+  seed is made). It is **reported by the client and not verified**, and
+  not signed: treat it as a label. Only `board_whoami` and `board dump`
+  show it.
 
 ### 13.2 Signing and verifying
 
@@ -705,10 +934,28 @@ flowchart TB
   SIG --> read
 ```
 
-- The seed is used to sign and then dropped; kbtool never stores it.
+- The board itself never stores a seed, only the public key. The seed
+  lives in the session directory's `.kbtool-seed` (0600), written
+  by `kbtool board signup` or the session layer (section 13.1). Each signing call sends the
+  seed to the daemon, which derives the key, signs, and keeps nothing. In an
+  encrypted state dir the seed is plain while its session is active and
+  sealed in the session's `.kbx` once it finishes.
 - **Attachments** are signed through their SHA-256 digest. Swapping the
   stored bytes turns the message into `bad-signature`, and `board fetch`
-  refuses data whose digest differs from the signed one.
+  refuses data whose digest differs from the signed one. Attachments go
+  through the agent's memory directory: attaching reads
+  files from there and fetching writes there, never to arbitrary paths.
+- **Consensus.** Proposals and votes are ordinary signed agent posts in the
+  `consensus` thread, and outcomes are `system` posts. The accepted files
+  come from the signed attachments of the accepted proposals. The daemon
+  builds every background sync from them and checks each file against the
+  SHA-256 recorded when it was proposed; clients trust the daemon for this,
+  as for the board itself. Only the session host's agent, through the
+  daemon socket, can skip the vote (section 11).
+- **Board state outside messages.** Agent platforms (an `AGT1` trailer) and
+  the consensus state (proposals, votes, accepted files: a `CNS1` trailer)
+  are stored with the board and are not signed. Like the messages, they
+  are as trustworthy as whoever controls the board file.
 - **What signatures do not do:** they prove *who* wrote a message, not that
   the board is complete or fresh. Whoever controls the board file can delete
   or withhold messages. When the store is encrypted, the board is
@@ -721,31 +968,44 @@ flowchart TB
 flowchart LR
   subgraph who["Who"]
     N["network observer"]
+    SC["internet scanner or bot swarm"]
     M["active MITM"]
     RO["relay operator"]
     TH["token holder"]
     LU["other local user on the host"]
+    SU["process running as the same user"]
     DT["disk thief"]
   end
   subgraph what["What they get"]
     N --> N1["TLS metadata; session IDs (SNI); the public team CA"]
+    SC --> SC1["sees an Apache server; probing blocks it; a swarm evicts old entries but cannot exhaust relay memory"]
     M --> M1["cannot enroll, read, or impersonate; can drop traffic"]
     RO --> RO1["metadata and byte counts; can drop traffic; never team plaintext"]
-    TH --> TH1["can enroll while that daemon runs (bearer secret)"]
+    TH --> TH1["can enroll while that daemon is up (bearer secret)"]
     LU --> LU1["no access to daemon.sock (0600) or keys (0600)"]
-    DT --> DT1["encrypted store: needs the passphrase (PBKDF2 600k); plain store: everything"]
+    SU --> SU1["everything the user can read: keys, the active session, the daemon's environment (KBTOOL_SECRET)"]
+    DT --> DT1["encrypted state dir: kb.db and finished sessions need the key (PBKDF2 600k), but an active or crashed session, the PKI keys and relay.json are plain; plain state dir: everything"]
   end
 ```
 
 | Asset | Protected by | Main residual risk |
 |---|---|---|
 | MCP traffic | TLS 1.2+ with ECDHE, mutual certificate authentication, CRL | a leaked shared client key; revoke it with the CRL |
-| Enrollment | token-derived AES-256-GCM bundle, CA-inside-bundle server check | the token while its daemon runs |
-| Relay registration | Ed25519 session proof bound to the TLS exporter, expiry with the team CA, constant-time token check, relay TLS (CA over plain HTTP, or `relay_ca`) | default mode: an active MITM on the CA download can see the token and session IDs (but cannot register) |
-| Relay availability | session cap, per-IP connection and registration rates, stream limits, bounded control lines | a distributed flood from many addresses; one NAT shares a budget |
+| Enrollment | token-derived AES-256-GCM bundle, CA-inside-bundle server check | the token while its daemon is up |
+| Relay registration | Ed25519 session proof bound to the TLS exporter, expiry with the team CA, constant-time token check, relay TLS (the presented certificate, or the `relay.json` `ca` setting) | default mode: an active MITM between daemon and relay can see the token and session IDs (but cannot register) |
+| Relay availability | session cap, per-IP connection and registration rates, stream limits, bounded control lines, `/healthz` once per interval, honeypot blocks, memory-capped client table | a distributed flood from many addresses; one NAT shares a budget and a block; anyone can use up the `/healthz` answers, so a monitor may see 429 |
+| Relay discovery | Apache disguise on every non-kbtool path and in every `Server` header; the listing and blocks never touch kbtool endpoints | it hides the product from casual scans, not from someone who knows kbtool's paths or watches its traffic |
+| Relay control | `relay.sock`, mode 0600 in the relay's state dir | any process running as the relay's user can list, unblock or clear clients |
 | Store at rest | AES-256-GCM with a PBKDF2 key | weak passphrases (PBKDF2 is not memory-hard) |
+| Finished sessions (encrypted state dir) | KBX2: AES-256-GCM records with a per-file HMAC key, header as associated data, a required final record; random file names, identity only in the head | weak passphrases; the number, sizes and times of archives are visible |
+| Active session and its state | file permissions (0600/0700); sealed at finish; unclean shutdowns blocked until `session validate` seals | a disk thief or same-user process while it is active or before it is validated; deleted plaintext remnants |
+| State dir key | never written by kbtool; no prompt in an encrypted state dir | the daemon's environment is readable by the same user; a `-db-key-file` is as safe as that file |
 | Board authorship | Ed25519 signatures, permanent name-to-key binding | completeness and freshness are not guaranteed |
-| Daemon socket | owner-only permission, mTLS when configured | any process running as the same user |
+| Board seeds | kept by kbtool in the session's `.kbtool-seed` (0600) and never shown to the agent | same-user processes can read it |
+| Consensus | signed proposals and votes, every other active agent must vote yes, `system`-signed outcomes, host-only bypass through the socket | the daemon decides who is active and builds the synced files; the host user can accept without a vote |
+| Agent platform labels | 64-byte limit at signup | client-reported and unsigned: a modified client can claim anything |
+| Steering messages | posted only through the owner-only daemon socket, signed by `system` | anyone running as the host user can steer; agents are told to confirm with their own human before acting |
+| Daemon socket | owner-only permission, mTLS in a relayed session | any process running as the same user |
 
 ## 15. Limitations and deliberate choices
 
@@ -754,39 +1014,80 @@ flowchart LR
 - **Leaf certificates carry both ServerAuth and ClientAuth** (one profile
   for all leaves).
 - **All clients share one client certificate.** Access is all-or-nothing per
-  team, and revocation affects every holder. Re-run `kbtool mtls` and
-  re-enroll to rotate it.
-- **Certificates default to 24 hours** (`-expire`), so a long-lived team
-  needs a longer expiry or a periodic `kbtool mtls`.
-- **By default the relay CA is trusted on first fetch, every time.** This is
+  team, and revocation affects every holder. New certificates (a new
+  session, or a renewal) rotate it, and attendees re-enroll with the new
+  line.
+- **Certificates default to 24 hours** (`collaborate host -expire`), so a
+  long-lived team needs a longer expiry or renewals: `kbtool collaborate
+  finish && kbtool collaborate resume` issues new ones once they expire,
+  and attendees then run `kbtool collaborate resume kb1…` with the new line.
+- **By default the relay's certificate is trusted as presented, every time.** This is
   intentional: the relay layer only adds privacy for registrations, and team
   security never depends on it; session ownership rests on the session key,
   not on the relay's certificate. Relay host names are not verified for the
-  same reason. Set `relay_ca` (`-relay-ca system` or a CA file) for a relay on
+  same reason. Pin the relay (`relay join -relay-ca system` or a CA file) for a relay on
   the internet with an operator certificate, so the token is protected too.
 - **PBKDF2-HMAC-SHA256 with 600,000 iterations** follows current OWASP
   guidance for that function, but it is not memory-hard (unlike scrypt or
   Argon2, which are not in the standard library). The 128-bit enrollment key
   is random, so this only matters for human-chosen store passphrases.
+- **One salt per state dir for KBX2.** New archives reuse the salt of an
+  existing one so that listing many sessions costs one PBKDF2 derivation.
+  Every file still has its own AES key (HMAC of the master key with a random
+  128-bit file ID), so record nonces never repeat under a key. The trade-off:
+  one successful guess of the passphrase opens every archive, which is true of
+  a shared passphrase anyway.
+- **Session archives hide contents, not existence.** File names are random
+  and say nothing about the session, but the number of archives, their
+  sizes, record counts and modification times are visible. The head
+  (session ID, working directory, certificate options, summary, participants) is
+  encrypted like the rest. `session.json` names the current session's ID in
+  the clear.
+- **The session catalog is served on the daemon socket** to callers that
+  present `HMAC-SHA256(key, "kbtool session list v1")`. That value is a
+  fixed verifier, not a challenge response: anyone who captures it from the
+  socket can replay it while the key is unchanged. The socket is owner-only,
+  and such a process could read the active session anyway.
+- **Deleted plaintext is not wiped** (section 6b). kbtool unlinks files; it
+  cannot guarantee the blocks are gone.
 - **No associated data in KBX1.** The magic and version are checked
   explicitly, and the salt and nonce feed the key and the GCM computation,
   so tampering with them still fails authentication.
 - **SHA-256 on the index swap is integrity, not authentication.** The unix
-  socket's permissions (and mTLS) are the authentication.
-- **Fingerprints are informational.** The team CA fingerprint printed by
-  `kbtool mtls` and the relay fingerprint printed by `relay establish` help
-  humans compare; no protocol step depends on them.
+  socket's permissions (and mTLS in a relayed session) are the authentication.
+- **The honeypot is a disguise and a tripwire, not authentication.** It
+  only judges requests outside kbtool's endpoints, so it never blocks a
+  real client by itself, but everyone behind one NAT address shares a
+  block. A blocked connection costs the relay a socket for a minute (at
+  most 4096 at once) because user space cannot drop packets; feed
+  `relay honeypot ls -json` to a firewall for true drops. A swarm larger
+  than the client table evicts the oldest entries, including blocks, so
+  more memory means longer memory. Blocks and the boot key live in memory
+  only, and a restart forgets them along with the listing.
+- **Fingerprints are informational.** The team CA fingerprint and the relay
+  fingerprint printed by `relay join` help humans compare; no protocol step
+  depends on them.
 
 ## 16. Where to look in the code
 
 | Topic | Functions in `kbtool.go` |
 |---|---|
-| Certificates | `cryptoGenerateCA`, `cryptoGenerateLeaf`, `cryptoRandomSerial`, `caFingerprint` |
+| Certificates | `cryptoGenerateCA`, `cryptoGenerateLeaf`, `cryptoRandomSerial`, `caFingerprint`; issued for a session by `collaborateHost` and `collaborateResume` through `runMtls` |
 | TLS configs | `cryptoServerTLSConfig`, `cryptoClientTLSConfig`, `bootstrapTLSConfig`, `hostSocketTLS` |
 | CRL | `cryptoLoadCRLs`, `cryptoVerifyCRLs`, `cryptoCheckRevoked`, `cryptoMonitorCRL` |
 | KBX1 bundles | `cryptoPbkdf2SHA256`, `cryptoBundleAEAD`, `bundleSealer.seal` / `.open` |
-| Store at rest | `kbStore` (`writeBundle`, `saveBoard`, `saveDBBytes`, `lock`), `resolveKey` |
+| KBX2 session archives | `newKBX2Writer`, `openKBX2`, `kbx2AEAD`, `sealSession`, `extractSession`, `readSessionHead`, `rekeyKBX2`, `rekeyDataDir` |
+| Store at rest | `kbStore` (`writeBundle`, `saveBoard`, `saveDBBytes`, `lock`), `resolveKey`, `requireSecret` |
+| Encrypted state dir | `encryptedDataDir`, `encryptDataDir`, `finishSessionNow`, `sealSessionDir`, `moveStateBack`, `daemonFinishSession`, `kbxMaster` |
+| Unclean shutdown | `uncleanSession`, `refuseUncleanSession`, `validateUnclean`, `checkStateDir` |
+| Session catalog | `sessionCatalog`, `sealedSessions`, `findSessionArchive`, `newSessionKBXPath`, `sessionListVerifier`, `Toolbox.sealedSessions` |
 | Enrollment | `enrollToken.encode`, `parseEnrollToken`, `bundleIDFromKey`, `bootstrapState`, `bootstrapFetchBundle`, `bootstrapInstall` |
-| Relay | `newRelayPKI`, `loadRelayOperatorPKI`, `relayServer` (`route`, `passthrough`, `handleRegister`), `verifyRegistration`, `ipLimiter`, `peekClientHelloSNI`, `relayConnector` (`run`, `once`, `accept`), `relaySessionID`, `relayRegisterMessage`, `relayEKM`, `relaySessionAuth`, `loadRelayAuth`, `relayTrust`, `relayFetchCA`, `relayVerifyCA`, `relaySNIConfig` |
+| Relay | `newRelayPKI`, `loadRelayOperatorPKI`, `relayServer` (`route`, `passthrough`, `handleRegister`), `verifyRegistration`, `ipLimiter`, `peekClientHelloSNI`, `relayConnector` (`run`, `once`, `accept`), `relaySessionID`, `relayRegisterMessage`, `relayEKM`, `relaySessionAuth`, `loadRelayAuth`, `relayTrust`, `relayFingerprint`, `relayCertWindow`, `relaySANs`, `relaySNIConfig` |
+| Self-hosted relay | `selfRelay` (`start`, `endpoint`), `selfHostSettings`, `selfRelayEndpoint`, `selfHostCovered` |
+| Relay honeypot | `honeypot` (`mask`, `listing`, `blocked`, `record`, `sweep`, `drop`, `serve`), `honeypotMaxClientsFor`, `healthzLimiter`, `relayServer.publicHandler`, `relayServer.serveControl`, `relayHoneypotCmd` |
 | Board | `canonicalMsg`, `cryptoDeriveSeed`, `cryptoSignBoard`, `cryptoVerifyBoardMsg` |
+| Session layer (seed custody, memory attachments) | `withSession`, `sessionExec` (`signup`, `editSchemas`), `injectSessionSeed`, `memoryAttachment`, `fetchAttachment` |
+| Consensus | `consPropose`, `consVoteOn`, `consSettle`, `consApply`, `consTreeTarGZ` |
+| Reading sealed sessions | `sessionBoard`, `boardFromState`, `exportSessionDir` |
 | Live reindex | `handleHostMethod`, `Toolbox.swapIndex`, `swapIndexVia` |
+| Steering | `doSteer`, `readSteerPayload`, `Toolbox.steer`, `Board.appendSystemMsg`, `systemNotice` |

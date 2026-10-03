@@ -1,7 +1,8 @@
 # kbtool status — full reference
 
-Print the resolved state of a kbtool installation. `status` and `stats` are
-the same command. Non-interactive: it never prompts.
+Print the resolved state of a kbtool installation: session, relay, daemon,
+board and tools. `status` and `stats` are the same command.
+Non-interactive: it never prompts.
 
 ```
 kbtool status [-db-key-env NAME | -db-key-file PATH]
@@ -16,19 +17,27 @@ kbtool status [-db-key-env NAME | -db-key-file PATH]
 
 ## Output sections
 
+On a session host (or a state dir without a session):
+
 | Section | What it reports |
 |---|---|
-| `db:` | db path + size (or "not found" when the recorded/`KBTOOL_DB` path is missing). |
+| `db:` | db path + size (or "not found"). |
 | `at-rest:` | Store shape — `ENCRYPTED (KBX1 bundle: kb.db + message board)` and whether the key is loaded or required. |
-| `config:` | `config.json` path, recorded build options (`sources`, `git`, `live`, `liveRepos`, `dim/chunk/overlap/maxKB`, `kwPath`, `db`, `updated`); or "not found" (run `kbtool build …`). |
+| `config:` | `config.json` path and the recorded index options (`sources`, `git`, `live`, `liveRepos`, `dim/chunk/overlap/maxKB`, `kwPath`, `db`, `updated`); or "not found" (no session has been hosted from this state dir). |
 | `tool options:` | `git_tools`, `message_board`, `disable_tools` (with defaults annotated when the fields are absent). |
+| `message_board_max_memory:` | The resolved board memory limit. |
 | `disabled tools:` | The effective disabled set (list ∪ group-off tools). |
-| `path trust:` | `trusted_paths`, `forbidden_paths` and the rule: git tools read only `-live` repos + indexed git sources + `trusted_paths`; `forbidden_paths` always wins. |
-| `network:` | `http`, `mtls`, `insecure`, bind address (default shown: `127.0.0.1:9876` without mTLS, `:9876` with), CRL file (exists + refresh mode). "unix socket only" when no network is configured. |
-| `relay:` | Only in relay mode: `relay_url`, `relay_session` and whether a token is set ([relay.md](relay.md)). |
-| `client:` | On a daemon host: that its CLI uses the unix socket only (plus a note about a leftover `client.json`). On a remote client, status shows the `client.json` endpoint (`https://host:port`, plus the relay session) and whether it is reachable instead of the local sections. |
+| `path trust:` | `trusted_paths`, `forbidden_paths` and the rule: git tools read only the indexed git sources + `trusted_paths`; `forbidden_paths` always wins. |
+| `network:` | "unix socket only (no mtls configured)" for a local session; for a session through a relay, `https=false mtls=true` with the bind address and CRL file names from `config.json`. |
+| `relay:` | `relay.json` (relays enabled or disabled, how many joined, self-hosting) and the session's `relay_session` and sticky relay ([relay.md](relay.md)). |
+| `ca:` | The session CA's fingerprint, when there is one. |
+| `client:` | That the host's CLI uses the unix socket only (plus a note about a leftover `client.json`). |
 | `board:` | Thread/message/agent counts (when a board is present). |
-| `daemon:` / `mcp:` | Running (pid + socket) or stopped, per service. |
+| `daemon:` | Running (pid + socket) or stopped. |
+
+On an attendee, status opens nothing local and shows instead: `client:` (the
+relay session it reaches through `client.json`), `relay:`, `ca:`, `daemon:`
+(reachable or not) and the daemon's enabled tools.
 
 ## Behavior notes
 
@@ -36,10 +45,11 @@ kbtool status [-db-key-env NAME | -db-key-file PATH]
 - A corrupt config or unreadable store is reported inline, not fatal.
 - With an encrypted store and no key flag, the `at-rest:` line tells you the
   key is required and which flags supply it (`-db-key-env` / `-db-key-file` /
-  `$KBTOOL_DBKEY`).
+  `$KBTOOL_SECRET`).
 
 ## Related
 
 - Simple example: [status-simple.md](status-simple.md)
+- The session itself: [session.md](session.md) (`kbtool session ls`)
 - What the sections mean in depth: [client-server-config.md](client-server-config.md)
 - Back to [README](../README.md)

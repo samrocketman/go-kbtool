@@ -28,7 +28,8 @@ builds:
       # -s -w: strip symbols/DWARF.
       # -X main.appVer: inject the tag (goreleaser strips the leading "v")
       # so `kbtool version` on a release binary reports its own version.
-      - -s -w -X main.appVer={{ .Version }}
+      # -X main.preRelease: pre-release tools (bench) only in snapshot builds.
+      - -s -w -X main.appVer={{ .Version }} -X main.preRelease={{ .IsSnapshot }}
 
 archives:
   - id: kbtool

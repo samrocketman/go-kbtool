@@ -2,3 +2,8 @@
 
 # goreleaser output
 dist/
+
+# intermediate notes, if any.  Feel free to `mkdir scratch`
+/scratch
+
+/AGENTS_COLLABORATION.md

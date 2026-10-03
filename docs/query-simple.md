@@ -1,10 +1,10 @@
 # kbtool query — quick start
 
-Search the index. `query` and `search` are the same command.
+Search the session's index. `query` and `search` are the same command.
 
 ```sh
-# Build first (once):
-kbtool build -git /path/to/repoA
+# Start a session first (indexes the working directory):
+kbtool collaborate host
 
 # Ask questions — hybrid (BM25 + vector) search by default:
 kbtool query "how do we parse config"
@@ -25,9 +25,9 @@ Output looks like:
 
 Notes:
 
-- If the daemon is running, `query` goes through the daemon (same results,
-  and message-board messages become searchable); otherwise it searches the
-  db file directly.
+- `query` goes through the session's daemon, so message-board messages are
+  searchable too. With no daemon running it fails (the host starts it
+  with `kbtool collaborate resume`).
 - `-min` gates only the vector channel; the keyword channel is never gated by it.
 
 Full reference with every option: [query.md](query.md) · back to [README](../README.md)

@@ -37,8 +37,7 @@ Notes:
 - Matching is an exact, case-sensitive **substring** over every indexed chunk —
   no ranking is involved, so a rare identifier is found even when a search
   wouldn't surface it.
-- Works the same through the daemon socket or the direct db (with
-  `-db-key-env` / `-db-key-file` for encrypted stores), and as the MCP tool
-  `kb_terms`.
+- Goes through the session's daemon (it fails when none runs), and is also the
+  MCP tool `kb_terms`.
 
 Full reference: [terms.md](terms.md) · back to [README](../README.md)

@@ -48,6 +48,25 @@ package main
 //     calls through the relay, relay CLI (plans/mtls-relay-plan.md)
 //  35. PBKDF2 cost: clients pay 600k iterations once, the server derives once
 //     (plans/pbkdf2-derive-once-plan.md)
+//  36. compact enrollment token (plans/compact-enrollment-token-plan.md)
+//  37. relay mode turns the message board on (plans/relay-message-board-default-plan.md)
+//  38. host socket CLI, remote-client guard, live reindex
+//     (plans/host-socket-cli-and-live-reindex-plan.md)
+//  39. relay in-memory rotating CA and systemd (plans/relay-ephemeral-ca-and-systemd-plan.md)
+//  40. relay reconnect jitter (plans/relay-reconnect-jitter-plan.md)
+//  41. relay hardening (plans/relay-hardening-plan.md)
+//  42. system user, read-only system thread, welcome limit, build refresh
+//     (plans/system-board-and-build-refresh-plan.md)
+//  43. collaboration sessions, relay.json, collaboration doc
+//  44. encrypted sessions, KBTOOL_SECRET, KBX2 and kbx rekey
+//  45. kbtool steer and system notices on stderr (plans/steer-and-system-notices-plan.md)
+//  46. memory, consensus and deliverables through kbtool (plans/memory-consensus-deliverables-plan.md)
+//  47. consensus voting on the board (plans/memory-consensus-deliverables-plan.md)
+//  48. board export from finished sessions (plans/memory-consensus-deliverables-plan.md)
+//  49. agent-side session layer: attachments through memory over MCP, host
+//     agent tag, signup platform (plans/session-memory-attachments-plan.md)
+//  50. relay honeypot, /healthz rate limit (plans/relay-honeypot-plan.md)
+//  51. pre-release tools: bench only in snapshot and source builds
 //
 // All tests use only the standard library and run hermetically (temp dirs,
 // no network). Git-dependent tests are skipped when git is absent.
@@ -74,6 +93,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"math/bits"
 	"math/rand"
 	"net"
 	"net/http"
@@ -83,10 +103,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2153,50 +2175,44 @@ func TestLogTail(t *testing.T) {
 	}
 }
 
-// ---------- 15. HTTP bind guard ----------
+// ---------- 15. No plain HTTP ----------
 
-func TestIsLoopbackBind(t *testing.T) {
-	for _, a := range []string{"127.0.0.1:9876", "[::1]:9876", "localhost:8080", "127.5.6.7:1"} {
-		if !isLoopbackBind(a) {
-			t.Errorf("%s should be loopback", a)
-		}
+// TestDaemonRefusesPlainHTTP: why — the daemon's TCP port is only ever HTTPS
+// with client certificates; -http (or config http) without mTLS must refuse to
+// start before any pid file or socket exists, on loopback too.
+func TestDaemonRefusesPlainHTTP(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
 	}
-	for _, a := range []string{"0.0.0.0:9876", ":9876", "[::]:9876", "10.0.0.5:9876", "myhost:80"} {
-		if isLoopbackBind(a) {
-			t.Errorf("%s should NOT be loopback", a)
-		}
+	bin := filepath.Join(t.TempDir(), "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
 	}
-	// Malformed.
-	if isLoopbackBind("nonsense") {
-		t.Error("malformed should be non-loopback")
-	}
-}
-
-func TestValidateHTTPBind(t *testing.T) {
-	cases := []struct {
-		name     string
-		httpOn   bool
-		mtls     bool
-		insecure bool
-		addr     string
-		wantErr  bool
+	for _, c := range []struct {
+		name string
+		cfg  string
+		args []string
 	}{
-		{"no http", false, false, false, "0.0.0.0:1", false},
-		{"loopback cleartext ok", true, false, false, "127.0.0.1:9876", false},
-		{"localhost cleartext ok", true, false, false, "localhost:9876", false},
-		{"nonloopback cleartext refused", true, false, false, "0.0.0.0:9876", true},
-		{"nonloopback cleartext LAN refused", true, false, false, "10.1.2.3:9876", true},
-		{"nonloopback mtls ok", true, true, false, "0.0.0.0:9876", false},
-		{"nonloopback insecure ok", true, false, true, "0.0.0.0:9876", false},
-		{"hostname cleartext refused (fail closed)", true, false, false, "myhost:9876", true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			err := validateHTTPBind(c.httpOn, c.mtls, c.insecure, c.addr)
-			if (err != nil) != c.wantErr {
-				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
+		{"flag", "", []string{"daemon", "run", "-http", "-bind", "127.0.0.1:0"}},
+		{"config", `{"http": true, "http_addr": "127.0.0.1:0"}`, []string{"daemon", "run"}},
+	} {
+		state := shortStateDir(t)
+		if c.cfg != "" {
+			writeTestPEM(t, state, "config.json", []byte(c.cfg))
+		}
+		cmd := exec.Command(bin, c.args...)
+		cmd.Env = append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KB_EMBED_URL=")
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "serves TCP only with mTLS") {
+			t.Fatalf("%s: -http without mTLS must refuse: %v\n%s", c.name, err, out)
+		}
+		ents, _ := os.ReadDir(state)
+		for _, e := range ents {
+			if e.Name() != "config.json" {
+				t.Fatalf("%s: a refused start must leave no state, found %s", c.name, e.Name())
 			}
-		})
+		}
 	}
 }
 
@@ -2225,11 +2241,16 @@ func TestSplitListenAddr(t *testing.T) {
 // ---------- 16. config + tool options ----------
 
 func TestEffectiveDisabledSetDefault(t *testing.T) {
-	// nil config → defaults: kb_status, board_sign, all git, all board.
+	// nil config → defaults: kb_status, board_sign, all git; the board is on.
 	m := effectiveDisabledSet(nil)
-	for _, name := range []string{"kb_status", "board_sign", "git_blame", "git_log", "board_signup", "board_read"} {
+	for _, name := range []string{"kb_status", "board_sign", "git_blame", "git_log"} {
 		if !m[name] {
 			t.Errorf("%s should be disabled by default", name)
+		}
+	}
+	for _, name := range []string{"board_signup", "board_read", "board_post"} {
+		if m[name] {
+			t.Errorf("%s should be enabled by default", name)
 		}
 	}
 	// search_codebase should be enabled (not disabled).
@@ -2292,8 +2313,8 @@ func TestEnsureToolOptionsSeed(t *testing.T) {
 	if c.GitTools == nil || *c.GitTools != false {
 		t.Fatal("GitTools should be seeded false")
 	}
-	if c.MessageBoard == nil || *c.MessageBoard != false {
-		t.Fatal("MessageBoard should be seeded false")
+	if c.MessageBoard == nil || *c.MessageBoard != true {
+		t.Fatal("MessageBoard should be seeded true")
 	}
 }
 
@@ -2686,8 +2707,8 @@ func TestQwenToolsShape(t *testing.T) {
 
 func TestToolSchemasWellFormed(t *testing.T) {
 	tools := toolSchemas()
-	if len(tools) != 17 {
-		t.Fatalf("got %d tools, want 17", len(tools))
+	if len(tools) != 21 {
+		t.Fatalf("got %d tools, want 21", len(tools))
 	}
 	seen := map[string]bool{}
 	for _, tool := range tools {
@@ -2934,7 +2955,7 @@ func TestOpenStoreKeyEnv(t *testing.T) {
 
 func TestResolveKey(t *testing.T) {
 	t.Setenv("RK_ENV", "envvalue")
-	t.Setenv(dbKeyEnv, "")
+	t.Setenv(secretEnv, "")
 	// 1. keyEnv wins.
 	k, have, err := resolveKey("RK_ENV", "", false)
 	if err != nil || !have || string(k) != "envvalue" {
@@ -2957,13 +2978,13 @@ func TestResolveKey(t *testing.T) {
 	if _, _, err := resolveKey("", filepath.Join(dir, "nope"), false); err == nil {
 		t.Fatal("missing file should error")
 	}
-	// 3. $KBTOOL_DBKEY fallback.
-	t.Setenv(dbKeyEnv, "dbkeyvalue")
+	// 3. $KBTOOL_SECRET fallback.
+	t.Setenv(secretEnv, "dbkeyvalue")
 	k, have, err = resolveKey("", "", false)
 	if err != nil || !have || string(k) != "dbkeyvalue" {
 		t.Fatalf("got (%s,%v,%v)", k, have, err)
 	}
-	t.Setenv(dbKeyEnv, "")
+	t.Setenv(secretEnv, "")
 	// 4. no source, no prompt → (nil,false,nil).
 	k, have, err = resolveKey("", "", false)
 	if err != nil || have || k != nil {
@@ -3830,17 +3851,12 @@ func TestEndpointFromClientConfigUnix(t *testing.T) {
 	}
 }
 
-func TestEndpointFromClientConfigHTTP(t *testing.T) {
-	cc := &clientConfig{Host: "10.0.0.5", Port: 9999}
-	ep, url, ok := endpointFromClientConfig(cc)
-	if !ok {
-		t.Fatal("not ok")
-	}
-	if ep.kind != "http" {
-		t.Fatalf("kind = %q", ep.kind)
-	}
-	if url != "http://10.0.0.5:9999" {
-		t.Fatalf("url = %q", url)
+// TestEndpointFromClientConfigNoTLS: why — daemons serve TCP only with mTLS,
+// so a hand-edited client.json with tls off yields no endpoint and cleartext
+// is never tried.
+func TestEndpointFromClientConfigNoTLS(t *testing.T) {
+	if _, _, ok := endpointFromClientConfig(&clientConfig{Host: "10.0.0.5", Port: 9999}); ok {
+		t.Fatal("a client config without TLS must yield no TCP endpoint")
 	}
 }
 
@@ -4101,7 +4117,12 @@ func TestWeightedFuseZeroScores(t *testing.T) {
 
 // ---------- 22. documentation link consistency (README + docs/) ----------
 
-var docSubcommands = []string{"build", "query", "terms", "bundle", "bench", "tools", "call", "mcp", "daemon", "mtls", "client", "relay", "status", "board"}
+var docSubcommands = []string{"build", "query", "terms", "bundle", "tools", "call", "mcp", "daemon", "relay", "status", "board",
+	"collaborate", "session", "steer", "kbx", "memory"}
+
+// snapshotSubcommands are the snapshot-only commands, documented (simple and
+// full) under docs/snapshots/ only.
+var snapshotSubcommands = []string{"bench", "mtls", "client"}
 
 // mdLinks extracts the relative markdown link targets of a doc. Fenced code
 // blocks are stripped first (shell/JSON examples must not count as links);
@@ -4154,14 +4175,23 @@ func mdLinkSet(t *testing.T, path string) map[string]bool {
 
 // TestDocsLinks machine-checks the required documentation structure:
 //
-//  1. every relative link in README.md and docs/*.md resolves to a real entry;
-//  2. the README links every subcommand's simple doc (the required index);
+//  1. every relative link in README.md, docs/*.md and docs/snapshots/*.md
+//     resolves to a real entry;
+//  2. the README links every release subcommand's simple doc (the required
+//     index), and neither the README nor a release doc links snapshot docs;
 //  3. each simple doc cross-links its full doc and the full doc links back
-//     (the required two-document, cross-linked layout).
+//     (the required two-document, cross-linked layout), release commands in
+//     docs/, snapshot-only ones in docs/snapshots/;
+//  4. every snapshot doc says it applies to snapshot builds, and
+//     docs/snapshots/README.md indexes the snapshot-only commands.
 func TestDocsLinks(t *testing.T) {
 	docs, err := filepath.Glob("docs/*.md")
 	if err != nil {
 		t.Fatalf("glob docs: %v", err)
+	}
+	snaps, err := filepath.Glob("docs/snapshots/*.md")
+	if err != nil {
+		t.Fatalf("glob docs/snapshots: %v", err)
 	}
 	if len(docs) == 0 {
 		t.Fatal("no docs/*.md found (expected the docs/ directory)")
@@ -4170,12 +4200,25 @@ func TestDocsLinks(t *testing.T) {
 		t.Fatalf("no README.md: %v", err)
 	}
 
-	// 1. No broken relative links anywhere.
-	for _, p := range append([]string{"README.md"}, docs...) {
+	// 1. No broken relative links anywhere; release docs never link snapshots.
+	release := append([]string{"README.md"}, docs...)
+	for _, p := range append(append([]string{}, release...), snaps...) {
 		for target := range mdLinkSet(t, p) {
 			if _, err := os.Stat(target); err != nil {
 				t.Errorf("%s: broken link -> %s", p, target)
 			}
+		}
+	}
+	for _, p := range release {
+		for target := range mdLinkSet(t, p) {
+			if strings.HasPrefix(filepath.ToSlash(target), "docs/snapshots") {
+				t.Errorf("%s: release docs must not link snapshot docs (%s)", p, target)
+			}
+		}
+	}
+	for _, p := range snaps {
+		if head := string(mustReadFile(t, p)); !strings.Contains(strings.ToLower(head[:min(len(head), 600)]), "snapshot") {
+			t.Errorf("%s: a snapshot doc says it applies to snapshot builds", p)
 		}
 	}
 
@@ -4188,14 +4231,27 @@ func TestDocsLinks(t *testing.T) {
 	}
 
 	// 3. Simple <-> full cross-links for every subcommand.
-	for _, cmd := range docSubcommands {
-		simple := filepath.Join("docs", cmd+"-simple.md")
-		full := filepath.Join("docs", cmd+".md")
+	pair := func(dir, cmd string) {
+		simple := filepath.Join(dir, cmd+"-simple.md")
+		full := filepath.Join(dir, cmd+".md")
 		if !mdLinkSet(t, simple)[full] {
 			t.Errorf("%s: missing cross-link to %s", simple, full)
 		}
 		if !mdLinkSet(t, full)[simple] {
 			t.Errorf("%s: missing cross-link back to %s", full, simple)
+		}
+	}
+	for _, cmd := range docSubcommands {
+		pair("docs", cmd)
+	}
+	snapIndex := mdLinkSet(t, filepath.Join("docs", "snapshots", "README.md"))
+	for _, cmd := range snapshotSubcommands {
+		pair(filepath.Join("docs", "snapshots"), cmd)
+		if !snapIndex[filepath.Join("docs", "snapshots", cmd+"-simple.md")] {
+			t.Errorf("docs/snapshots/README.md: missing link to %s-simple.md", cmd)
+		}
+		if readme[filepath.Join("docs", "snapshots", cmd+"-simple.md")] || fileExists(filepath.Join("docs", cmd+".md")) {
+			t.Errorf("%s is snapshot-only: documented under docs/snapshots/ and not in the README", cmd)
 		}
 	}
 }
@@ -4797,11 +4853,11 @@ func TestTermsBundleEncryptedStore(t *testing.T) {
 	}
 }
 
-// 7. Daemon parity: identical results via the daemon socket vs direct DB.
-// Builds the real binary, serves it with `daemon run` on a temp unix socket, and
-// compares `terms` + `bundle` output over the socket against the one-shot local
-// (direct-DB) path. Skipped when the go toolchain is unavailable.
-func TestTermsBundleDaemonParity(t *testing.T) {
+// 7. Client commands need the daemon: with a built DB on disk but no daemon,
+// every client command refuses instead of opening the store itself; once
+// `daemon run` serves the socket, terms, bundle and the stdio MCP server answer
+// through it. Skipped when the go toolchain is unavailable.
+func TestClientCommandsRequireDaemon(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		t.Skip("go not on PATH; cannot build the binary for daemon parity")
@@ -4872,17 +4928,14 @@ func TestEncodeEcosystem(t *testing.T) {
 		return string(b), err
 	}
 
-	// Direct-DB (daemon down) baseline.
-	termsLocal, err := run("terms", "EncodeEcosystem")
-	if err != nil {
-		t.Fatalf("terms (local): %v\n%s", err, termsLocal)
-	}
-	bundleLocal, err := run("bundle", "repo/src/foo/bar.go:7")
-	if err != nil {
-		t.Fatalf("bundle (local): %v\n%s", err, bundleLocal)
-	}
-	if !strings.Contains(termsLocal, "ABSENT") && !strings.Contains(termsLocal, "occurrence") {
-		t.Fatalf("unexpected terms output: %s", termsLocal)
+	for _, args := range [][]string{
+		{"terms", "EncodeEcosystem"}, {"bundle", "repo/src/foo/bar.go:7"}, {"query", "encode"},
+		{"query", "-bundle", "encode"}, {"call", "kb_status"}, {"tools"}, {"mcp"}, {"board", "dump"},
+	} {
+		out, err := run(args...)
+		if err == nil || !strings.Contains(out, "no kbtool daemon is running") {
+			t.Fatalf("%v without a daemon must refuse: %v\n%s", args, err, out)
+		}
 	}
 
 	// Start the daemon on a temp socket.
@@ -4939,22 +4992,17 @@ func TestEncodeEcosystem(t *testing.T) {
 	if !strings.Contains(absDaemon, "ABSENT in indexed sources") {
 		t.Fatalf("absent terms over daemon: %s", absDaemon)
 	}
-	// Strip the "(via daemon: …)" stderr line, then require identical results.
-	stripDaemon := func(s string) string {
-		var out []string
-		for _, ln := range strings.Split(s, "\n") {
-			if strings.Contains(ln, "(via daemon:") {
-				continue
-			}
-			out = append(out, ln)
-		}
-		return strings.Join(out, "\n")
+	if !strings.Contains(termsDaemon, "occurrence") || !strings.Contains(termsDaemon, "(via daemon:") {
+		t.Fatalf("terms over the daemon: %s", termsDaemon)
 	}
-	if got, want := stripDaemon(termsDaemon), termsLocal; got != want {
-		t.Fatalf("daemon/local terms mismatch:\ndaemon=\n%s\nlocal=\n%s", got, want)
+	if !strings.Contains(bundleDaemon, "bar.go") {
+		t.Fatalf("bundle over the daemon: %s", bundleDaemon)
 	}
-	if got, want := stripDaemon(bundleDaemon), bundleLocal; got != want {
-		t.Fatalf("daemon/local bundle mismatch:\ndaemon=\n%s\nlocal=\n%s", got, want)
+	mcp := exec.Command(bin, "mcp")
+	mcp.Env = dEnv
+	mcp.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}` + "\n")
+	if out, err := mcp.Output(); err != nil || !strings.Contains(string(out), "search_codebase") {
+		t.Fatalf("stdio mcp must proxy to the running daemon: %v\n%s", err, out)
 	}
 }
 
@@ -5047,6 +5095,18 @@ func writeTestPEM(t *testing.T, dir, name string, data []byte) {
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// serveToolboxSocket serves tb on a unix socket at path, the way the daemon
+// does, for the client commands of a built binary to reach.
+func serveToolboxSocket(t *testing.T, tb *Toolbox, path string) {
+	t.Helper()
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go serveUnix(ln, tb, make(chan error, 1))
 }
 
 // freePort returns a localhost TCP port that is free at call time.
@@ -5542,13 +5602,13 @@ func TestMtlsPureClientUsesBackendToolsAndState(t *testing.T) {
 	t.Setenv("KBTOOL_DB", "")
 	t.Setenv("KBTOOL_BOARD", "")
 	caKey, caCert := writeTestClientPKI(t, dir)
-	backend := &fakeExec{disabled: map[string]bool{"kb_status": true}} // backend: board ON
+	backend := &fakeExec{disabled: map[string]bool{"kb_status": true}} // backend: git tools ON
 	port := startTestMtlsDaemon(t, caKey, caCert, backend)
 	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
 		t.Fatal(err)
 	}
-	if !effectiveDisabledSet(nil)["board_signup"] {
-		t.Fatal("control: the local default view must hide the board (else this test is vacuous)")
+	if !effectiveDisabledSet(nil)["git_blame"] {
+		t.Fatal("control: the local default view must hide the git tools (else this test is vacuous)")
 	}
 
 	tools, via, err := cliToolList()
@@ -5562,15 +5622,15 @@ func TestMtlsPureClientUsesBackendToolsAndState(t *testing.T) {
 	for _, tl := range tools {
 		got[tl.Name] = true
 	}
-	if !got["board_signup"] || !got["board_post"] || got["kb_status"] {
-		t.Fatalf("tool list must be the backend's (board on, kb_status off), got %v", got)
+	if !got["git_blame"] || !got["board_post"] || got["kb_status"] {
+		t.Fatalf("tool list must be the backend's (git tools on, kb_status off), got %v", got)
 	}
 
 	ex, _, ok, err := liveDaemon()
 	if !ok {
 		t.Fatal(err)
 	}
-	if ex.toolDisabled("board_signup") || !ex.toolDisabled("kb_status") {
+	if ex.toolDisabled("git_blame") || !ex.toolDisabled("kb_status") {
 		t.Fatal("stdio-mcp proxy filter must follow the backend's tools/list")
 	}
 	if text, isErr := ex.Execute("board_threads", json.RawMessage(`{}`)); isErr || text != "exec:board_threads" {
@@ -5678,8 +5738,9 @@ func TestMtlsClientConfigErrorsSurfaced(t *testing.T) {
 
 // TestMtlsClientRefusesLocalFallbackCLI is the user's scenario through the built
 // binary: with an unreachable mTLS endpoint, `call board_signup`, `query`, and
-// stdio `mcp` must fail and must NOT create a local board.bin. The control run
-// (no client.json) shows the same call otherwise writes the local board.
+// stdio `mcp` must fail and must NOT create a local board.bin. Without
+// client.json and without a daemon the same call fails too: no client command
+// opens the store itself.
 func TestMtlsClientRefusesLocalFallbackCLI(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -5730,7 +5791,7 @@ func TestMtlsClientRefusesLocalFallbackCLI(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%v: must fail with an unreachable mTLS endpoint, got:\n%s", c.args, out)
 		}
-		if !strings.Contains(out, "refusing local db/board fallback") {
+		if !strings.Contains(out, "endpoint is unreachable") {
 			t.Fatalf("%v: missing the no-fallback error:\n%s", c.args, out)
 		}
 		if fileExists(board) {
@@ -5742,12 +5803,11 @@ func TestMtlsClientRefusesLocalFallbackCLI(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, "client.json")); err != nil {
 		t.Fatal(err)
 	}
-	// Control: a plain local dir with the board on writes board.bin locally.
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"version":1,"message_board":true}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := run("", "call", "board_signup", `{"name":"gus"}`); err != nil || !fileExists(board) {
-		t.Fatalf("control: without mTLS the one-shot board call writes board.bin locally: err=%v\n%s", err, out)
+	if out, err := run("", "call", "board_signup", `{"name":"gus"}`); err == nil || !strings.Contains(out, "no kbtool daemon is running") || fileExists(board) {
+		t.Fatalf("without a daemon the board call must refuse and write nothing: err=%v\n%s", err, out)
 	}
 }
 
@@ -5858,9 +5918,16 @@ func TestBoardSnapshotVerificationStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got []string
+	var agentMsgs []snapMsg
 	for _, m := range s.Threads[0].Msgs {
+		if m.Agent == boardSystem {
+			continue // the system intro (verified) is not under test here
+		}
+		agentMsgs = append(agentMsgs, m)
 		got = append(got, m.Text+"="+m.Status)
 	}
+	s.Threads = s.Threads[:1]
+	s.Threads[0].Msgs = agentMsgs
 	want := []string{"genuine alice=verified", "forged alice=impersonation", "tampered=bad-signature"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("statuses = %v, want %v", got, want)
@@ -5892,19 +5959,19 @@ func TestBoardSnapshotOrderAndRoster(t *testing.T) {
 	for _, th := range s.Threads {
 		ids = append(ids, th.ID)
 	}
-	if !reflect.DeepEqual(ids, []string{"welcome", "zeta", "alpha"}) {
+	if !reflect.DeepEqual(ids, []string{"welcome", "system", "zeta", "alpha"}) {
 		t.Fatalf("thread order = %v", ids)
 	}
-	if z := s.Threads[1].Msgs; len(z) != 2 || z[0].Text != "z0" || z[1].Text != "z1" || z[1].Seq != 1 {
+	if z := s.Threads[2].Msgs; len(z) != 2 || z[0].Text != "z0" || z[1].Text != "z1" || z[1].Seq != 1 {
 		t.Fatalf("zeta messages out of seq order: %+v", z)
 	}
-	if s.TTL != 60 || len(s.Agents) != 2 {
-		t.Fatalf("ttl=%d agents=%d", s.TTL, len(s.Agents))
+	if s.TTL != 60 || len(s.Agents) != 3 || s.Agents[0].ID != boardSystem {
+		t.Fatalf("ttl=%d agents=%+v (system first)", s.TTL, s.Agents)
 	}
-	if a := s.Agents[0]; a.ID != "alice" || !a.Active {
+	if a := s.Agents[1]; a.ID != "alice" || !a.Active {
 		t.Fatalf("most recent agent should be ACTIVE alice, got %+v", a)
 	}
-	if b := s.Agents[1]; b.ID != "bob" || b.Active {
+	if b := s.Agents[2]; b.ID != "bob" || b.Active {
 		t.Fatalf("bob (last seen 1h ago, ttl 60s) should be STALE, got %+v", b)
 	}
 }
@@ -6028,8 +6095,8 @@ func TestBoardExportNotAnMCPTool(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
 		t.Fatal(err)
 	}
-	if rr.Error != nil || len(rr.Result.Threads) != 1 || len(rr.Result.Threads[0].Msgs) != 1 ||
-		rr.Result.Threads[0].Msgs[0].Text != "over http" || rr.Result.Threads[0].Msgs[0].Status != "verified" {
+	if rr.Error != nil || len(rr.Result.Threads) != 2 || len(rr.Result.Threads[0].Msgs) != 2 ||
+		rr.Result.Threads[0].Msgs[1].Text != "over http" || rr.Result.Threads[0].Msgs[1].Status != "verified" {
 		t.Fatalf("board/export over HTTP: error=%v result=%+v", rr.Error, rr.Result)
 	}
 
@@ -6055,7 +6122,7 @@ func TestBoardExportRemoteOverMtls(t *testing.T) {
 	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
 		t.Fatal(err)
 	}
-	got, via, err := boardDumpSnapshot(filepath.Join(dir, "kb.db"), "", "")
+	got, via, err := boardDumpSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6073,19 +6140,20 @@ func TestBoardExportRemoteOverMtls(t *testing.T) {
 }
 
 // TestBoardExportDisabledBoard pins that a config with the message board off
-// (message_board absent/false) refuses the export with an explanation instead of
+// (message_board false) refuses the export with an explanation instead of
 // rendering an empty page; the control exports the same board once it is on.
 func TestBoardExportDisabledBoard(t *testing.T) {
 	tb := newBoardToolbox(t, nil)
 	seed := dumpSignup(t, tb, "alice")
 	dumpPost(t, tb, seed, "welcome", "hello", "hi")
-	tb.Disabled = effectiveDisabledSet(nil)
+	off := false
+	tb.Disabled = effectiveDisabledSet(&config{MessageBoard: &off})
 	if _, err := tb.boardExport(); err == nil || !strings.Contains(err.Error(), "disabled by config") {
 		t.Fatalf("board off must refuse the export, got %v", err)
 	}
 	on := true
 	tb.Disabled = effectiveDisabledSet(&config{MessageBoard: &on})
-	if s, err := tb.boardExport(); err != nil || len(s.Threads) != 1 {
+	if s, err := tb.boardExport(); err != nil || len(s.Threads) != 2 {
 		t.Fatalf("control: board on must export, got %v (threads=%d)", err, len(s.Threads))
 	}
 }
@@ -6111,7 +6179,9 @@ func TestBoardDumpBinaryRunsWithoutTemplateOnDisk(t *testing.T) {
 		t.Fatal(err)
 	}
 	work := t.TempDir()
-	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+filepath.Join(state, "none.sock"),
+	sock := filepath.Join(shortStateDir(t), "daemon.sock")
+	serveToolboxSocket(t, tb, sock)
+	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+sock,
 		"KBTOOL_DB=", "KBTOOL_BOARD="+tb.BoardPath, "KB_EMBED_URL=")
 	cmd := func(args ...string) *exec.Cmd {
 		c := exec.Command(bin, args...)
@@ -6386,19 +6456,21 @@ func TestBoardAttachmentLimits(t *testing.T) {
 	dumpPost(t, tb, seed, "x", "info", "a small text post still fits")
 }
 
-// TestBoardFileWithoutAttachmentsUnchanged pins compatibility: a board without
-// attachments serializes with no trailer (boards written before this feature
-// still load), and a trailer pointing at an unknown message is corruption.
+// TestBoardFileWithoutAttachmentsUnchanged pins compatibility: a board written
+// before the attachments trailer (it ends after the agents) still loads, the
+// trailer round-trips, and a trailer pointing at an unknown message is
+// corruption.
 func TestBoardFileWithoutAttachmentsUnchanged(t *testing.T) {
 	b := newBoard()
 	b.Threads["welcome"].Msgs = []BoardMsg{{ID: 1, Thread: "welcome", Agent: "a", Text: "hi", Kind: "info"}}
 	plain := boardMarshal(b)
-	if _, err := readBoard(bytes.NewReader(plain)); err != nil {
+	legacy := plain[:len(plain)-4] // no attachment count: the pre-attachments format
+	if _, err := readBoard(bytes.NewReader(legacy)); err != nil {
 		t.Fatalf("board without trailer: %v", err)
 	}
 	b.Threads["welcome"].Msgs[0].Attach = &BoardAttachment{SHA256: "s", Data: []byte("d"), Files: []attachFile{{Name: "f", Size: 1}}}
 	with := boardMarshal(b)
-	if !bytes.HasPrefix(with, plain) {
+	if !bytes.HasPrefix(with, legacy) {
 		t.Fatal("attachments must only append a trailer")
 	}
 	b2, err := readBoard(bytes.NewReader(with))
@@ -6409,7 +6481,7 @@ func TestBoardFileWithoutAttachmentsUnchanged(t *testing.T) {
 	orphan := boardMarshal(b)
 	b.Threads["welcome"].Msgs[0].Attach = nil
 	b.Threads["welcome"].Msgs[0].ID = 1
-	corrupt := append(boardMarshal(b), orphan[len(plain):]...)
+	corrupt := append(legacy, orphan[len(legacy):]...)
 	if _, err := readBoard(bytes.NewReader(corrupt)); err == nil || !strings.Contains(err.Error(), "unknown message") {
 		t.Fatalf("orphan attachment must be corruption, got %v", err)
 	}
@@ -6612,7 +6684,7 @@ func TestBoardAttachRemoteOverMtls(t *testing.T) {
 	if err := saveClientConfig(mtlsHostConfig(port)); err != nil {
 		t.Fatal(err)
 	}
-	ex, via, err := boardClientExec(filepath.Join(dir, "kb.db"), "", "")
+	ex, via, err := boardClientExec()
 	if err != nil || !strings.HasPrefix(via, "https://127.0.0.1:") {
 		t.Fatalf("not resolved to the mTLS backend: via=%q err=%v", via, err)
 	}
@@ -6665,7 +6737,9 @@ func TestBoardAttachFetchBinary(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+filepath.Join(state, "none.sock"),
+	sock := filepath.Join(shortStateDir(t), "daemon.sock")
+	serveToolboxSocket(t, tb, sock)
+	env := append(os.Environ(), "KBTOOL_DIR="+state, "KBTOOL_SOCKET="+sock,
 		"KBTOOL_DB=", "KBTOOL_BOARD="+tb.BoardPath, "KB_EMBED_URL=")
 	run := func(dir string, args ...string) (string, error) {
 		c := exec.Command(bin, args...)
@@ -7504,7 +7578,7 @@ func TestDaemonMtlsServesHTTPByDefault(t *testing.T) {
 // shrink its limits before it serves.
 func startTestRelay(t *testing.T, token string, tune func(*relayServer)) (*relayServer, string) {
 	t.Helper()
-	rs := newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour), token)
+	rs := newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil), token)
 	if tune != nil {
 		tune(rs)
 	}
@@ -7538,17 +7612,13 @@ func newTestRelaySession(t *testing.T, exp time.Time) (string, *relaySessionAuth
 }
 
 // registerTestSession registers sid with the relay at hp, signed by auth (nil:
-// unsigned), trusting the relay CA fetched over HTTP.
+// unsigned), trusting the certificate the relay presents.
 func registerTestSession(hp, sid string, auth *relaySessionAuth, token string) (net.Conn, error) {
-	pool, _, err := relayFetchCA(hp)
-	if err != nil {
-		return nil, err
-	}
 	var sign func(tls.ConnectionState) (map[string]string, error)
 	if auth != nil {
 		sign = func(cs tls.ConnectionState) (map[string]string, error) { return auth.headers(sid, cs) }
 	}
-	return relayUpgrade(hp, relayTLSClientConfig(pool), "/v1/register",
+	return relayUpgrade(hp, relayTrust{}.tlsConfig(), "/v1/register",
 		map[string]string{"X-Kbtool-Session": sid, "X-Kbtool-Relay-Token": token}, sign)
 }
 
@@ -7646,6 +7716,9 @@ func enrollViaRelay(t *testing.T, hp string, team *relayTeam) *clientConfig {
 		t.Fatal(err)
 	}
 	t.Setenv("KBTOOL_DIR", cli)
+	if err := enableClientRelay(); err != nil {
+		t.Fatal(err)
+	}
 	cc, err := loadClientConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -7745,26 +7818,32 @@ func TestClientHelloSNI(t *testing.T) {
 	}
 }
 
-// TestRelayPublicEndpoints: why — daemons bootstrap trust in the relay from
-// plain-HTTP /ca.crt, and /healthz serves health checks on both the plain and
-// the TLS side.
+// TestRelayPublicEndpoints: why — /healthz serves health checks on both the
+// plain and the TLS side, the relay serves no /ca.crt that would name it, and a
+// default-trust daemon learns the CA fingerprint from the handshake itself.
 func TestRelayPublicEndpoints(t *testing.T) {
 	rs, hp := startTestRelay(t, "", nil)
-	resp, err := http.Get("http://" + hp + "/ca.crt")
-	if err != nil {
-		t.Fatal(err)
+	for _, scheme := range []string{"http", "https"} {
+		cl := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+		resp, err := cl.Get(scheme + "://" + hp + "/ca.crt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound || bytes.Contains(b, []byte("CERTIFICATE")) {
+			t.Fatalf("%s /ca.crt must be the honeypot's 404: %d %q", scheme, resp.StatusCode, b)
+		}
 	}
-	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !bytes.Equal(b, rs.currentPKI().CAPEM) {
-		t.Fatal("plain /ca.crt must serve the relay CA")
+	if l := rs.Honey.list(); len(l) != 0 {
+		t.Fatalf("/ca.crt must not mark the client: %+v", l)
 	}
 	if !relayHealthy(hp) {
 		t.Fatal("plain /healthz must answer")
 	}
 	fp, err := relayCheck(hp, relayTrust{})
 	if err != nil || fp != rs.currentPKI().FP {
-		t.Fatalf("relayCheck (CA over HTTP, /healthz over HTTPS) = %q, %v; want %q", fp, err, rs.currentPKI().FP)
+		t.Fatalf("relayCheck (/healthz over HTTPS) = %q, %v; want %q", fp, err, rs.currentPKI().FP)
 	}
 	if resp, err := http.Get("http://" + hp + "/v1/register"); err != nil || resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("registration must not be reachable over plain HTTP: %v %v", resp, err)
@@ -7990,8 +8069,8 @@ func TestRelayLimits(t *testing.T) {
 // TestResolveHTTPRelay: why — a daemon with a relay must not open a TCP port
 // that bypasses the relay unless the admin asks (-http or config http).
 func TestResolveHTTPRelay(t *testing.T) {
-	relay := &config{RelayURL: "https://relay:9876/"}
-	relayHTTP := &config{RelayURL: "https://relay:9876/", Http: true}
+	relay := &config{RelaySession: "0123456789abcdef0123456789abcdef"}
+	relayHTTP := &config{RelaySession: "0123456789abcdef0123456789abcdef", Http: true}
 	if resolveHTTP(false, false, relay, true) {
 		t.Error("relay + mTLS: HTTP must default off")
 	}
@@ -8003,31 +8082,34 @@ func TestResolveHTTPRelay(t *testing.T) {
 	}
 }
 
-// TestParseMtlsArgsRelay: why — `mtls -relay` takes the relay URL (default
-// port 9876, the daemon's) and an optional token; a token without a relay or a malformed
-// relay URL is a usage error, not silently ignored.
+// TestParseMtlsArgsRelay: why — relay.json is the only relay source, so the
+// old relay flags are usage errors; relay URLs default to port 9876 and the
+// relay CA setting ("system" or a PEM file) is validated before it is stored.
 func TestParseMtlsArgsRelay(t *testing.T) {
-	sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-token", "tk", "-dns", "extra.example"})
-	if err != nil || sa.relay != "https://relay.example/" || sa.token != "tk" || !reflect.DeepEqual(sa.names, []string{"extra.example"}) {
-		t.Fatalf("parse: %+v %v", sa, err)
+	for _, bad := range [][]string{{"-relay", "https://relay.example/"}, {"-token", "tk"}, {"-relay-ca", "system"}} {
+		if _, err := parseMtlsArgs(bad); err == nil {
+			t.Errorf("parseMtlsArgs(%q) must fail", bad)
+		}
 	}
-	if h, p, norm, err := relayHostPort(sa.relay); err != nil || h != "relay.example" || p != defRelayPort || norm != "https://relay.example:9876/" {
+	if h, p, norm, err := relayHostPort("https://relay.example/"); err != nil || h != "relay.example" || p != defRelayPort || norm != "https://relay.example:9876/" {
 		t.Fatalf("relayHostPort = %q %d %q %v", h, p, norm, err)
+	}
+	for _, bad := range []string{"http://relay/", "https://relay/x"} {
+		if _, _, _, err := relayHostPort(bad); err == nil {
+			t.Errorf("relayHostPort(%q) must fail", bad)
+		}
 	}
 	ca := filepath.Join(t.TempDir(), "relay-ca.pem")
 	_, caCert := cryptoGenerateCA("pinned", time.Hour)
 	writeTestPEM(t, filepath.Dir(ca), filepath.Base(ca), cryptoPEMCert(caCert))
-	if sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-relay-ca", "system"}); err != nil || sa.relayCA != "system" {
-		t.Fatalf("-relay-ca system: %+v %v", sa, err)
+	if v, err := normalizeRelayCA("system"); err != nil || v != "system" {
+		t.Fatalf("normalizeRelayCA(system) = %q %v", v, err)
 	}
-	if sa, err := parseMtlsArgs([]string{"-relay", "https://relay.example/", "-relay-ca", ca}); err != nil || sa.relayCA != ca {
-		t.Fatalf("-relay-ca FILE: %+v %v", sa, err)
+	if v, err := normalizeRelayCA(ca); err != nil || v != ca {
+		t.Fatalf("normalizeRelayCA(FILE) = %q %v", v, err)
 	}
-	for _, bad := range [][]string{{"-token", "tk"}, {"-relay", "http://relay/"}, {"-relay", "https://relay/x"},
-		{"-relay-ca", "system"}, {"-relay", "https://relay/", "-relay-ca", filepath.Join(t.TempDir(), "missing.pem")}} {
-		if _, err := parseMtlsArgs(bad); err == nil {
-			t.Errorf("parseMtlsArgs(%q) must fail", bad)
-		}
+	if _, err := normalizeRelayCA(filepath.Join(t.TempDir(), "missing.pem")); err == nil {
+		t.Fatal("a missing relay CA file must fail")
 	}
 }
 
@@ -8091,12 +8173,157 @@ func TestLiveDaemonPrefersLocalMtlsSocket(t *testing.T) {
 	}
 }
 
+// TestRelayListCLI: why — with several joined relays a new session falls back
+// round robin when a relay cannot take it, then sticks to the relay that did:
+// when that relay is down the daemon logs errors instead of moving, and only
+// the host's `relay move` switches it (keeping the session, since every
+// joined relay host is a SAN).
+func TestRelayListCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	dirA, dirB, srvDir := shortStateDir(t), shortStateDir(t), shortStateDir(t)
+	env := func(dir string) []string {
+		return append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=")
+	}
+	run := func(dir string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = env(dir)
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	n := 0
+	spawn := func(dir string, args ...string) (*exec.Cmd, string) {
+		t.Helper()
+		n++
+		logPath := filepath.Join(work, fmt.Sprintf("p%d.log", n))
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := exec.Command(bin, args...)
+		c.Env = env(dir)
+		c.Stdout, c.Stderr = lf, lf
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); lf.Close() })
+		return c, logPath
+	}
+	stop := func(c *exec.Cmd) {
+		_ = c.Process.Signal(syscall.SIGTERM)
+		_, _ = c.Process.Wait()
+	}
+	waitLog := func(path, want string) string {
+		t.Helper()
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if l := string(mustReadFile(t, path)); strings.Contains(l, want) {
+				return l
+			}
+		}
+		t.Fatalf("%q not in log:\n%s", want, mustReadFile(t, path))
+		return ""
+	}
+	startRelay := func(dir, hp string) *exec.Cmd {
+		t.Helper()
+		c, _ := spawn(dir, "relay", "run", "-bind", hp)
+		for deadline := time.Now().Add(15 * time.Second); !relayHealthy(hp); time.Sleep(50 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("relay %s did not come up", hp)
+			}
+		}
+		return c
+	}
+	cfgOf := func() config {
+		var c config
+		if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	pA, pB := freePort(t), freePort(t)
+	hpA, hpB := fmt.Sprintf("127.0.0.1:%d", pA), fmt.Sprintf("127.0.0.1:%d", pB)
+	urlA, urlB := "https://"+hpA+"/", "https://"+hpB+"/"
+	relayA, relayB := startRelay(dirA, hpA), startRelay(dirB, hpB)
+	for _, u := range []string{urlA, urlB} {
+		if out, err := run(srvDir, "relay", "join", u); err != nil {
+			t.Fatalf("relay join %s: %v\n%s", u, err, out)
+		}
+	}
+	if out, err := run(srvDir, "relay", "ls"); err != nil || !strings.Contains(out, "1. "+urlA+" (trusts the certificate it presents; next new session starts here)") || !strings.Contains(out, "2. "+urlB) {
+		t.Fatalf("relay ls: %v\n%s", err, out)
+	}
+	stop(relayA)
+	if out, err := run(srvDir, "mtls", "-expire", "1h"); err != nil || !strings.Contains(out, "round robin") {
+		t.Fatalf("mtls: %v\n%s", err, out)
+	}
+	sid := cfgOf().RelaySession
+	if cfgOf().RelayURL != "" {
+		t.Fatal("a new relay session picks its relay at daemon start")
+	}
+
+	d1, log1 := spawn(srvDir, "daemon", "run")
+	waitLog(log1, "relay "+hpA+": cannot start the session there")
+	waitLog(log1, "session "+sid+" started on relay "+urlB+" and sticks to it")
+	line := waitImportLine(t, log1, enrollTokenPrefix, 20*time.Second)
+	if tok, err := parseEnrollToken(strings.Fields(line)[3]); err != nil || tok.Port != pB {
+		t.Fatalf("the enrollment line must name the relay that took the session: %+v %v", tok, err)
+	}
+	var rj relayJSON
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "relay.json")), &rj)
+	if cfgOf().RelayURL != urlB || rj.Next != 0 {
+		t.Fatalf("sticky relay %q (want %s), next %d (want 0, past B)", cfgOf().RelayURL, urlB, rj.Next)
+	}
+	stop(d1)
+
+	stop(relayB)
+	relayA = startRelay(dirA, hpA)
+	d2, log2 := spawn(srvDir, "daemon", "run")
+	waitLog(log2, "relay "+hpB+": ")
+	time.Sleep(500 * time.Millisecond)
+	if l := string(mustReadFile(t, log2)); strings.Contains(l, "registered") || strings.Contains(l, hpA) {
+		t.Fatalf("a sticky session must not move to another relay on its own:\n%s", l)
+	}
+	if out, err := run(srvDir, "relay", "move", urlA); err == nil || !strings.Contains(out, "daemon is running") {
+		t.Fatalf("relay move needs the daemon stopped: %v\n%s", err, out)
+	}
+	stop(d2)
+	if out, err := run(srvDir, "relay", "move", "https://127.0.0.1:1/"); err == nil || !strings.Contains(out, "not joined") {
+		t.Fatalf("relay move to a relay that is not joined: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "relay", "move", urlA); err != nil || !strings.Contains(out, "moved to "+urlA) {
+		t.Fatalf("relay move: %v\n%s", err, out)
+	}
+	if c := cfgOf(); c.RelayURL != urlA || c.RelaySession != sid {
+		t.Fatalf("relay move keeps the session when the certificates cover the relay: %+v", c)
+	}
+	_, log3 := spawn(srvDir, "daemon", "run")
+	waitLog(log3, "relay "+hpA+": session "+sid+" registered")
+	if out, err := run(srvDir, "relay", "ls"); err != nil || !strings.Contains(out, "session "+sid+" sticks here") {
+		t.Fatalf("relay ls shows the sticky relay: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "status"); err != nil || !strings.Contains(out, "relay:    session "+sid+" on "+urlA+" (sticky; relays enabled, 2 joined)") {
+		t.Fatalf("status shows the sticky relay: %v\n%s", err, out)
+	}
+}
+
 // TestRelayCLI: why — the user-facing flow through the built binary: a relay
-// service, `mtls -relay` (relay-only SAN, stored session, http off, no host
-// client.json), a daemon that opens no TCP port and prints the relay token
-// import line, the refusals (establish while running, relay and daemon in one state
-// dir, unreachable relay), enrollment and calls from a third state dir, the same
-// session after a daemon restart, and a new one from the next `mtls -relay`.
+// service, `relay join` (checked before relay.json is written) and `mtls`
+// (relay-only SAN, stored session, http off, no host client.json), a daemon
+// that opens no TCP port and prints the relay token import line, the refusals
+// (relay and daemon in one state dir, unreachable relay), enrollment (which
+// writes the client's relay.json) and calls from a third state dir, the same
+// session after a daemon restart, a new one from the next `mtls`, and `relay
+// leave` returning mtls to direct mode.
 func TestRelayCLI(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
@@ -8152,33 +8379,37 @@ func TestRelayCLI(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if out, err := run(relayDir, "daemon", "run"); err == nil || !strings.Contains(out, "cannot share one state dir") {
-		t.Fatalf("a daemon must refuse a state dir with a running relay: %v\n%s", err, out)
-	}
 	fresh := shortStateDir(t)
-	if out, err := run(fresh, "relay", "establish", fmt.Sprintf("https://127.0.0.1:%d/", freePort(t))); err == nil || !strings.Contains(out, "not usable") || fileExists(filepath.Join(fresh, "ca.crt")) {
-		t.Fatalf("establish must check the relay before issuing certificates: %v\n%s", err, out)
+	if out, err := run(fresh, "relay", "join", fmt.Sprintf("https://127.0.0.1:%d/", freePort(t))); err == nil || !strings.Contains(out, "not usable") || fileExists(filepath.Join(fresh, "relay.json")) {
+		t.Fatalf("relay join must check the relay before writing relay.json: %v\n%s", err, out)
 	}
 
-	if err := os.WriteFile(filepath.Join(srvDir, "config.json"), []byte(`{"message_board": false}`), 0600); err != nil {
-		t.Fatal(err)
+	if out, err := run(srvDir, "relay", "join", relayURL, "-token", "tk"); err != nil || !strings.Contains(out, "reachable") {
+		t.Fatalf("relay join: %v\n%s", err, out)
 	}
-	if out, err := run(srvDir, "mtls", "-relay", relayURL, "-token", "tk", "-expire", "1h"); err != nil || !strings.Contains(out, "message board is on") {
-		t.Fatalf("mtls -relay: %v\n%s", err, out)
+	var rj relayJSON
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "relay.json")), &rj); err != nil || len(rj.Relays) != 1 || rj.Relays[0].URL != relayURL || rj.Relays[0].Token != "tk" || !rj.Enabled {
+		t.Fatalf("relay.json: %+v %v", rj, err)
+	}
+	if fi, err := os.Stat(filepath.Join(srvDir, "relay.json")); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("relay.json holds the relay token and must be 0600: %v", err)
+	}
+	if out, err := run(srvDir, "mtls", "-expire", "1h"); err != nil {
+		t.Fatalf("mtls with relay.json: %v\n%s", err, out)
 	}
 	var cfg config
 	if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.MessageBoard == nil || !*cfg.MessageBoard {
-		t.Fatalf("relay setup must turn the message board on (plans/relay-message-board-default-plan.md): %+v", cfg.MessageBoard)
+		t.Fatalf("the message board defaults on: %+v", cfg.MessageBoard)
 	}
-	if cfg.RelayURL != relayURL || !isRelaySessionID(cfg.RelaySession) || cfg.RelayToken != "tk" || cfg.Http || cfg.HTTPAddr != "" || !cfg.Mtls {
-		t.Fatalf("mtls -relay config: %+v", cfg)
+	if !isRelaySessionID(cfg.RelaySession) || cfg.RelayToken != "" || cfg.Http || cfg.HTTPAddr != "" || !cfg.Mtls {
+		t.Fatalf("relay-mode mtls config: %+v", cfg)
 	}
 	sid := cfg.RelaySession
 	if fi, err := os.Stat(filepath.Join(srvDir, relaySessionKeyFile)); err != nil || fi.Mode().Perm() != 0600 {
-		t.Fatalf("mtls -relay must write %s with mode 0600: %v", relaySessionKeyFile, err)
+		t.Fatalf("relay-mode mtls must write %s with mode 0600: %v", relaySessionKeyFile, err)
 	}
 	if _, err := loadRelayAuth(srvDir, filepath.Join(srvDir, "ca.crt"), sid); err != nil {
 		t.Fatalf("the session ID must derive from the session key and the CA expiry: %v", err)
@@ -8214,20 +8445,30 @@ func TestRelayCLI(t *testing.T) {
 	if strings.Contains(logText, "https://*") || !strings.Contains(logText, "relay "+relayURL) {
 		t.Fatalf("relay-mode daemon must not open a TCP port by default:\n%s", logText)
 	}
-	if out, err := run(srvDir, "relay", "establish", relayURL); err == nil || !strings.Contains(out, "the daemon must not be running to establish a relay connection") {
-		t.Fatalf("establish must refuse while the daemon runs: %v\n%s", err, out)
+	hp2 := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	relay2, relay2Log := spawn(srvDir, "relay2.log", "relay", "run", "-bind", hp2)
+	for deadline := time.Now().Add(15 * time.Second); !relayHealthy(hp2); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("a relay must run beside a daemon in one state dir:\n%s", mustReadFile(t, relay2Log))
+		}
 	}
-	if out, err := run(srvDir, "relay", "run", "-bind", "127.0.0.1:0"); err == nil || !strings.Contains(out, "cannot share one state dir") {
-		t.Fatalf("a relay must refuse a state dir with a running daemon: %v\n%s", err, out)
-	}
+	stop(relay2)
 	if out, err := run(srvDir, "status"); err != nil || !strings.Contains(out, "socket "+filepath.Join(srvDir, "daemon.sock")) ||
-		!strings.Contains(out, "relay:    "+relayURL+" session "+sid) || !strings.Contains(out, "unix socket only") {
+		!strings.Contains(out, "relay:    session "+sid+" on "+relayURL+" (sticky") || !strings.Contains(out, "unix socket only") {
 		t.Fatalf("the daemon host's CLI must use the unix socket: %v\n%s", err, out)
 	}
 
 	f := strings.Fields(line)
 	if out, err := run(cliDir, f[1:]...); err != nil || !strings.Contains(out, "enrolled") {
 		t.Fatalf("client import through the relay: %v\n%s", err, out)
+	}
+	var crj relayJSON
+	var ccj clientConfig
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(cliDir, "relay.json")), &crj); err != nil || !crj.Enabled || len(crj.Relays) != 0 {
+		t.Fatalf("a relay token import must enable relays in the client's relay.json and join none: %+v %v", crj, err)
+	}
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(cliDir, "client.json")), &ccj); err != nil || ccj.Host != "" || ccj.Port != 0 || ccj.Session != sid || ccj.Relay != relayURL {
+		t.Fatalf("a relay client.json keeps the session and the relay the token named: %+v %v", ccj, err)
 	}
 	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "reachable at https://"+hp+" (relay session "+sid+")") {
 		t.Fatalf("enrolled client must reach the daemon via the relay: %v\n%s", err, out)
@@ -8245,21 +8486,26 @@ func TestRelayCLI(t *testing.T) {
 	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "reachable at https://"+hp) {
 		t.Fatalf("an enrolled client must keep working after a daemon restart: %v\n%s", err, out)
 	}
+	if out, err := run(cliDir, "relay", "disable"); err != nil || !strings.Contains(out, "disabled") {
+		t.Fatalf("relay disable: %v\n%s", err, out)
+	}
+	if out, _ := run(cliDir, "tools"); !strings.Contains(out, "relay enable") {
+		t.Fatalf("a client of a disabled relay must refuse and name 'kbtool relay enable':\n%s", out)
+	}
+	if out, err := run(cliDir, "relay", "enable"); err != nil {
+		t.Fatalf("relay enable: %v\n%s", err, out)
+	}
+	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "reachable at https://"+hp) {
+		t.Fatalf("re-enabling the relay must reconnect the client: %v\n%s", err, out)
+	}
 	stop(relay)
-	if out, err := run(srvDir, "mtls", "-relay", relayURL); err != nil {
-		t.Fatalf("mtls -relay again: %v\n%s", err, out)
+	if out, err := run(srvDir, "mtls"); err != nil {
+		t.Fatalf("mtls again: %v\n%s", err, out)
 	}
 	var cfg2 config
 	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg2)
-	if !isRelaySessionID(cfg2.RelaySession) || cfg2.RelaySession == sid || cfg2.RelayToken != "" {
-		t.Fatalf("a new mtls -relay must issue a new session (and drop the old token): %+v", cfg2)
-	}
-	if out, err := run(srvDir, "mtls", "-relay", relayURL, "-relay-ca", "system"); err != nil {
-		t.Fatalf("mtls -relay -relay-ca system: %v\n%s", err, out)
-	}
-	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg2)
-	if cfg2.RelayCA != "system" {
-		t.Fatalf("mtls -relay-ca must record relay_ca: %+v", cfg2)
+	if !isRelaySessionID(cfg2.RelaySession) || cfg2.RelaySession == sid {
+		t.Fatalf("a new mtls must issue a new relay session: %+v", cfg2)
 	}
 	if err := os.Remove(filepath.Join(srvDir, relaySessionKeyFile)); err != nil {
 		t.Fatal(err)
@@ -8267,21 +8513,45 @@ func TestRelayCLI(t *testing.T) {
 	if out, err := run(srvDir, "daemon", "run"); err == nil || !strings.Contains(out, "relay session key") {
 		t.Fatalf("a relay session without its key (pre-key config) must be refused at daemon start: %v\n%s", err, out)
 	}
+	if out, err := run(srvDir, "relay", "disable"); err != nil {
+		t.Fatalf("relay disable: %v\n%s", err, out)
+	}
+	if b := mustReadFile(t, filepath.Join(srvDir, "relay.json")); !strings.Contains(string(b), `"enabled": false`) || !strings.Contains(string(b), relayURL) {
+		t.Fatalf("relay disable must keep relay.json and set enabled false:\n%s", b)
+	}
+	localDaemon, localLog := spawn(srvDir, "daemon3.log", "daemon", "run")
+	waitLog(localLog, "relays are disabled (or none is joined); serving locally only")
+	if out, err := run(srvDir, "status"); err != nil || !strings.Contains(out, "relays disabled, 1 joined") {
+		t.Fatalf("status must show the disabled relay: %v\n%s", err, out)
+	}
+	stop(localDaemon)
+	if l := string(mustReadFile(t, localLog)); strings.Contains(l, enrollTokenPrefix) {
+		t.Fatalf("a daemon with a disabled relay must print no enrollment line:\n%s", l)
+	}
+	if out, err := run(srvDir, "relay", "enable"); err != nil {
+		t.Fatalf("relay enable: %v\n%s", err, out)
+	}
 	off := false
 	cfg2.MessageBoard = &off
 	if b, err := json.Marshal(cfg2); err != nil || os.WriteFile(filepath.Join(srvDir, "config.json"), b, 0600) != nil {
 		t.Fatal(err)
+	}
+	if out, err := run(srvDir, "relay", "leave"); err == nil || !strings.Contains(out, "-all") {
+		t.Fatalf("relay leave needs a URL or -all: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "relay", "leave", "-all"); err != nil || fileExists(filepath.Join(srvDir, "relay.json")) {
+		t.Fatalf("relay leave must remove relay.json: %v\n%s", err, out)
 	}
 	if out, err := run(srvDir, "mtls", "-ip", "127.0.0.1"); err != nil {
 		t.Fatalf("mtls (leaving relay mode): %v\n%s", err, out)
 	}
 	var cfg3 config
 	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg3)
-	if cfg3.RelayURL != "" || cfg3.MessageBoard == nil || *cfg3.MessageBoard {
-		t.Fatalf("plain mtls must leave relay mode and keep the user's message_board=false: %+v", cfg3)
+	if cfg3.RelaySession != "" || cfg3.MessageBoard == nil || *cfg3.MessageBoard {
+		t.Fatalf("mtls without relay.json must leave relay mode and keep the user's message_board=false: %+v", cfg3)
 	}
-	if cfg3.RelayCA != "" || fileExists(filepath.Join(srvDir, relaySessionKeyFile)) {
-		t.Fatalf("plain mtls must drop relay_ca and the session key: %+v", cfg3)
+	if fileExists(filepath.Join(srvDir, relaySessionKeyFile)) {
+		t.Fatal("mtls without relay.json must drop the relay session key")
 	}
 }
 
@@ -8523,11 +8793,11 @@ func TestBundleIDFromKey(t *testing.T) {
 	}
 }
 
-// ---------- 37. relay mode turns the message board on (plans/relay-message-board-default-plan.md) ----------
+// ---------- 37. the message board defaults on, with or without a relay ----------
 
-// TestBoardEnabledRule: why — an explicit message_board value always wins; only
-// a missing value follows the mode (on with a relay, off without), so turning
-// the board off in relay mode is possible and sticks.
+// TestBoardEnabledRule: why — an explicit message_board value always wins; a
+// missing value means on in every mode, so a local session has its board (the
+// agent's session memory) without a relay, and turning it off sticks.
 func TestBoardEnabledRule(t *testing.T) {
 	on, off := true, false
 	for _, tc := range []struct {
@@ -8535,11 +8805,11 @@ func TestBoardEnabledRule(t *testing.T) {
 		relay string
 		want  bool
 	}{
-		{nil, "", false}, {nil, "https://relay.example.net:9876/", true},
-		{&on, "", true}, {&on, "https://relay.example.net:9876/", true},
-		{&off, "", false}, {&off, "https://relay.example.net:9876/", false},
+		{nil, "", true}, {nil, "0123456789abcdef0123456789abcdef", true},
+		{&on, "", true}, {&on, "0123456789abcdef0123456789abcdef", true},
+		{&off, "", false}, {&off, "0123456789abcdef0123456789abcdef", false},
 	} {
-		c := &config{MessageBoard: tc.board, RelayURL: tc.relay}
+		c := &config{MessageBoard: tc.board, RelaySession: tc.relay}
 		if got := boardEnabled(c); got != tc.want {
 			t.Errorf("boardEnabled(board=%v relay=%q) = %v, want %v", tc.board, tc.relay, got, tc.want)
 		}
@@ -8548,24 +8818,24 @@ func TestBoardEnabledRule(t *testing.T) {
 			t.Errorf("board_post disabled=%v for board=%v relay=%q", disabled, tc.board, tc.relay)
 		}
 	}
-	if boardEnabled(nil) {
-		t.Fatal("no config must keep the board off")
+	if !boardEnabled(nil) || effectiveDisabledSet(nil)["board_post"] {
+		t.Fatal("no config must leave the board on")
 	}
 }
 
 // TestEnsureToolOptionsRelaySeed: why — config writes seed the board option so
-// the file documents it; in relay mode the seed must be true, and a present
-// value is never re-stamped either way.
+// the file documents it; the seed is true in every mode, and a present value
+// is never re-stamped either way.
 func TestEnsureToolOptionsRelaySeed(t *testing.T) {
-	relay := &config{RelayURL: "https://relay.example.net:9876/"}
+	relay := &config{RelaySession: "0123456789abcdef0123456789abcdef"}
 	ensureToolOptions(relay)
 	plain := &config{}
 	ensureToolOptions(plain)
-	if relay.MessageBoard == nil || !*relay.MessageBoard || plain.MessageBoard == nil || *plain.MessageBoard {
-		t.Fatalf("seed: relay=%v plain=%v, want true and false", relay.MessageBoard, plain.MessageBoard)
+	if relay.MessageBoard == nil || !*relay.MessageBoard || plain.MessageBoard == nil || !*plain.MessageBoard {
+		t.Fatalf("seed: relay=%v plain=%v, want true for both", relay.MessageBoard, plain.MessageBoard)
 	}
 	off := false
-	kept := &config{RelayURL: "https://relay.example.net:9876/", MessageBoard: &off}
+	kept := &config{RelaySession: "0123456789abcdef0123456789abcdef", MessageBoard: &off}
 	ensureToolOptions(kept)
 	if *kept.MessageBoard {
 		t.Fatal("an explicit false must not be re-stamped in relay mode")
@@ -8578,7 +8848,7 @@ func TestEnsureToolOptionsRelaySeed(t *testing.T) {
 func TestRelayBoardFalseSurvivesDaemonArgs(t *testing.T) {
 	t.Setenv("KBTOOL_DIR", t.TempDir())
 	off := false
-	if err := saveConfig(&config{RelayURL: "https://relay.example.net:9876/", MessageBoard: &off}); err != nil {
+	if err := saveConfig(&config{RelaySession: "0123456789abcdef0123456789abcdef", MessageBoard: &off}); err != nil {
 		t.Fatal(err)
 	}
 	if !persistDaemonArgs([]string{"-board-max-memory", "512MiB"}) {
@@ -8877,8 +9147,8 @@ func TestIndexMethodsSocketOnly(t *testing.T) {
 }
 
 // TestHostSocketCLI: why — the user-facing flow through the built binary: the
-// host's CLI ignores a leftover client.json (local fallback while the daemon is
-// down, removed at daemon start), `build` swaps into the running daemon with no
+// host's CLI ignores a leftover client.json (with the daemon down it reports
+// that no daemon runs; the file is removed at daemon start), `build` swaps into the running daemon with no
 // restart, at-rest encryption can't be changed under it, another -db is just
 // written; a remote client refuses every daemon-side command and a host dir
 // refuses `client -import`.
@@ -8895,7 +9165,7 @@ func TestHostSocketCLI(t *testing.T) {
 	host, remote := shortStateDir(t), shortStateDir(t)
 	run := func(dir string, args ...string) (string, error) {
 		c := exec.Command(bin, args...)
-		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_DBKEY=", "KB_EMBED_URL=")
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_SECRET=", "KB_EMBED_URL=")
 		out, err := c.CombinedOutput()
 		return string(out), err
 	}
@@ -8916,8 +9186,8 @@ func TestHostSocketCLI(t *testing.T) {
 	if err := saveClientConfig(mtlsHostConfig(freePort(t))); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := run(host, "query", "alphaOne"); err != nil || !strings.Contains(out, "alphaOne.go") {
-		t.Fatalf("a host with its daemon down queries locally, ignoring client.json: %v\n%s", err, out)
+	if out, err := run(host, "query", "alphaOne"); err == nil || !strings.Contains(out, "no kbtool daemon is running") {
+		t.Fatalf("a host with its daemon down must say so, ignoring client.json: %v\n%s", err, out)
 	}
 	if out, err := run(host, "status"); err != nil || !strings.Contains(out, "ignoring leftover") || !strings.Contains(out, "unix socket only") {
 		t.Fatalf("host status: %v\n%s", err, out)
@@ -8929,7 +9199,7 @@ func TestHostSocketCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	daemon := exec.Command(bin, "daemon", "run")
-	daemon.Env = append(os.Environ(), "KBTOOL_DIR="+host, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_DBKEY=", "KB_EMBED_URL=")
+	daemon.Env = append(os.Environ(), "KBTOOL_DIR="+host, "KBTOOL_SOCKET=", "KBTOOL_DB=", "KBTOOL_BOARD=", "KBTOOL_SECRET=", "KB_EMBED_URL=")
 	daemon.Stdout, daemon.Stderr = lf, lf
 	if err := daemon.Start(); err != nil {
 		t.Fatal(err)
@@ -9013,35 +9283,80 @@ func chainsTo(leaf *x509.Certificate, caPEM []byte) bool {
 	return err == nil
 }
 
-// TestRelayPKIInMemory: why — the relay's CA is generated per start, never
-// written, valid for the configured lifetime, and its leaf chains to it; two
-// generations never share a CA.
+// TestRelayPKIInMemory: why — the relay's CA is generated per generation,
+// never written, and its leaf chains to it; two generations never share a CA.
 func TestRelayPKIInMemory(t *testing.T) {
-	before := time.Now()
-	p1 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, []string{"relay.test"}, 3*time.Hour)
-	p2 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, 3*time.Hour)
+	p1 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, []string{"relay.test"})
+	p2 := newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil)
 	if p1.FP == p2.FP || bytes.Equal(p1.CAPEM, p2.CAPEM) {
 		t.Fatal("two generations must have different CAs")
 	}
 	if !chainsTo(p1.Leaf.Leaf, p1.CAPEM) || chainsTo(p1.Leaf.Leaf, p2.CAPEM) {
 		t.Fatal("the leaf must chain to its own CA only")
 	}
-	for _, na := range []time.Time{p1.Expires, p1.Leaf.Leaf.NotAfter} {
-		if d := na.Sub(before); d < 3*time.Hour-time.Minute || d > 3*time.Hour+time.Minute {
-			t.Fatalf("validity %s, want about 3h", d)
-		}
-	}
 	if !containsString(p1.Leaf.Leaf.DNSNames, "relay.test") {
 		t.Fatalf("extra DNS SAN missing: %v", p1.Leaf.Leaf.DNSNames)
 	}
+	if !p1.Expires.IsZero() || strings.Contains(relayStatusText(":1", p1), "valid until") {
+		t.Fatal("an in-memory CA must not report its (disguised) expiry")
+	}
 }
 
-// TestRelayRotationServesNewCA: why — after a rotation /ca.crt and the leaf
-// presented to new handshakes change together, so a daemon that fetches the
-// CA can always verify the relay.
+// TestRelayCertDisguise: why — anyone can open a TLS connection to the relay,
+// so its certificate must look like a sysadmin's long-lived self-made one:
+// nothing names kbtool, the validity is years long and the same across
+// rotations (a 12h window would give the relay away), the chain carries the
+// CA, and no interface address or container name leaks into the SANs.
+func TestRelayCertDisguise(t *testing.T) {
+	ips, names := relaySANs([]string{"203.0.113.7"}, []string{"relay.example.org"})
+	p1 := newRelayPKI(ips, names)
+	p2 := newRelayPKI(ips, names)
+	ca, err := x509.ParseCertificate(p1.Leaf.Certificate[len(p1.Leaf.Certificate)-1])
+	if err != nil || len(p1.Leaf.Certificate) != 2 || !ca.IsCA || caFingerprint(ca.Raw) != p1.FP {
+		t.Fatalf("chain must be [leaf, CA] with FP the CA's: %d certs, %v", len(p1.Leaf.Certificate), err)
+	}
+	leaf := p1.Leaf.Leaf
+	if ca.Subject.String() != "CN="+relayCAName || len(leaf.Subject.Organization) != 0 {
+		t.Fatalf("subjects: CA %q, leaf %q", ca.Subject, leaf.Subject)
+	}
+	host, _ := os.Hostname()
+	if dnsNameOK(host) && leaf.Subject.CommonName != host {
+		t.Fatalf("leaf CN %q, want the host name %q", leaf.Subject.CommonName, host)
+	}
+	for _, der := range p1.Leaf.Certificate {
+		if bytes.Contains(bytes.ToLower(der), []byte("kbtool")) {
+			t.Fatal("no certificate may contain \"kbtool\"")
+		}
+	}
+	if len(leaf.ExtKeyUsage) != 1 || leaf.ExtKeyUsage[0] != x509.ExtKeyUsageServerAuth {
+		t.Fatalf("leaf EKU %v, want serverAuth only", leaf.ExtKeyUsage)
+	}
+	if len(leaf.IPAddresses) != 1 || !leaf.IPAddresses[0].Equal(net.ParseIP("203.0.113.7")) {
+		t.Fatalf("IP SANs %v, want only the -ip one", leaf.IPAddresses)
+	}
+	for _, n := range leaf.DNSNames {
+		if n != host && n != "relay.example.org" {
+			t.Fatalf("unexpected DNS SAN %q in %v", n, leaf.DNSNames)
+		}
+	}
+	age := time.Since(leaf.NotBefore)
+	if age < 30*24*time.Hour-time.Minute || age > 365*24*time.Hour+time.Minute ||
+		!leaf.NotAfter.Equal(leaf.NotBefore.AddDate(10, 0, 0)) {
+		t.Fatalf("validity %s – %s, want issued 30–365 days ago for ten years", leaf.NotBefore, leaf.NotAfter)
+	}
+	if !ca.NotBefore.Equal(leaf.NotBefore) || !p2.Leaf.Leaf.NotBefore.Equal(leaf.NotBefore) || !p2.Leaf.Leaf.NotAfter.Equal(leaf.NotAfter) {
+		t.Fatal("every generation of one relay process must carry the same validity")
+	}
+	if p1.FP == p2.FP {
+		t.Fatal("rotation must still change the keys")
+	}
+}
+
+// TestRelayRotationServesNewCA: why — after a rotation new handshakes present
+// the new chain, whose CA fingerprint the daemon reports.
 func TestRelayRotationServesNewCA(t *testing.T) {
 	rs, hp := startTestRelay(t, "", nil)
-	_, fp1, err := relayFetchCA(hp)
+	fp1, err := relayFingerprint(hp)
 	if err != nil || fp1 != rs.currentPKI().FP {
 		t.Fatalf("first CA: %q %v", fp1, err)
 	}
@@ -9049,10 +9364,10 @@ func TestRelayRotationServesNewCA(t *testing.T) {
 	if !chainsTo(relayLeafVia(t, hp), old) {
 		t.Fatal("the presented leaf must chain to the served CA")
 	}
-	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour))
-	_, fp2, err := relayFetchCA(hp)
+	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil))
+	fp2, err := relayFingerprint(hp)
 	if err != nil || fp2 == fp1 || fp2 != rs.currentPKI().FP {
-		t.Fatalf("after rotation /ca.crt must serve the new CA: %q (old %q) %v", fp2, fp1, err)
+		t.Fatalf("after rotation the handshake must present the new CA: %q (old %q) %v", fp2, fp1, err)
 	}
 	leaf := relayLeafVia(t, hp)
 	if !chainsTo(leaf, rs.currentPKI().CAPEM) || chainsTo(leaf, old) {
@@ -9089,7 +9404,7 @@ func TestRelayRotationGraceful(t *testing.T) {
 	ctrl := rs.sessions[team.sid].ctrl
 	rs.mu.Unlock()
 
-	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour))
+	rs.setPKI(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil))
 
 	_ = est.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.WriteString(est, "GET /healthz HTTP/1.1\r\nHost: kb\r\n\r\n"); err != nil {
@@ -9123,39 +9438,38 @@ func TestRelayEnvOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	o, err := parseRelayOptsErr(nil)
-	if err != nil || o.bind != "127.0.0.1:7000" || o.token != "cfg" || o.rotate != relayDefaultRotate || o.caTTL != relayDefaultCATTL {
+	if err != nil || o.bind != "127.0.0.1:7000" || o.token != "cfg" || o.rotate != relayDefaultRotate {
 		t.Fatalf("config and defaults: %+v %v", o, err)
 	}
 	t.Setenv("KBTOOL_RELAY_PORT", "7100")
 	t.Setenv("KBTOOL_RELAY_TOKEN", "env")
 	t.Setenv("KBTOOL_RELAY_ROTATE", "1h")
-	t.Setenv("KBTOOL_RELAY_CA_TTL", "3h")
-	if o, err = parseRelayOptsErr(nil); err != nil || o.bind != ":7100" || o.token != "env" || o.rotate != time.Hour || o.caTTL != 3*time.Hour {
+	if o, err = parseRelayOptsErr(nil); err != nil || o.bind != ":7100" || o.token != "env" || o.rotate != time.Hour {
 		t.Fatalf("environment over config: %+v %v", o, err)
 	}
 	t.Setenv("KBTOOL_RELAY_BIND", "127.0.0.1:7200")
 	if o, _ = parseRelayOptsErr(nil); o.bind != "127.0.0.1:7200" {
 		t.Fatalf("KBTOOL_RELAY_BIND wins over KBTOOL_RELAY_PORT: %q", o.bind)
 	}
-	if o, err = parseRelayOptsErr([]string{"-bind", ":7300", "-token", "flag", "-rotate", "2h", "-ca-ttl", "5h"}); err != nil ||
-		o.bind != ":7300" || o.token != "flag" || o.rotate != 2*time.Hour || o.caTTL != 5*time.Hour {
+	if o, err = parseRelayOptsErr([]string{"-bind", ":7300", "-token", "flag", "-rotate", "2h"}); err != nil ||
+		o.bind != ":7300" || o.token != "flag" || o.rotate != 2*time.Hour {
 		t.Fatalf("flags over environment: %+v %v", o, err)
 	}
 	t.Setenv("KBTOOL_RELAY_BIND", "")
-	for env, bad := range map[string]string{"KBTOOL_RELAY_PORT": "http", "KBTOOL_RELAY_ROTATE": "soon", "KBTOOL_RELAY_CA_TTL": "-1h"} {
+	for env, bad := range map[string]string{"KBTOOL_RELAY_PORT": "http", "KBTOOL_RELAY_ROTATE": "soon"} {
 		t.Setenv(env, bad)
 		if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), env) {
 			t.Fatalf("%s=%q must be refused naming the variable: %v", env, bad, err)
 		}
-		t.Setenv(env, map[string]string{"KBTOOL_RELAY_PORT": "7100", "KBTOOL_RELAY_ROTATE": "1h", "KBTOOL_RELAY_CA_TTL": "3h"}[env])
+		t.Setenv(env, map[string]string{"KBTOOL_RELAY_PORT": "7100", "KBTOOL_RELAY_ROTATE": "1h"}[env])
 	}
 	t.Setenv("KBTOOL_RELAY_BIND", "no-port")
 	if _, err := parseRelayOptsErr(nil); err == nil || !strings.Contains(err.Error(), "KBTOOL_RELAY_BIND") {
 		t.Fatalf("a bad KBTOOL_RELAY_BIND must be refused: %v", err)
 	}
 	t.Setenv("KBTOOL_RELAY_BIND", "")
-	if _, err := parseRelayOptsErr([]string{"-rotate", "3h"}); err == nil || !strings.Contains(err.Error(), "longer than the rotation") {
-		t.Fatalf("a CA lifetime not longer than the rotation must be refused: %v", err)
+	if o, err := parseRelayOptsErr([]string{"-rotate", "72h"}); err != nil || o.rotate != 72*time.Hour {
+		t.Fatalf("any positive rotation interval is accepted: %+v %v", o, err)
 	}
 }
 
@@ -9303,7 +9617,7 @@ func TestRelayServiceCLI(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); _ = lf.Close() })
 		ready := next("READY=1")
-		_, fp, err := relayFetchCA(hp)
+		fp, err := relayFingerprint(hp)
 		if err != nil || !strings.Contains(ready, fp) {
 			t.Fatalf("READY status must name the served CA %q: %q %v", fp, ready, err)
 		}
@@ -9319,7 +9633,7 @@ func TestRelayServiceCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	rotated := next("STATUS=")
-	_, fp2, err := relayFetchCA(hp)
+	fp2, err := relayFingerprint(hp)
 	if err != nil || fp2 == fp1 || !strings.Contains(rotated, fp2) {
 		t.Fatalf("SIGHUP must rotate the served CA: %q -> %q (%q) %v", fp1, fp2, rotated, err)
 	}
@@ -9476,11 +9790,7 @@ func TestRelaySessionKeyDerivation(t *testing.T) {
 // relay TLS connection and returns the status code (101 on success).
 func registerSigned(t *testing.T, hp, sid string, sign func(tls.ConnectionState) (map[string]string, error)) (int, net.Conn) {
 	t.Helper()
-	pool, _, err := relayFetchCA(hp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := relayUpgrade(hp, relayTLSClientConfig(pool), "/v1/register", map[string]string{"X-Kbtool-Session": sid}, sign)
+	c, err := relayUpgrade(hp, relayTrust{}.tlsConfig(), "/v1/register", map[string]string{"X-Kbtool-Session": sid}, sign)
 	var he *relayHTTPError
 	switch {
 	case err == nil:
@@ -9576,7 +9886,7 @@ func TestRelaySessionExpiresWithCA(t *testing.T) {
 // so registrations cannot exhaust the relay; at the cap it answers 503 and a
 // freed slot is usable again.
 func TestRelaySessionCap(t *testing.T) {
-	if newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil, time.Hour), "").MaxSessions != 5000 {
+	if newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil), "").MaxSessions != 5000 {
 		t.Fatal("the default session cap must be 5000")
 	}
 	rs, hp := startTestRelay(t, "", func(rs *relayServer) { rs.MaxSessions = 2 })
@@ -9703,8 +10013,8 @@ func writeOperatorCert(t *testing.T, dir string) string {
 }
 
 // TestRelayOperatorCertPinned: why — a relay on the internet can present an
-// operator certificate, and a daemon with relay_ca pinned verifies it (host
-// name included) without trusting plain-HTTP /ca.crt at all.
+// operator certificate, and a daemon with the relay CA pinned verifies it (host
+// name included) instead of trusting whatever certificate it is shown.
 func TestRelayOperatorCertPinned(t *testing.T) {
 	dir := t.TempDir()
 	caFile := writeOperatorCert(t, dir)
@@ -9714,17 +10024,9 @@ func TestRelayOperatorCertPinned(t *testing.T) {
 	}
 	caPEM := mustReadFile(t, caFile)
 	if !bytes.Equal(pki.CAPEM, caPEM) {
-		t.Fatal("/ca.crt must serve the last certificate of the operator chain")
+		t.Fatal("the operator chain's last certificate is its CA")
 	}
-	var fetches atomic.Int32
 	rs := newRelayServer(pki, "")
-	inner := rs.plainSrv.Handler
-	rs.plainSrv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/ca.crt" {
-			fetches.Add(1)
-		}
-		inner.ServeHTTP(w, r)
-	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -9749,11 +10051,8 @@ func TestRelayOperatorCertPinned(t *testing.T) {
 	if err := pingRelayed(enrollViaRelay(t, hp, team)); err != nil {
 		t.Fatalf("mTLS through an operator-certificate relay: %v", err)
 	}
-	if n := fetches.Load(); n != 0 {
-		t.Fatalf("a pinned-CA daemon must not fetch /ca.crt (%d fetches)", n)
-	}
 	if fp, err := relayCheck(hp, relayTrust{}); err != nil || fp != caFingerprint(pki.Leaf.Certificate[1]) {
-		t.Fatalf("fetch-mode daemons must keep working with an operator certificate: %q %v", fp, err)
+		t.Fatalf("default-trust daemons must keep working with an operator certificate: %q %v", fp, err)
 	}
 }
 
@@ -9816,8 +10115,8 @@ func TestRelayHardeningOptions(t *testing.T) {
 }
 
 // TestRelayOperatorCLI: why — through the built binary: a relay with an
-// operator certificate from the environment, a daemon set up with `mtls -relay
-// -relay-ca FILE` registering through it, and SIGHUP reloading a replaced
+// operator certificate from the environment, a daemon set up with `relay join
+// -relay-ca FILE` and `mtls` registering through it, and SIGHUP reloading a replaced
 // certificate from disk without dropping the daemon's session.
 func TestRelayOperatorCLI(t *testing.T) {
 	goBin, err := exec.LookPath("go")
@@ -9862,20 +10161,27 @@ func TestRelayOperatorCLI(t *testing.T) {
 	relay, relayLog := spawn(append(base, "KBTOOL_DIR="+relayDir, "KBTOOL_RELAY_CERT="+filepath.Join(certDir, "relay.crt"),
 		"KBTOOL_RELAY_KEY="+filepath.Join(certDir, "relay.key")), "relay.log", "relay", "run", "-bind", hp)
 	waitLog(relayLog, "operator certificate")
-	_, fp1, err := relayFetchCA(hp)
+	fp1, err := relayFingerprint(hp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mt := exec.Command(bin, "mtls", "-relay", "https://"+hp+"/", "-relay-ca", caFile, "-expire", "1h")
+	join := exec.Command(bin, "relay", "join", "https://"+hp+"/", "-relay-ca", caFile)
+	join.Env = append(base, "KBTOOL_DIR="+srvDir)
+	if out, err := join.CombinedOutput(); err != nil {
+		t.Fatalf("relay join -relay-ca: %v\n%s", err, out)
+	}
+	var rj relayJSON
+	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "relay.json")), &rj)
+	if len(rj.Relays) != 1 || rj.Relays[0].CA != caFile {
+		t.Fatalf("relay.json must record the pinned CA: %+v", rj)
+	}
+	mt := exec.Command(bin, "mtls", "-expire", "1h")
 	mt.Env = append(base, "KBTOOL_DIR="+srvDir)
 	if out, err := mt.CombinedOutput(); err != nil {
-		t.Fatalf("mtls -relay -relay-ca: %v\n%s", err, out)
+		t.Fatalf("mtls: %v\n%s", err, out)
 	}
 	var cfg config
 	_ = json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &cfg)
-	if cfg.RelayCA != caFile {
-		t.Fatalf("relay_ca must record the pinned CA: %+v", cfg)
-	}
 	_, daemonLog := spawn(append(base, "KBTOOL_DIR="+srvDir), "daemon.log", "daemon", "run")
 	waitLog(daemonLog, "session "+cfg.RelaySession+" registered")
 	writeOperatorCert(t, certDir)
@@ -9883,7 +10189,7 @@ func TestRelayOperatorCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitLog(relayLog, "rotated the CA (SIGHUP)")
-	if _, fp2, err := relayFetchCA(hp); err != nil || fp2 == fp1 {
+	if fp2, err := relayFingerprint(hp); err != nil || fp2 == fp1 {
 		t.Fatalf("SIGHUP must reload the operator certificate: %q -> %q %v", fp1, fp2, err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -9911,4 +10217,4242 @@ func FuzzPeekClientHelloSNI(f *testing.F) {
 	f.Fuzz(func(t *testing.T, b []byte) {
 		_, _ = peekClientHelloSNI(bufio.NewReaderSize(bytes.NewReader(b), 5+16384+2048))
 	})
+}
+
+// ---------- 42. system user, read-only system thread, build refresh (plans/system-board-and-build-refresh-plan.md) ----------
+
+// loadTestBoard reads the toolbox's board from its store.
+func loadTestBoard(t *testing.T, tb *Toolbox) *Board {
+	t.Helper()
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestSystemInitOrderAndSignature: why — the system user must be registered
+// when the board is first written, post system#0 BEFORE welcome#0 (so the
+// welcome pointer is valid), sign both verifiably, keep welcome first and
+// system second, and keep its key in board.bin across reloads.
+func TestSystemInitOrderAndSignature(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	dumpSignup(t, tb, "alice")
+	b := loadTestBoard(t, tb)
+	if len(b.Order) < 2 || b.Order[0] != boardWelcome || b.Order[1] != boardSystem {
+		t.Fatalf("thread order = %v, want welcome, system first", b.Order)
+	}
+	sys0, wel0 := b.Threads[boardSystem].Msgs[0], b.Threads[boardWelcome].Msgs[0]
+	if sys0.ID != 1 || wel0.ID != 2 || sys0.Agent != boardSystem || wel0.Agent != boardSystem {
+		t.Fatalf("system#0 must precede welcome#0, both by system: %+v / %+v", sys0, wel0)
+	}
+	for _, m := range []BoardMsg{sys0, wel0} {
+		if st := cryptoVerifyBoardMsg(b, m); st != "verified" {
+			t.Fatalf("%s#%d is %s", m.Thread, m.Seq, st)
+		}
+	}
+	for _, want := range []string{"system-authored", "not an agent", "not interactive", "purely informative", "kbtool board read system#0", "10 words"} {
+		if !strings.Contains(wel0.Text, want) {
+			t.Fatalf("welcome#0 lacks %q: %s", want, wel0.Text)
+		}
+	}
+	for _, want := range []string{"Current search index", "first line of the roster", "latest=system#N",
+		"kbtool board attach", "share files between agents", "8.0 MiB compressed, 1000 files", "topic threads", "Keep `welcome` minimal"} {
+		if !strings.Contains(sys0.Text, want) {
+			t.Fatalf("system#0 lacks %q", want)
+		}
+	}
+	pub := hex.EncodeToString(ed25519.NewKeyFromSeed(b.SystemSeed).Public().(ed25519.PublicKey))
+	if b.Agents[boardSystem].Pub != pub {
+		t.Fatal("stored system seed does not match the registered system key")
+	}
+	dumpSignup(t, tb, "bob") // a later write must not re-register
+	if b2 := loadTestBoard(t, tb); !bytes.Equal(b2.SystemSeed, b.SystemSeed) || len(b2.Threads[boardSystem].Msgs) != 1 {
+		t.Fatal("the system user must be registered once and kept forever")
+	}
+}
+
+// TestSystemReservedNameAndThread: why — nobody may sign up as `system`, and
+// agent posts (plain or with an attachment) to the system thread are refused,
+// so system messages stay trustworthy.
+func TestSystemReservedNameAndThread(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	if out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "system"})); !isErr || !strings.Contains(out, "reserved") {
+		t.Fatalf("signup as system must be refused, got (%q, %v)", out, isErr)
+	}
+	seed := dumpSignup(t, tb, "alice")
+	data, _, err := attachPack([]tarGZMember{{Name: "a.txt", Data: []byte("x")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range []map[string]any{
+		{"thread": "system", "text": "hi", "seed": seed},
+		{"thread": "SYSTEM", "text": "hi", "seed": seed, "attachment": base64.StdEncoding.EncodeToString(data)},
+	} {
+		if out, isErr := tb.Execute("board_post", mustMarshal(args)); !isErr || !strings.Contains(out, "read-only") {
+			t.Fatalf("post to system must be refused, got (%q, %v)", out, isErr)
+		}
+	}
+	if n := len(loadTestBoard(t, tb).Threads[boardSystem].Msgs); n != 1 {
+		t.Fatalf("system thread changed: %d messages", n)
+	}
+}
+
+// TestSystemPostWelcomeNotice: why — every system post must leave the exact
+// welcome notice naming the command that retrieves it.
+func TestSystemPostWelcomeNotice(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	dumpSignup(t, tb, "alice")
+	tb.postSystem(func(*Board, bool) string { return "index rebuilt" })
+	b := loadTestBoard(t, tb)
+	sys := b.Threads[boardSystem].Msgs
+	wel := b.Threads[boardWelcome].Msgs
+	if len(sys) != 2 || sys[1].Text != "index rebuilt" {
+		t.Fatalf("system thread = %+v", sys)
+	}
+	want := "Notice: a `system` thread message was posted.  Retrieve the latest message with `kbtool board read system#1`."
+	if last := wel[len(wel)-1]; last.Text != want || last.Agent != boardSystem || cryptoVerifyBoardMsg(b, last) != "verified" {
+		t.Fatalf("welcome notice = %+v", last)
+	}
+}
+
+// TestWelcomeWordLimit: why — welcome stays minimal: at most N words
+// (default 10, config welcome_max_words), each under 50 characters with
+// punctuation counted, and no attachments; other threads are unaffected.
+func TestWelcomeWordLimit(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	post := func(tb *Toolbox, thread, text string) (string, bool) {
+		return tb.Execute("board_post", mustMarshal(map[string]any{"thread": thread, "text": text, "seed": seed}))
+	}
+	ten := strings.TrimSpace(strings.Repeat("w ", 10))
+	if out, isErr := post(tb, "welcome", ten); isErr {
+		t.Fatalf("10 words must fit: %s", out)
+	}
+	if out, isErr := post(tb, "welcome", ten+" w"); !isErr || !strings.Contains(out, "limited to 10 words") {
+		t.Fatalf("11 words must be refused, got (%q, %v)", out, isErr)
+	}
+	if out, isErr := post(tb, "welcome", strings.Repeat("a", 48)+"!"); isErr {
+		t.Fatalf("a 49-character word must fit: %s", out)
+	}
+	if out, isErr := post(tb, "welcome", strings.Repeat("a", 49)+","); !isErr || !strings.Contains(out, "under 50 characters") {
+		t.Fatalf("50 characters including punctuation must be refused, got (%q, %v)", out, isErr)
+	}
+	data, _, _ := attachPack([]tarGZMember{{Name: "a.txt", Data: []byte("x")}})
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "welcome", "text": "file", "seed": seed,
+		"attachment": base64.StdEncoding.EncodeToString(data)})); !isErr || !strings.Contains(out, "cannot carry attachments") {
+		t.Fatalf("welcome attachment must be refused, got (%q, %v)", out, isErr)
+	}
+	if out, isErr := post(tb, "plans", strings.Repeat("word ", 200)); isErr {
+		t.Fatalf("other threads have no word limit: %s", out)
+	}
+	if err := os.WriteFile(filepath.Join(os.Getenv("KBTOOL_DIR"), "config.json"), []byte(`{"version":1,"welcome_max_words":3}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tb2 := &Toolbox{Store: tb.Store, BoardPath: tb.BoardPath}
+	if out, isErr := post(tb2, "welcome", "one two three four"); !isErr || !strings.Contains(out, "limited to 3 words") {
+		t.Fatalf("welcome_max_words=3 must apply, got (%q, %v)", out, isErr)
+	}
+}
+
+// TestSystemExemptFromMessageLimits: why — per-message limits (text size,
+// welcome words) never apply to the system user, but the board-wide memory
+// limit still does: an oversized system post is skipped, not forced in.
+func TestSystemExemptFromMessageLimits(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	dumpSignup(t, tb, "alice")
+	big := strings.Repeat("long system text ", boardMaxText/16+10)
+	tb.postSystem(func(*Board, bool) string { return big })
+	b := loadTestBoard(t, tb)
+	if got := b.Threads[boardSystem].Msgs; len(got) != 2 || len(got[1].Text) <= boardMaxText {
+		t.Fatal("a system post over the per-message text cap must be accepted")
+	}
+	if n := len(strings.Fields(b.Threads[boardWelcome].Msgs[0].Text)); n <= defWelcomeMaxWords {
+		t.Fatalf("the system welcome intro should exceed the agent word limit (has %d words)", n)
+	}
+	tb2 := &Toolbox{Store: tb.Store, BoardPath: tb.BoardPath, BoardMaxBytes: int64(len(boardMarshal(b))) + 64}
+	tb2.postSystem(func(*Board, bool) string { return big })
+	if n := len(loadTestBoard(t, tb).Threads[boardSystem].Msgs); n != 2 {
+		t.Fatalf("a system post over the board memory limit must be skipped, have %d messages", n)
+	}
+}
+
+// TestBoardSystemTrailer: why — the system seed and state survive a save and
+// load, a board written before the trailer still loads (without a system
+// user), an unknown trailer is corruption, and board.bin is owner-only now
+// that it holds a private key.
+func TestBoardSystemTrailer(t *testing.T) {
+	b := newBoard()
+	legacy := boardMarshal(b)
+	if _, err := ensureSystem(b, boardSysInfo{WelcomeWords: 10}, 1); err != nil {
+		t.Fatal(err)
+	}
+	b.Sys = boardSysState{Settings: map[string]string{"k": "v"}, Running: true}
+	b2, err := readBoard(bytes.NewReader(boardMarshal(b)))
+	if err != nil || !bytes.Equal(b2.SystemSeed, b.SystemSeed) || !reflect.DeepEqual(b2.Sys, b.Sys) {
+		t.Fatalf("system trailer round trip: %v", err)
+	}
+	if old, err := readBoard(bytes.NewReader(legacy)); err != nil || old.SystemSeed != nil {
+		t.Fatalf("legacy board: %v", err)
+	}
+	var bad bytes.Buffer
+	bad.Write(legacy)
+	writeStr(&bad, "NOPE")
+	if _, err := readBoard(&bad); err == nil || !strings.Contains(err.Error(), "unknown trailer") {
+		t.Fatalf("unknown trailer must be corruption, got %v", err)
+	}
+	p := filepath.Join(t.TempDir(), "board.bin")
+	if err := boardSave(p, b); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("board.bin mode = %v (%v), want 0600", fi.Mode().Perm(), err)
+	}
+	b.Agents = map[string]*BoardAgent{boardSystem: {ID: boardSystem}}
+	b.SystemSeed = nil
+	if _, err := ensureSystem(b, boardSysInfo{}, 1); err == nil {
+		t.Fatal("an agent already named system must block registration")
+	}
+}
+
+// TestRosterSystemFirst: why — watching for system updates relies on
+// `system` being the roster's first line with its latest message id, and it
+// must not count as an agent.
+func TestRosterSystemFirst(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	dumpSignup(t, tb, "alice")
+	b := loadTestBoard(t, tb)
+	lines := strings.Split(boardRoster(b, time.Now().Unix()), "\n")
+	if len(lines) < 3 || !strings.Contains(lines[1], "SYSTEM") || !strings.Contains(lines[1], "latest=system#0") ||
+		!strings.Contains(lines[2], "alice") {
+		t.Fatalf("roster:\n%s", strings.Join(lines, "\n"))
+	}
+	if s := tb.boardStats(); !strings.Contains(s, "1 agent(s) (1 active") {
+		t.Fatalf("stats must not count system: %s", s)
+	}
+	empty := newBoard()
+	_, _ = ensureSystem(empty, boardSysInfo{}, time.Now().Unix())
+	if r := boardRoster(empty, time.Now().Unix()); !strings.Contains(r, "none signed up yet") {
+		t.Fatalf("a board with only system has no agents:\n%s", r)
+	}
+}
+
+// TestSearchRanksSystemThreadLast: why — system notices must never crowd out
+// real results: system-thread chunks rank below every other hit, even when
+// they match better.
+func TestSearchRanksSystemThreadLast(t *testing.T) {
+	chunks := []Chunk{
+		{Path: "board/system/msg-0", Kind: "board", Text: "zebra zebra zebra zebra"},
+		{Path: "src/a.go", Kind: "code", Text: "zebra once in some code"},
+		{Path: "board/plans/msg-0", Kind: "board", Text: "zebra plan"},
+	}
+	for i := range chunks {
+		chunks[i].Vector = embedOne(chunks[i].Text, 64)
+	}
+	db := &DB{Dim: 64, Chunks: chunks, KW: buildKWIndex(chunks, true)}
+	for _, mode := range []string{ModeHybrid, ModeKeyword, ModeVector} {
+		res, err := db.SearchW("zebra", 10, "", "", 0, true, mode, defWKeyword, defWVector)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 3 || res[2].C.Path != "board/system/msg-0" {
+			t.Fatalf("%s: system chunk must rank last: %+v", mode, res)
+		}
+	}
+}
+
+// TestBoardMergeIgnoresThreadOrder: why — messages are stored by thread, not
+// by ID; merging into the index must not skip lower IDs that appear in later
+// threads (the system thread interleaves IDs with welcome).
+func TestBoardMergeIgnoresThreadOrder(t *testing.T) {
+	tb := newBoardToolbox(t, &DB{Dim: 8, KW: buildKWIndex(nil, true)})
+	b := newBoard()
+	b.Threads["welcome"].Msgs = []BoardMsg{{ID: 1, Thread: "welcome", Text: "a"}, {ID: 5, Thread: "welcome", Seq: 1, Text: "e"}}
+	b.Threads["plans"] = &BoardThread{ID: "plans", Msgs: []BoardMsg{{ID: 2, Thread: "plans", Text: "b"}, {ID: 3, Thread: "plans", Seq: 1, Text: "c"}}}
+	b.Order = append(b.Order, "plans")
+	tb.mergeBoardMsgs(tb.store(), b)
+	if len(tb.DB.Chunks) != 4 || tb.boardLast != 5 {
+		t.Fatalf("merged %d chunks (last %d), want 4 (last 5)", len(tb.DB.Chunks), tb.boardLast)
+	}
+}
+
+// initTestRepo makes a git repo with one commit and returns its path and HEAD.
+func initTestRepo(t *testing.T, name string) (string, string) {
+	t.Helper()
+	repo := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(repo, 0755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "user.email", "t@example.com")
+	git("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "init")
+	return repo, git("rev-parse", "HEAD")
+}
+
+// TestSourceCommitDirtyCaptured: why — every build records HEAD and the
+// work-tree state of each git source, even without -git, and the DB keeps
+// them; DBs written before the trailer still load.
+func TestSourceCommitDirtyCaptured(t *testing.T) {
+	if !gitAvailable() {
+		t.Skip("git not available")
+	}
+	t.Setenv("KB_EMBED_URL", "")
+	repo, head := initTestRepo(t, "repoa")
+	plain := t.TempDir()
+	if err := os.WriteFile(filepath.Join(plain, "n.txt"), []byte("notes\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	build := func() *DB {
+		db, err := buildDB(BuildOpts{Sources: []string{repo, plain}, Embed: localEmbed, KWPath: boolPtr(true)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	db := build()
+	if s := db.Sources[0]; !s.HasGit || s.Commit != head || s.Dirty {
+		t.Fatalf("git source = %+v, want HEAD %s clean", s, head)
+	}
+	if s := db.Sources[1]; s.HasGit || s.Commit != "" {
+		t.Fatalf("plain source = %+v", s)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "new.go"), []byte("package a\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	db = build()
+	if !db.Sources[0].Dirty {
+		t.Fatal("an uncommitted file must mark the work tree dirty")
+	}
+	raw := dbMarshal(db)
+	back, err := readDB(bytes.NewReader(raw))
+	if err != nil || !reflect.DeepEqual(back.Sources, db.Sources) {
+		t.Fatalf("source trailer round trip: %v %+v", err, back.Sources)
+	}
+	if hs, err := readDBSources(bytes.NewReader(raw)); err != nil || len(hs) != 2 || hs[0].Label != db.Sources[0].Label {
+		t.Fatalf("header-only source read: %v %+v", err, hs)
+	}
+	legacy := raw[:bytes.LastIndex(raw, []byte(dbSrcTag))-4]
+	if old, err := readDB(bytes.NewReader(legacy)); err != nil || old.Sources[0].Commit != "" || old.KW == nil {
+		t.Fatalf("a DB without the trailer must still load: %v", err)
+	}
+}
+
+// TestBuildAnnouncementText: why — the build message names sources by label
+// only, says indexed (new) or was rebuilt (known), clean or dirty, not a git
+// repo, and lists removed sources; it never leaks a path.
+func TestBuildAnnouncementText(t *testing.T) {
+	prev := []Source{{Label: "repoA", Root: "/secret/repoA", HasGit: true}, {Label: "gone", Root: "/secret/gone"}}
+	cur := []Source{
+		{Label: "repoA", Root: "/secret/repoA", HasGit: true, Commit: "abc123"},
+		{Label: "repoB", Root: "/secret/repoB", HasGit: true, Commit: "def456", Dirty: true},
+		{Label: "dirA", Root: "/secret/dirA"},
+	}
+	got := buildAnnouncement(prev, cur, 42)
+	for _, want := range []string{
+		"42 chunks from 3 source(s)",
+		"- `repoA` was rebuilt at commit `abc123` with a clean git workspace\n",
+		"- `repoB` indexed at commit `def456` with a dirty git workspace\n",
+		"- `dirA` indexed (not a git repo)\n",
+		"- `gone` was removed from the index\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("announcement lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "/secret") {
+		t.Fatalf("announcement leaks a path:\n%s", got)
+	}
+}
+
+// TestSwapIndexAnnouncesBuild: why — a live reindex through the daemon posts
+// the build summary (comparing against the index it replaced) with its
+// welcome notice; with the board off nothing is posted.
+func TestSwapIndexAnnouncesBuild(t *testing.T) {
+	old := &DB{Dim: 8, Sources: []Source{{Label: "repoA", HasGit: true}}, KW: buildKWIndex(nil, true)}
+	tb := newBoardToolbox(t, old)
+	dumpSignup(t, tb, "alice")
+	next := &DB{Dim: 8, Sources: []Source{{Label: "repoA", HasGit: true, Commit: "abc"}, {Label: "notes"}}, KW: buildKWIndex(nil, true)}
+	if _, err := tb.swapIndex(dbMarshal(next)); err != nil {
+		t.Fatal(err)
+	}
+	b := loadTestBoard(t, tb)
+	sys := b.Threads[boardSystem].Msgs
+	if len(sys) != 2 || !strings.Contains(sys[1].Text, "`repoA` was rebuilt at commit `abc`") || !strings.Contains(sys[1].Text, "`notes` indexed (not a git repo)") {
+		t.Fatalf("system thread after swap: %+v", sys)
+	}
+	wel := b.Threads[boardWelcome].Msgs
+	if !strings.Contains(wel[len(wel)-1].Text, "kbtool board read system#1") {
+		t.Fatalf("no welcome notice: %+v", wel[len(wel)-1])
+	}
+	off := false
+	tb.Disabled = effectiveDisabledSet(&config{MessageBoard: &off})
+	if _, err := tb.swapIndex(dbMarshal(next)); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(loadTestBoard(t, tb).Threads[boardSystem].Msgs); n != 2 {
+		t.Fatalf("board off must not post, have %d system messages", n)
+	}
+}
+
+// TestDaemonStartStopAnnouncements: why — daemon start and stop are posted;
+// the first start on a new board is covered by system#0; a start after an
+// unclean stop says so; changed collaboration settings are listed.
+func TestDaemonStartStopAnnouncements(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	tb.announceDaemonStart()
+	b := loadTestBoard(t, tb)
+	if len(b.Threads[boardSystem].Msgs) != 1 || !b.Sys.Running || b.Sys.Settings["welcome post limit"] == "" {
+		t.Fatalf("first start: %d system messages, state %+v", len(b.Threads[boardSystem].Msgs), b.Sys)
+	}
+	tb.announceDaemonStart() // the previous run never stopped
+	b = loadTestBoard(t, tb)
+	last := b.Threads[boardSystem].Msgs[len(b.Threads[boardSystem].Msgs)-1].Text
+	if !strings.Contains(last, "daemon started") || !strings.Contains(last, "did not stop cleanly") || !strings.Contains(last, "No collaboration settings changed") {
+		t.Fatalf("restart after crash:\n%s", last)
+	}
+	tb.announceDaemonStop("received terminated")
+	b = loadTestBoard(t, tb)
+	last = b.Threads[boardSystem].Msgs[len(b.Threads[boardSystem].Msgs)-1].Text
+	if b.Sys.Running || !strings.Contains(last, "daemon stopped (received terminated)") {
+		t.Fatalf("stop: running=%v\n%s", b.Sys.Running, last)
+	}
+	tb2 := &Toolbox{Store: tb.Store, BoardPath: tb.BoardPath, WelcomeMaxWords: 5}
+	tb2.announceDaemonStart()
+	b = loadTestBoard(t, tb)
+	last = b.Threads[boardSystem].Msgs[len(b.Threads[boardSystem].Msgs)-1].Text
+	if strings.Contains(last, "did not stop cleanly") || !strings.Contains(last, "welcome post limit changed: 10 words, each under 50 characters → 5 words") {
+		t.Fatalf("settings change:\n%s", last)
+	}
+}
+
+// TestReuseRecordedBuild: why — a bare `kbtool build` rebuilds the recorded
+// sources with the recorded knobs, explicit flags still win, and with nothing
+// recorded it changes nothing.
+func TestReuseRecordedBuild(t *testing.T) {
+	kw := false
+	prev := &config{Sources: []string{"/r/a", "/r/b"}, DB: "/r/kb.db", Dim: 128, Chunk: 30, Git: true, GitMaxCommits: 7, KWPath: &kw}
+	o := BuildOpts{Sources: []string{"."}, Dim: 256, Chunk: 60, Overlap: 10, KWPath: boolPtr(true)}
+	dbp := "default.db"
+	if !reuseRecordedBuild(prev, map[string]bool{"dim": true}, &o, &dbp) {
+		t.Fatal("recorded sources must be reused")
+	}
+	if !reflect.DeepEqual(o.Sources, prev.Sources) || o.Dim != 256 || o.Chunk != 30 || o.Overlap != 10 || !o.Git ||
+		o.GitMaxCommits != 7 || *o.KWPath || dbp != "/r/kb.db" {
+		t.Fatalf("opts = %+v db=%s", o, dbp)
+	}
+	o2 := BuildOpts{Sources: []string{"."}}
+	if reuseRecordedBuild(&config{}, nil, &o2, &dbp) || reuseRecordedBuild(nil, nil, &o2, &dbp) || o2.Sources[0] != "." {
+		t.Fatal("nothing recorded must leave the opts alone")
+	}
+}
+
+// TestRecordBuildConfigMerges: why — a build replaces only the build fields
+// in config.json; unrelated settings (welcome limit, relay, board memory)
+// survive so the next daemon start uses the new index and the old settings.
+func TestRecordBuildConfigMerges(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("KBTOOL_DIR", dir)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"),
+		[]byte(`{"version":1,"welcome_max_words":4,"relay_session":"0123456789abcdef0123456789abcdef","message_board_max_memory":"64MiB","sources":["/old"],"git":true,"live":true,"liveRepos":["/old"]}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	recordBuildConfig([]string{dir}, filepath.Join(dir, "kb.db"), 64, 40, 5, 512, false, 0, 0, nil)
+	c, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WelcomeMaxWords != 4 || c.RelaySession != "0123456789abcdef0123456789abcdef" || c.BoardMaxMemory != "64MiB" {
+		t.Fatalf("unrelated settings lost: %+v", c)
+	}
+	if len(c.Sources) != 1 || c.Sources[0] != dir || c.Dim != 64 || c.Git || c.Live || c.LiveRepos != nil {
+		t.Fatalf("build fields not replaced: %+v", c)
+	}
+}
+
+// TestBoardReadArgs: why — `kbtool board read system#N` must ask board_read
+// for exactly message N; a bare thread reads from the start.
+func TestBoardReadArgs(t *testing.T) {
+	a, err := boardReadArgs("system#3", 50)
+	if err != nil || a["thread"] != "system" || a["after"] != 3 || a["limit"] != 1 {
+		t.Fatalf("system#3 -> %v %v", a, err)
+	}
+	if a, err := boardReadArgs("plans", 20); err != nil || a["thread"] != "plans" || a["limit"] != 20 || a["after"] != nil {
+		t.Fatalf("plans -> %v %v", a, err)
+	}
+	for _, bad := range []string{"#1", "system#x", "system#-1"} {
+		if _, err := boardReadArgs(bad, 1); err == nil {
+			t.Fatalf("%q must be refused", bad)
+		}
+	}
+	tb := newBoardToolbox(t, nil)
+	seed := dumpSignup(t, tb, "alice")
+	a, _ = boardReadArgs("system#0", 50)
+	a["seed"] = seed
+	out, isErr := tb.Execute("board_read", mustMarshal(a))
+	if isErr || !strings.Contains(out, "showing 0..0") || !strings.Contains(out, "How this board works") {
+		t.Fatalf("board_read system#0: %s", out)
+	}
+}
+
+// TestRelayLostConnectivityLogged: why — losing an established relay
+// connection must be written to daemon.log in plain words (it is not posted
+// on the board).
+func TestRelayLostConnectivityLogged(t *testing.T) {
+	rs, hp := startTestRelay(t, "", nil)
+	sid, auth := newTestRelaySession(t, time.Now().Add(time.Hour))
+	var mu sync.Mutex
+	var logs []string
+	rc := &relayConnector{HostPort: hp, Session: sid, Auth: auth, Deliver: func(net.Conn) bool { return false },
+		minBackoff: 10 * time.Millisecond, maxBackoff: 20 * time.Millisecond,
+		Logf: func(f string, a ...any) {
+			mu.Lock()
+			logs = append(logs, fmt.Sprintf(f, a...))
+			mu.Unlock()
+		}}
+	go rc.run()
+	defer rc.close()
+	waitRelaySession(t, rs, sid, true)
+	rs.shutdown()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		joined := strings.Join(logs, "\n")
+		mu.Unlock()
+		if strings.Contains(joined, "lost connectivity to the relay") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no lost-connectivity log line:\n%s", strings.Join(logs, "\n"))
+}
+
+// TestRelayConnectorRoundRobin: why — when no candidate relay takes a new
+// session at start, the connector keeps cycling through all of them, sticks
+// to the first that accepts it (OnSticky, exactly once) and serves there.
+func TestRelayConnectorRoundRobin(t *testing.T) {
+	sid, auth := newTestRelaySession(t, time.Now().Add(time.Hour))
+	dead := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	late := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	var mu sync.Mutex
+	var logs, stuck []string
+	rc := &relayConnector{Session: sid, Auth: auth, Deliver: func(net.Conn) bool { return false },
+		minBackoff: 10 * time.Millisecond, maxBackoff: 20 * time.Millisecond,
+		Candidates: []relayEndpoint{{URL: "https://" + dead + "/", HostPort: dead}, {URL: "https://" + late + "/", HostPort: late}},
+		OnSticky: func(ep relayEndpoint) {
+			mu.Lock()
+			stuck = append(stuck, ep.URL)
+			mu.Unlock()
+		},
+		Logf: func(f string, a ...any) {
+			mu.Lock()
+			logs = append(logs, fmt.Sprintf(f, a...))
+			mu.Unlock()
+		}}
+	if rc.pick() || rc.sticky() {
+		t.Fatal("no relay is up: pick must fail and keep the candidates")
+	}
+	go rc.run()
+	defer rc.close()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		mu.Lock()
+		retried := strings.Contains(strings.Join(logs, "\n"), "no joined relay accepted session")
+		mu.Unlock()
+		if retried {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no retry log line")
+		}
+	}
+	rs := newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil), "")
+	ln, err := net.Listen("tcp", late)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go rs.serve(ln)
+	t.Cleanup(func() { _ = ln.Close(); rs.shutdown() })
+	waitRelaySession(t, rs, sid, true)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stuck) != 1 || stuck[0] != "https://"+late+"/" {
+		t.Fatalf("OnSticky must report the relay that took the session once: %v", stuck)
+	}
+}
+
+// ---------- 43. collaboration sessions, relay.json, collaboration doc (plans/collaborate-sessions-and-relay-json-plan.md) ----------
+
+// TestSessionIDFormat: why — session directories sort and list by their name,
+// so the ID must be the ISO-8601 basic UTC timestamp plus a short random part,
+// and two IDs from the same second must still differ.
+func TestSessionIDFormat(t *testing.T) {
+	now := time.Date(2026, 10, 2, 18, 47, 0, 0, time.FixedZone("x", 3600))
+	a, b := newSessionID(now), newSessionID(now)
+	if !sessionIDRe.MatchString(a) || !strings.HasPrefix(a, "20261002T174700Z_") {
+		t.Fatalf("session id %q: want 20261002T174700Z_xxxxxx (UTC)", a)
+	}
+	if a == b {
+		t.Fatal("two session ids from the same second must differ")
+	}
+}
+
+// TestCollabSources: why — `collaborate host` indexes what the human means by
+// "this directory": the checkout itself, or every project next to a git
+// checkout (git or not), never hidden or symlinked directories.
+func TestCollabSources(t *testing.T) {
+	mk := func(p ...string) string {
+		d := filepath.Join(p...)
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	repo := t.TempDir()
+	mk(repo, ".git")
+	mk(repo, "sub", ".git")
+	if got, _ := collabSources(repo); !reflect.DeepEqual(got, []string{repo}) {
+		t.Fatalf("a git checkout indexes itself only: %v", got)
+	}
+	ws := t.TempDir()
+	a, b := mk(ws, "a"), mk(ws, "b")
+	mk(a, ".git")
+	mk(ws, ".hidden", ".git")
+	if err := os.Symlink(a, filepath.Join(ws, "link")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, ws, "file.txt", []byte("x"))
+	if got, _ := collabSources(ws); !reflect.DeepEqual(got, []string{a, b}) {
+		t.Fatalf("children of a workspace with a git child: %v, want [%s %s]", got, a, b)
+	}
+	plain := t.TempDir()
+	mk(plain, "x")
+	if got, _ := collabSources(plain); !reflect.DeepEqual(got, []string{plain}) {
+		t.Fatalf("no git anywhere indexes the directory itself: %v", got)
+	}
+}
+
+// TestValidateAbout: why — `session ls` shows about.json, which agents write;
+// validation must catch every mistake an agent can make so `session validate`
+// is a reliable check of their edit.
+func TestValidateAbout(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{`{"summary":"branch protection migration","participants":["Sam","Josh"]}`, ""},
+		{`{"summary":"two words","participants":["Sam"]}`, ""},
+		{`{"summary":"one","participants":["Sam"]}`, "2 or 3 words"},
+		{`{"summary":"one two three four","participants":["Sam"]}`, "2 or 3 words"},
+		{`{"summary":"two  words","participants":["Sam"]}`, "single spaces"},
+		{`{"summary":"two words","participants":[]}`, "participants is empty"},
+		{`{"summary":"two words","participants":null}`, "participants is empty"},
+		{`{"summary":"two words","participants":["Sam","sam"]}`, "more than once"},
+		{`{"summary":"two words","participants":[" Sam"]}`, "leading or trailing"},
+		{`{"summary":"two words","participants":[""]}`, "empty name"},
+		{`{"summary":"two words","participants":["` + strings.Repeat("x", 65) + `"]}`, "at most 64"},
+		{`{"summary":"two words","participants":["a\u0007b"]}`, "control"},
+		{`{"summary":"two words","participants":["Sam"],"agents":["x"]}`, "unknown field"},
+		{`{"summary":"two words","participants":["Sam"]} {}`, "after the JSON"},
+		{`not json`, "is not"},
+	} {
+		_, probs := validateAbout([]byte(tc.in))
+		got := strings.Join(probs, "; ")
+		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("validateAbout(%s) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestCreateAndValidateSession: why — a new session must have the layout the
+// collaboration doc promises (seed kept out of git, empty about.json the
+// agents fill in), and validation must report the kbtool-owned files too.
+// Why: agents work from the user's checkout, so memory/, consensus/,
+// deliverables/ and the checksum files must only ever exist under
+// ~/.config/kbtool/sessions/<id>/, and the agent doc must never send an agent
+// to a path relative to its working directory.
+func TestSessionDirsNeverInWorkdir(t *testing.T) {
+	home, work := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KBTOOL_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(old) })
+	m, err := createSession("attendee", work, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".config", "kbtool", "sessions", m.ID)
+	if sessionDir(m.ID) != want {
+		t.Fatalf("session dir %s, want %s", sessionDir(m.ID), want)
+	}
+	for _, d := range []string{"memory", "consensus", "deliverables"} {
+		if fi, err := os.Stat(filepath.Join(want, d)); err != nil || !fi.IsDir() {
+			t.Fatalf("%s must be under %s: %v", d, want, err)
+		}
+	}
+	doc, err := renderCollabDoc(newCollabDoc(m, "attend"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, never := range []string{want, home, ".config/kbtool", m.ID, "shasum", "scratch", "about.json", ".kbtool-seed"} {
+		if strings.Contains(string(doc), never) {
+			t.Fatalf("the doc must not name %q: agents reach session files only through kbtool", never)
+		}
+	}
+	ents, _ := os.ReadDir(work)
+	if len(ents) != 0 {
+		t.Fatalf("nothing may be created in the working directory: %v", ents)
+	}
+
+	t.Setenv("KBTOOL_DIR", "relative-state")
+	if _, err := createSession("attendee", work, time.Now()); err == nil || !strings.Contains(err.Error(), "not absolute") {
+		t.Fatalf("a relative data dir must be refused: %v", err)
+	}
+	if ents, _ := os.ReadDir(work); len(ents) != 0 {
+		t.Fatalf("a refused session must not touch the working directory: %v", ents)
+	}
+}
+
+func TestCreateAndValidateSession(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	m, err := createSession("host", "/work", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := sessionDir(m.ID)
+	for _, d := range []string{"memory", "consensus", "deliverables"} {
+		if fi, err := os.Stat(filepath.Join(dir, d)); err != nil || !fi.IsDir() || fi.Mode().Perm() != 0700 {
+			t.Fatalf("%s must be a 0700 directory: %v", d, err)
+		}
+	}
+	probs := validateSession(m.ID)
+	if len(probs) != 2 || !strings.Contains(probs[0], "summary") || !strings.Contains(probs[1], "participants") {
+		t.Fatalf("a fresh session lacks only summary and participants: %q", probs)
+	}
+	writeTestPEM(t, dir, "about.json", []byte(`{"summary":"auth review","participants":["Sam"]}`))
+	if probs := validateSession(m.ID); len(probs) != 0 {
+		t.Fatalf("a filled-in session must validate: %q", probs)
+	}
+	if err := os.Remove(filepath.Join(dir, "deliverables")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, dir, "meta.json", []byte(`{"id":"other","role":"host"}`))
+	probs = validateSession(m.ID)
+	if got := strings.Join(probs, "; "); !strings.Contains(got, "deliverables/") || !strings.Contains(got, "meta.json") {
+		t.Fatalf("validation must cover the directories and meta.json: %q", probs)
+	}
+	if probs := validateSession("bogus"); len(probs) != 1 {
+		t.Fatalf("an invalid id is one problem: %q", probs)
+	}
+}
+
+// TestListSessions: why — `session ls` is how humans find a past session: most
+// recently used first, the current one marked, and long participant lists cut
+// off unless -a asks for all.
+func TestListSessions(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var ids []string
+	for i, people := range []string{`["A"]`, `["A","B","C","D","E"]`, `[]`} {
+		m, err := createSession("attendee", "/w", base.Add(time.Duration(i)*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTestPEM(t, sessionDir(m.ID), "about.json", []byte(`{"summary":"session `+strconv.Itoa(i)+`","participants":`+people+`}`))
+		ids = append(ids, m.ID)
+	}
+	m, _ := loadSessionMeta(ids[0])
+	m.LastUsed = base.Add(5 * time.Hour).Format(time.RFC3339Nano)
+	if err := saveSessionMeta(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionPointer(&sessionPointer{Current: ids[1], Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := listSessions(nil)
+	if err != nil || len(rows) != 3 {
+		t.Fatalf("rows: %v %v", rows, err)
+	}
+	if rows[0].ID != ids[0] || rows[1].ID != ids[2] || rows[2].ID != ids[1] {
+		t.Fatalf("order must follow last_used: %v", rows)
+	}
+	if !rows[2].Current || rows[2].State != "active" || rows[0].State != "finished" {
+		t.Fatalf("current/active marking: %+v", rows)
+	}
+	var buf bytes.Buffer
+	writeSessionList(&buf, rows, false)
+	out := buf.String()
+	if !strings.Contains(out, "A, B, C +2 more") || !strings.Contains(out, "session ls -a") || !strings.Contains(out, "* "+ids[1]) {
+		t.Fatalf("list output:\n%s", out)
+	}
+	buf.Reset()
+	writeSessionList(&buf, rows, true)
+	if !strings.Contains(buf.String(), "A, B, C, D, E") || strings.Contains(buf.String(), "more") {
+		t.Fatalf("-a must list every participant:\n%s", buf.String())
+	}
+}
+
+// TestArchiveRestoreState: why — finish must leave the data dir with only
+// relay.json, session.json and sessions/, and resume must bring back exactly
+// what was there, private key modes included.
+func TestArchiveRestoreState(t *testing.T) {
+	sd := shortStateDir(t)
+	writeTestPEM(t, sd, "relay.json", []byte("{}"))
+	writeTestPEM(t, sd, "session.json", []byte("{}"))
+	if err := os.MkdirAll(filepath.Join(sd, "sessions", "x"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sd, "server.key"), []byte("key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, sd, "config.json", []byte(`{"a":1}`))
+	if err := os.MkdirAll(filepath.Join(sd, "nested", "deep"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(sd, "nested", "deep"), "f", []byte("deep"))
+	ln, err := net.Listen("unix", filepath.Join(sd, "daemon.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+	dest := filepath.Join(sd, "sessions", "x", "state.tar.gz")
+	n, err := archiveState(sd, dest)
+	if err != nil || n != 3 {
+		t.Fatalf("archive: n=%d err=%v", n, err)
+	}
+	if fi, err := os.Stat(dest); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("the archive holds keys and must be 0600: %v", err)
+	}
+	left, _ := looseState(sd)
+	if len(left) != 0 {
+		t.Fatalf("only the keep-list may remain: %v", left)
+	}
+	if n, err := archiveState(sd, dest); n != 0 || err != nil || !fileExists(dest) {
+		t.Fatal("archiving nothing must leave an earlier archive alone")
+	}
+	if n, err := restoreState(sd, dest); err != nil || n != 3 {
+		t.Fatalf("restore: n=%d err=%v", n, err)
+	}
+	if fi, err := os.Stat(filepath.Join(sd, "server.key")); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("server.key must come back 0600: %v", err)
+	}
+	if string(mustReadFile(t, filepath.Join(sd, "nested", "deep", "f"))) != "deep" {
+		t.Fatal("nested files must come back")
+	}
+	if fi, err := os.Stat(filepath.Join(sd, "nested", "deep")); err != nil || fi.Mode().Perm() != 0750 {
+		t.Fatalf("directory modes must come back: %v", err)
+	}
+	if _, err := restoreState(sd, dest); err == nil {
+		t.Fatal("restore must never overwrite existing files")
+	}
+}
+
+// TestRestoreStateRefusesEscapes: why — an archive is unpacked into the data
+// dir; it must not write outside it or over the files that outlive sessions.
+func TestRestoreStateRefusesEscapes(t *testing.T) {
+	for _, name := range []string{"../evil", "/abs", "relay.json", "sessions/x/meta.json"} {
+		sd := t.TempDir()
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		tw := tar.NewWriter(gz)
+		_ = tw.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: 1, Typeflag: tar.TypeReg})
+		_, _ = tw.Write([]byte("x"))
+		tw.Close()
+		gz.Close()
+		src := filepath.Join(t.TempDir(), "s.tar.gz")
+		writeTestPEM(t, filepath.Dir(src), "s.tar.gz", buf.Bytes())
+		if _, err := restoreState(sd, src); err == nil {
+			t.Errorf("restore must refuse %q", name)
+		}
+	}
+}
+
+// TestConfirmCollab: why — replacing a session is destructive enough to need
+// a yes; scripts and agents without a terminal must pass -yes explicitly.
+func TestConfirmCollab(t *testing.T) {
+	old := stdinTTY
+	t.Cleanup(func() { stdinTTY = old })
+	stdinTTY = func() bool { return false }
+	if err := confirmCollab(nil, false); err != nil {
+		t.Fatal("nothing to confirm must pass")
+	}
+	if err := confirmCollab([]string{"x"}, true); err != nil {
+		t.Fatal("-yes must confirm")
+	}
+	if err := confirmCollab([]string{"x"}, false); err == nil || !strings.Contains(err.Error(), "-yes") {
+		t.Fatalf("no terminal and no -yes must refuse and name -yes: %v", err)
+	}
+}
+
+// TestReplaceReasons: why — the user must be told every thing a new session
+// replaces: the collaboration doc or stray state. An active session is never
+// replaced (activeSessionErr refuses instead).
+func TestReplaceReasons(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	cwd := t.TempDir()
+	if rs := replaceReasons(cwd, nil); len(rs) != 0 {
+		t.Fatalf("a clean start needs no confirmation: %q", rs)
+	}
+	writeTestPEM(t, cwd, collabDocName, []byte(collabDocPrefix+"(x) -->\n"))
+	writeTestPEM(t, stateDir(), "kb.db", []byte("x"))
+	rs := replaceReasons(cwd, nil)
+	if len(rs) != 2 || !strings.Contains(rs[0], collabDocName) || !strings.Contains(rs[1], "kb.db") {
+		t.Fatalf("doc + loose state: %q", rs)
+	}
+	if err := activeSessionErr(&sessionPointer{Current: "20260101T000000Z_abcdef", Active: true}); !strings.Contains(err.Error(), "kbtool collaborate finish") {
+		t.Fatalf("an active session must be finished by the user: %v", err)
+	}
+}
+
+// TestCollabDocRender: why — the doc is what agents follow: every field must
+// render, it names no session ID or data dir path, kbtool recognizes its own
+// doc, and only the host gets the hosting section with its sources and relay.
+func TestCollabDocRender(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	writeTestPEM(t, stateDir(), "relay.json", []byte(`{"version":1,"enabled":true,"relays":[{"url":"https://other.example:9876/"},{"url":"https://relay.example:9876/"}]}`))
+	if err := saveConfig(&config{Sources: []string{"/src/a", "/src/b"}, RelaySession: "0123456789abcdef0123456789abcdef", RelayURL: "https://relay.example:9876/"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"host", "attendee"} {
+		m, err := createSession(role, "/w", time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := renderCollabDoc(newCollabDoc(m, "host"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc := string(b)
+		if strings.Contains(doc, "{{") || strings.Contains(doc, "<no value>") {
+			t.Fatalf("%s: unrendered template fields", role)
+		}
+		for _, never := range []string{sessionDir(m.ID), stateDir(), m.ID, "~/.config"} {
+			if strings.Contains(doc, never) {
+				t.Errorf("%s doc names %q", role, never)
+			}
+		}
+		for _, want := range []string{"consensus/goals.md", "kbtool board signup", "kbtool session about", "kbtool memory", "kbtool consensus propose",
+			"kbtool consensus review", "kbtool consensus vote", "kbtool deliverables", "-host-accepted", "background update", "board fetch -o DIR", "attach` (memory", "consensus_files"} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("%s doc lacks %q", role, want)
+			}
+		}
+		host := strings.Contains(doc, "Hosting this session")
+		if host != (role == "host") {
+			t.Errorf("%s: hosting section present=%v", role, host)
+		}
+		if role == "host" && (!strings.Contains(doc, "`/src/b`") || !strings.Contains(doc, "https://relay.example:9876/")) {
+			t.Error("the host section must list the sources and the relay")
+		}
+		if strings.Contains(doc, "This session is local") {
+			t.Errorf("%s: a relay session is not local", role)
+		}
+		dir := t.TempDir()
+		writeTestPEM(t, dir, collabDocName, b)
+		if exists, ours := collabDocState(dir); !exists || !ours {
+			t.Fatalf("kbtool recognizes its own doc: %v %v", exists, ours)
+		}
+		writeTestPEM(t, dir, collabDocName, []byte("# my own notes\n"))
+		if exists, ours := collabDocState(dir); !exists || ours {
+			t.Fatalf("a hand-written file is not kbtool's: %v %v", exists, ours)
+		}
+	}
+	writeTestPEM(t, stateDir(), "relay.json", []byte(`{"version":1,"enabled":false,"relays":[{"url":"https://relay.example:9876/"}]}`))
+	m, err := createSession("host", "/w", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := renderCollabDoc(newCollabDoc(m, "host"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(b)
+	if !strings.Contains(doc, "This session is local") || !strings.Contains(doc, "session memory") ||
+		strings.Contains(doc, "enrollment line for the") || strings.Contains(doc, "relay.example") || strings.Contains(doc, "shared daemon") {
+		t.Fatalf("a host without an enabled relay gets the local session doc:\n%s", doc)
+	}
+}
+
+// TestRelayJSONClient: why — a relay client reaches the relay its token named
+// (client.json relay), whatever the joined list says; relay.json only gates it
+// with "enabled", and a broken client.json says how to re-enroll.
+func TestRelayJSONClient(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	if err := saveRelayJSON(&relayJSON{Relays: []relayTarget{{URL: "https://joined.example:7000/", Token: "tk", CA: "system"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(relayJSONPath()); err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("relay.json must be 0600: %v", err)
+	}
+	if err := enableClientRelay(); err != nil {
+		t.Fatal(err)
+	}
+	if rj, _ := loadRelayJSON(); rj == nil || !rj.Enabled || len(rj.Relays) != 1 || rj.Relays[0].Token != "tk" {
+		t.Fatalf("enrolling enables relays and keeps the joined list: %+v", rj)
+	}
+	writeTestPEM(t, stateDir(), "client.json", []byte(`{"version":1,"tls":true,"session":"0123456789abcdef0123456789abcdef","relay":"https://relay.example:7001/"}`))
+	cc, err := loadClientConfig()
+	if err != nil || cc.Host != "relay.example" || cc.Port != 7001 {
+		t.Fatalf("relay client endpoint from client.json: %+v %v", cc, err)
+	}
+	rj, _ := loadRelayJSON()
+	rj.Enabled = false
+	if err := saveRelayJSON(rj); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadClientConfig(); err == nil || !strings.Contains(err.Error(), "kbtool relay enable") {
+		t.Fatalf("a relay client with relays disabled must say how to enable them: %v", err)
+	}
+	if a, err := activeRelay(); err != nil || a != nil {
+		t.Fatalf("disabled relays are not active: %+v %v", a, err)
+	}
+	if err := os.Remove(relayJSONPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadClientConfig(); err != nil {
+		t.Fatalf("a relay client needs no relay.json: %v", err)
+	}
+	writeTestPEM(t, stateDir(), "client.json", []byte(`{"version":1,"tls":true,"session":"0123456789abcdef0123456789abcdef"}`))
+	if _, err := loadClientConfig(); err == nil || !strings.Contains(err.Error(), "client -import") {
+		t.Fatalf("a relay client.json without its relay must say how to re-enroll: %v", err)
+	}
+	writeTestPEM(t, stateDir(), "relay.json", []byte(`{"relays":[{"url":"http://plain/"}]}`))
+	if _, err := loadRelayJSON(); err == nil {
+		t.Fatal("an invalid relay URL must be refused")
+	}
+}
+
+// TestRelayJSONList: why — the joined relays are one global list: a new
+// session tries them round robin from next, find matches normalized URLs, and
+// activeRelay needs relays enabled and at least one joined.
+func TestRelayJSONList(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	rj := &relayJSON{Enabled: true, Next: 1, Relays: []relayTarget{{URL: "https://a.example:9876/"}, {URL: "https://b.example:9876/"}, {URL: "https://c.example:9876/"}}}
+	var order []string
+	for _, r := range rj.roundRobin() {
+		order = append(order, r.URL)
+	}
+	if strings.Join(order, " ") != "https://b.example:9876/ https://c.example:9876/ https://a.example:9876/" {
+		t.Fatalf("round robin from next=1: %v", order)
+	}
+	if rj.find("https://c.example") != 2 || rj.find("https://d.example/") != -1 {
+		t.Fatal("find must match normalized URLs")
+	}
+	if err := saveRelayJSON(&relayJSON{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if a, _ := activeRelay(); a != nil {
+		t.Fatal("no joined relay: not active")
+	}
+	if err := saveRelayJSON(rj); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(&config{RelaySession: "0123456789abcdef0123456789abcdef"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistStickyRelay("https://c.example:9876/"); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := loadConfig()
+	got, _ := loadRelayJSON()
+	if c.RelayURL != "https://c.example:9876/" || got.Next != 0 {
+		t.Fatalf("sticky relay recorded and round robin moved past it: relay_url=%q next=%d", c.RelayURL, got.Next)
+	}
+}
+
+// TestSessionSeedDefaults: why — agents should never handle the seed: board
+// commands default to the active session's seed file, and `kbtool call`
+// fills in a missing seed, but never overrides one or touches signup.
+func TestSessionSeedDefaults(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	if defaultSeedFile() != ".kbtool-seed" {
+		t.Fatal("without a session the seed file is ./.kbtool-seed")
+	}
+	m, err := createSession("attendee", "/w", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionPointer(&sessionPointer{Current: m.ID, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if defaultSeedFile() != sessionSeedPath(m.ID) {
+		t.Fatalf("active session seed file = %q", defaultSeedFile())
+	}
+	seed := strings.Repeat("ab", 32)
+	if sessionSeedPath(m.ID) != filepath.Join(stateDir(), "sessions", m.ID, ".kbtool-seed") {
+		t.Fatalf("the seed lives in the session directory, not memory/: %s", sessionSeedPath(m.ID))
+	}
+	writeTestPEM(t, sessionDir(m.ID), ".kbtool-seed", []byte(seed+"\n"))
+	var got map[string]string
+	_ = json.Unmarshal(injectSessionSeed("board_whoami", []byte(`{}`)), &got)
+	if got["seed"] != seed {
+		t.Fatalf("missing seed must be injected: %v", got)
+	}
+	for _, tc := range []struct{ name, args string }{
+		{"board_post", `{"seed":"mine"}`}, {"board_signup", `{"name":"a"}`}, {"kb_search", `{"q":"x"}`},
+	} {
+		if out := string(injectSessionSeed(tc.name, []byte(tc.args))); out != tc.args {
+			t.Errorf("%s %s must be left alone, got %s", tc.name, tc.args, out)
+		}
+	}
+	if err := saveSessionPointer(&sessionPointer{Current: m.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if out := string(injectSessionSeed("board_whoami", []byte(`{}`))); out != `{}` || defaultSeedFile() != ".kbtool-seed" {
+		t.Fatal("a finished session's seed must not be used")
+	}
+	if signupSeed("signed up as: a\nseed: "+seed+"\n") != seed || signupSeed("seed: xyz") != "" {
+		t.Fatal("signupSeed must extract exactly a 64-hex seed")
+	}
+}
+
+// TestSystemIntroRebuildGuidance: why — rebuilding the index is a human action
+// on the host, so system#0 must tell agents how to ask (call or board) and
+// how to sign up without handling the seed.
+func TestSystemIntroRebuildGuidance(t *testing.T) {
+	txt := systemIntroText(boardSysInfo{WelcomeWords: 10})
+	for _, want := range []string{"Only the host's human can rebuild the index", "in the call", "`index` thread", "kbtool board signup NAME"} {
+		if !strings.Contains(txt, want) {
+			t.Errorf("system#0 lacks %q", want)
+		}
+	}
+}
+
+// TestCollaborateLocalThenExpand: why — with the relay disabled, hosting needs
+// no relay connectivity: the session is local (unix socket, no PKI, no
+// enrollment line) yet has its board as session memory; enabling the relay and
+// resuming opens the same session, board included, to collaborators.
+func TestCollaborateLocalThenExpand(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, hostDir := shortStateDir(t), shortStateDir(t)
+	hostWork := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostWork, "repo", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(hostWork, "repo"), "a.go", []byte("package a\nfunc Alpha() {}\n"))
+	run := func(dir, cwd string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=")
+		c.Dir = cwd
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	hp := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if out, err := run(relayDir, work, "relay", "start", "-bind", hp); err != nil {
+		t.Fatalf("relay start: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_, _ = run(hostDir, hostWork, "collaborate", "finish")
+		_, _ = run(relayDir, work, "relay", "stop")
+	})
+	if out, err := run(hostDir, work, "relay", "disable"); err == nil || !strings.Contains(out, "relay join") {
+		t.Fatalf("relay disable without relay.json must point to relay join: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, work, "relay", "join", "https://"+hp+"/"); err != nil {
+		t.Fatalf("relay join: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, work, "relay", "disable"); err != nil {
+		t.Fatalf("relay disable: %v\n%s", err, out)
+	}
+	out, err := run(hostDir, hostWork, "collaborate", "host", "-yes")
+	if err != nil || !strings.Contains(out, "local session") || strings.Contains(out, "kbtool collaborate attend") {
+		t.Fatalf("collaborate host with the relay disabled must start a local session: %v\n%s", err, out)
+	}
+	for _, f := range []string{"ca.crt", "server.crt", relaySessionKeyFile} {
+		if fileExists(filepath.Join(hostDir, f)) {
+			t.Fatalf("a local session must not issue %s", f)
+		}
+	}
+	if !strings.Contains(string(mustReadFile(t, filepath.Join(hostWork, collabDocName))), "This session is local") {
+		t.Fatal("the local host's doc must say the session is local")
+	}
+	if out, err := run(hostDir, hostWork, "board", "signup", "hostbot"); err != nil || !strings.Contains(out, "seed stored in this session") {
+		t.Fatalf("the board is on in a local session: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, hostWork, "relay", "enable"); err != nil || !strings.Contains(out, "collaborate resume") {
+		t.Fatalf("relay enable: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, hostWork, "collaborate", "resume"); err != nil || !strings.Contains(out, "does not use them") {
+		t.Fatalf("resume with the daemon running must say how to expand: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, hostWork, "collaborate", "finish"); err != nil {
+		t.Fatalf("finish: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, hostWork, "collaborate", "resume"); err != nil || !strings.Contains(out, "opening the session to collaborators") {
+		t.Fatalf("resume with an enabled relay must open the session: %v\n%s", err, out)
+	}
+	var line string
+	for deadline := time.Now().Add(20 * time.Second); line == "" && time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if m := regexp.MustCompile(`kbtool client -import (kb1\S+)`).FindStringSubmatch(string(mustReadFile(t, filepath.Join(hostDir, "daemon.log")))); m != nil {
+			line = m[1]
+		}
+	}
+	if line == "" {
+		t.Fatalf("no relay enrollment line after expanding:\n%s", mustReadFile(t, filepath.Join(hostDir, "daemon.log")))
+	}
+	if doc := string(mustReadFile(t, filepath.Join(hostWork, collabDocName))); strings.Contains(doc, "This session is local") || !strings.Contains(doc, "https://"+hp+"/") {
+		t.Fatal("resume must rewrite the doc for collaborators")
+	}
+	if out, err := run(hostDir, hostWork, "call", "board_whoami"); err != nil || !strings.Contains(out, "you are: hostbot") {
+		t.Fatalf("the local session's board carries over: %v\n%s", err, out)
+	}
+}
+
+// TestCollaborateCLI: why — the whole lifecycle through the binary built with
+// the single build command (run from directories without the embedded
+// template) over a relay: host (index, relay-mode mTLS, daemon, doc, attend line), the
+// confirmation refusal, attend (relay.json written), seedless board use,
+// finish leaving only the keep-list, session ls, resume on both sides, and
+// session validate.
+func TestCollaborateCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, hostDir, attDir := shortStateDir(t), shortStateDir(t), shortStateDir(t)
+	hostWork, attWork := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostWork, "repo", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(hostWork, "repo"), "a.go", []byte("package a\nfunc Alpha() {}\n"))
+	run := func(dir, cwd string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=")
+		c.Dir = cwd
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	hp := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if out, err := run(relayDir, work, "relay", "start", "-bind", hp); err != nil {
+		t.Fatalf("relay start: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		_, _ = run(hostDir, hostWork, "collaborate", "finish")
+		_, _ = run(relayDir, work, "relay", "stop")
+	})
+	if out, err := run(hostDir, work, "relay", "join", "https://"+hp+"/"); err != nil {
+		t.Fatalf("relay join: %v\n%s", err, out)
+	}
+	writeTestPEM(t, hostWork, collabDocName, []byte("old\n"))
+	if out, err := run(hostDir, hostWork, "collaborate", "host"); err == nil || !strings.Contains(out, "-yes") {
+		t.Fatalf("an existing %s must need confirmation: %v\n%s", collabDocName, err, out)
+	}
+	out, err := run(hostDir, hostWork, "collaborate", "host", "-yes")
+	if err != nil || !strings.Contains(out, "indexing "+hostWork) || !strings.Contains(out, "kbtool collaborate attend kb1") {
+		t.Fatalf("collaborate host: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(mustReadFile(t, filepath.Join(hostWork, collabDocName))), "Hosting this session") {
+		t.Fatal("the host's doc must have the hosting section")
+	}
+	var line string
+	for deadline := time.Now().Add(20 * time.Second); line == "" && time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if m := regexp.MustCompile(`kbtool client -import (kb1\S+)`).FindStringSubmatch(string(mustReadFile(t, filepath.Join(hostDir, "daemon.log")))); m != nil {
+			line = m[1]
+		}
+	}
+	if line == "" {
+		t.Fatal("no relay enrollment line")
+	}
+	if out, err := run(attDir, attWork, "collaborate", "attend", line); err != nil || !strings.Contains(out, "enrolled") || !fileExists(filepath.Join(attDir, "relay.json")) {
+		t.Fatalf("collaborate attend: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "board", "signup", "alice"); err != nil || strings.Contains(out, "seed: ") {
+		t.Fatalf("board signup must store, not print, the seed: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "call", "board_whoami"); err != nil || !strings.Contains(out, "you are: alice") || !strings.Contains(out, "platform: "+clientPlatform) {
+		t.Fatalf("kbtool call must use the session seed: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "board", "read", "system#0"); err != nil || !strings.Contains(out, "Rebuilding the index") {
+		t.Fatalf("board read with the session seed: %v\n%s", err, out)
+	}
+	// consensus voting end to end: the host's agent signs up over the unix socket
+	if out, err := run(hostDir, hostWork, "board", "signup", "hostbot"); err != nil || !strings.Contains(out, "session host's agent") || !strings.Contains(out, "seed stored in this session") {
+		t.Fatalf("host signup over the socket is the host's agent (and names no data dir path): %v\n%s", err, out)
+	}
+	os.MkdirAll(filepath.Join(attWork, "tickets"), 0700)
+	writeTestPEM(t, filepath.Join(attWork, "tickets"), "01.md", []byte("ticket one\n"))
+	if out, err := run(attDir, attWork, "memory", "import", "tickets"); err != nil {
+		t.Fatalf("memory import: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "consensus", "propose", "-m", "first ticket", "tickets=deliverables"); err != nil || !strings.Contains(out, "waiting for: hostbot") {
+		t.Fatalf("propose: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "consensus", "propose", "-m", "x", "-host-accepted", "tickets=deliverables/x"); err == nil {
+		t.Fatalf("-host-accepted is refused for a remote agent:\n%s", out)
+	}
+	if out, err := run(hostDir, hostWork, "consensus", "review", "1", "-diff"); err != nil || !strings.Contains(out, "=== deliverables/01.md: new file") {
+		t.Fatalf("review -diff: %v\n%s", err, out)
+	}
+	if out, err := run(hostDir, hostWork, "consensus", "vote", "1", "yes"); err != nil || !strings.Contains(out, "accepted") {
+		t.Fatalf("vote: %v\n%s", err, out)
+	}
+	out, err = run(attDir, attWork, "deliverables", "cat", "01.md")
+	if err != nil || !strings.Contains(out, "ticket one") || !strings.Contains(out, "background update of deliverables/ (proposal 1 accepted)") {
+		t.Fatalf("the attendee's copy updates in the background before it is read: %v\n%s", err, out)
+	}
+	os.MkdirAll(filepath.Join(hostWork, "notes"), 0700)
+	writeTestPEM(t, filepath.Join(hostWork, "notes"), "goals.md", []byte("the goals\n"))
+	run(hostDir, hostWork, "memory", "import", "notes/goals.md")
+	if out, err := run(hostDir, hostWork, "consensus", "propose", "-m", "goals agreed with the humans", "-host-accepted", "goals.md=consensus/goals.md"); err != nil || !strings.Contains(out, "accepted") {
+		t.Fatalf("-host-accepted over the socket: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "consensus", "cat", "goals.md"); err != nil || !strings.Contains(out, "the goals") {
+		t.Fatalf("host-accepted change reaches the attendee: %v\n%s", err, out)
+	}
+	if out, err := run(attDir, attWork, "call", "board_confirm"); err != nil || !regexp.MustCompile(`alice .*copies=in-sync`).MatchString(out) {
+		t.Fatalf("roster shows the attendee in sync:\n%s", out)
+	}
+	p := func(dir string) *sessionPointer {
+		var sp sessionPointer
+		if err := json.Unmarshal(mustReadFile(t, filepath.Join(dir, "session.json")), &sp); err != nil {
+			t.Fatal(err)
+		}
+		return &sp
+	}
+	attID := p(attDir).Current
+	writeTestPEM(t, filepath.Join(attDir, "sessions", attID), "about.json", []byte(`{"summary":"lab session","participants":["Sam","Josh"]}`))
+	if out, err := run(attDir, attWork, "session", "validate"); err != nil || !strings.Contains(out, "ok") {
+		t.Fatalf("session validate: %v\n%s", err, out)
+	}
+	certsBefore := map[string][]byte{}
+	for _, f := range []string{"ca.crt", "server.crt", "client.crt"} {
+		certsBefore[f], _ = os.ReadFile(filepath.Join(hostDir, f))
+	}
+	for _, d := range []struct{ dir, cwd string }{{attDir, attWork}, {hostDir, hostWork}} {
+		if out, err := run(d.dir, d.cwd, "collaborate", "finish"); err != nil {
+			t.Fatalf("finish: %v\n%s", err, out)
+		}
+		ents, _ := os.ReadDir(d.dir)
+		for _, e := range ents {
+			if !collabKeep[e.Name()] {
+				t.Fatalf("%s left in %s after finish", e.Name(), d.dir)
+			}
+		}
+	}
+	if out, err := run(hostDir, hostWork, "board", "dump", "-session", p(hostDir).Current); err != nil || !strings.Contains(out, "first ticket") || !strings.Contains(out, "<html") {
+		t.Fatalf("board dump of the finished host session: %v\n%.300s", err, out)
+	}
+	if out, err := run(attDir, attWork, "board", "dump", "-session", attID); err == nil || !strings.Contains(out, "attendee session has no copy") {
+		t.Fatalf("board dump of a finished attendee session: %v\n%.300s", err, out)
+	}
+	if out, err := run(attDir, attWork, "session", "ls"); err != nil || !strings.Contains(out, "lab session") || !strings.Contains(out, "Sam, Josh") || !strings.Contains(out, "finished") {
+		t.Fatalf("session ls: %v\n%s", err, out)
+	}
+	out, err = run(hostDir, hostWork, "collaborate", "resume")
+	if err != nil || !strings.Contains(out, "daemon started") {
+		t.Fatalf("host resume: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "issuing new ones") {
+		t.Fatalf("resume must not issue certificates while the restored ones are valid:\n%s", out)
+	}
+	for f, want := range certsBefore {
+		if got, _ := os.ReadFile(filepath.Join(hostDir, f)); len(want) == 0 || !bytes.Equal(got, want) {
+			t.Fatalf("resume must restore %s unchanged while it is valid", f)
+		}
+	}
+	attDoc := filepath.Join(attWork, collabDocName)
+	if err := os.WriteFile(attDoc, []byte("# hand-written\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(attDir, attWork, "collaborate", "resume"); err == nil || !strings.Contains(out, "not written by kbtool") {
+		t.Fatalf("resume must ask before replacing a hand-written doc: %v\n%s", err, out)
+	}
+	os.Remove(attDoc)
+	var connected bool
+	for deadline := time.Now().Add(20 * time.Second); !connected && time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		out, _ = run(attDir, attWork, "collaborate", "resume")
+		connected = strings.Contains(out, "connected to")
+	}
+	if !connected {
+		t.Fatalf("attendee resume must reconnect through the same relay session:\n%s", out)
+	}
+	if out, err := run(attDir, attWork, "call", "board_whoami"); err != nil || !strings.Contains(out, "you are: alice") {
+		t.Fatalf("the restored session keeps its identity: %v\n%s", err, out)
+	}
+}
+
+// ---------- 44. encrypted sessions, KBTOOL_SECRET, KBX2 and kbx rekey ----------
+
+func kbx2Bytes(t *testing.T, key, head, payload []byte, keys kbxKeys) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := newKBX2Writer(&buf, key, nil, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(keys); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestKBX2Format: why — session archives must round-trip across many
+// records, and a wrong key, a truncated file, a re-flagged record or trailing
+// data must all be rejected (the final keys record guards against
+// truncation).
+func TestKBX2Format(t *testing.T) {
+	key := []byte("k1")
+	payload := bytes.Repeat([]byte("0123456789abcdef"), kbx2RecordMax/16*3+5)
+	keys := kbxKeys{Inner: map[string][]byte{"state/kb.db": []byte("inner")}}
+	b := kbx2Bytes(t, key, []byte(`{"h":1}`), payload, keys)
+	r, err := openKBX2(bytes.NewReader(b), key)
+	if err != nil || string(r.head) != `{"h":1}` {
+		t.Fatalf("open: %v head %q", err, r.head)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil || !bytes.Equal(got, payload) || string(r.keys.Inner["state/kb.db"]) != "inner" {
+		t.Fatalf("round trip: %v (%d bytes) keys %v", err, len(got), r.keys)
+	}
+	if _, err := openKBX2(bytes.NewReader(b), []byte("nope")); err == nil || !strings.Contains(err.Error(), "wrong key") {
+		t.Fatalf("a wrong key must fail on the head: %v", err)
+	}
+	cut, _ := openKBX2(bytes.NewReader(b[:len(b)-40]), key)
+	if _, err := io.ReadAll(cut); err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("a truncated file must be reported: %v", err)
+	}
+	tampered := append([]byte{}, b...)
+	tampered[kbx2HeaderLen+5+len(r.head)+16] = kbx2FlagFinal | kbx2FlagKeys
+	tr, _ := openKBX2(bytes.NewReader(tampered), key)
+	if _, err := io.ReadAll(tr); err == nil {
+		t.Fatal("re-flagging a record must fail authentication")
+	}
+	extra, _ := openKBX2(bytes.NewReader(append(append([]byte{}, b...), 'x')), key)
+	if _, err := io.ReadAll(extra); err == nil || !strings.Contains(err.Error(), "after its final record") {
+		t.Fatalf("trailing data must be rejected: %v", err)
+	}
+	var out bytes.Buffer
+	if err := rekeyKBX2(bytes.NewReader(b), &out, key, []byte("k2"), nil); err != nil {
+		t.Fatal(err)
+	}
+	r2, err := openKBX2(bytes.NewReader(out.Bytes()), []byte("k2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, _ := io.ReadAll(r2)
+	if !bytes.Equal(got2, payload) || string(r2.head) != `{"h":1}` || string(r2.keys.Inner["state/kb.db"]) != "inner" {
+		t.Fatal("rekey must keep the head, payload and keys record")
+	}
+}
+
+// encSessionFixture makes an active attendee session in an encrypted data
+// dir with a summary, a seed, and loose state including an encrypted kb.db.
+func encSessionFixture(t *testing.T, key []byte) (*sessionPointer, string) {
+	t.Helper()
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	t.Setenv(secretEnv, string(key))
+	work := t.TempDir()
+	m, err := createSession("attendee", work, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, sessionDir(m.ID), "about.json", []byte(`{"summary":"sealed lab","participants":["Sam","Josh"]}`))
+	writeTestPEM(t, sessionDir(m.ID), ".kbtool-seed", []byte("seed-value\n"))
+	writeTestPEM(t, filepath.Join(sessionDir(m.ID), "consensus"), "goals.md", []byte("goals\n"))
+	st := &kbStore{path: filepath.Join(stateDir(), "kb.db")}
+	st.setKey(key)
+	if err := st.writeBundle([]byte("DBBYTES"), []byte("BOARD")); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, stateDir(), "client.json", []byte(`{}`))
+	p := &sessionPointer{Current: m.ID, Active: true, Encrypt: true}
+	if err := writeJSON0600(sessionJSONPath(), p); err != nil {
+		t.Fatal(err)
+	}
+	return p, work
+}
+
+var randomKBXRe = regexp.MustCompile(`^[0-9a-f]{32}\.kbx$`)
+
+// sealedPath is the file sealing session id, found by its head; its name
+// must be random.
+func sealedPath(t *testing.T, id string, key []byte) string {
+	t.Helper()
+	a, err := findSessionArchive(id, key)
+	if err != nil || a == nil {
+		t.Fatalf("session %s is not sealed: %v", id, err)
+	}
+	if !randomKBXRe.MatchString(a.File) {
+		t.Fatalf("sealed file name %q is not random", a.File)
+	}
+	return a.path()
+}
+
+// kbxFilesIn lists dir/sessions/*.kbx.
+func kbxFilesIn(t *testing.T, dir string) []string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(dir, "sessions", "*.kbx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// TestEncryptedFinishListRekeyResume: why — this is the encrypted session
+// lifecycle: finish leaves only a randomly named sessions/*.kbx whose head
+// alone identifies the session, ls reads the head alone, kbx rekey changes
+// only outer files and renames every archive (an interrupted rekey repeats
+// cleanly), and restoring re-encrypts the inner kb.db under the current key
+// while the archive disappears.
+func TestEncryptedFinishListRekeyResume(t *testing.T) {
+	k1, k2, k3 := []byte("first key"), []byte("second key"), []byte("third key")
+	p, work := encSessionFixture(t, k1)
+	id := p.Current
+	if err := finishSessionNow(p, time.Now(), k1, nil); err != nil {
+		t.Fatal(err)
+	}
+	f1 := sealedPath(t, id, k1)
+	if dirExists(sessionDir(id)) || len(kbxFilesIn(t, stateDir())) != 1 || strings.Contains(f1, id) {
+		t.Fatal("finish must leave only the encrypted archive, under a name unrelated to the session")
+	}
+	if loose, _ := looseState(stateDir()); len(loose) != 0 {
+		t.Fatalf("the data dir keeps only %v after finish, has %v", collabKeep, loose)
+	}
+	if bytes.Contains(mustReadFile(t, f1), []byte("sealed lab")) {
+		t.Fatal("the archive must not hold plain text")
+	}
+	rows, err := listSessions(k1)
+	if err != nil || len(rows) != 1 || rows[0].ID != id || rows[0].Summary != "sealed lab" || len(rows[0].People) != 2 || rows[0].State != "finished, encrypted" || rows[0].Role != "attendee" {
+		t.Fatalf("ls must show the head: %v %+v", err, rows)
+	}
+	if rows, _ := listSessions(nil); len(rows) != 0 {
+		t.Fatalf("without a key nothing sealed is listed: %+v", rows)
+	}
+	h, err := readSessionHead(f1, k1)
+	if err != nil || h.Meta.Workdir != work || h.Meta.Finished == "" {
+		t.Fatalf("the head carries the working directory: %v %+v", err, h)
+	}
+	if probs := validateSealedSession(id, k1); len(probs) != 0 {
+		t.Fatalf("validate reads the head: %q", probs)
+	}
+
+	if n, err := rekeyDataDir(k1, k2); err != nil || n != 1 {
+		t.Fatalf("rekey: %d %v", n, err)
+	}
+	f2 := sealedPath(t, id, k2)
+	if f2 == f1 || fileExists(f1) || len(kbxFilesIn(t, stateDir())) != 1 {
+		t.Fatal("rekey must write the archive under a new random name and remove the old file")
+	}
+	if kbxOpensWith(f2, k1) || !kbxOpensWith(f2, k2) {
+		t.Fatal("the archive must open with the new key only")
+	}
+	if n, err := rekeyDataDir(k1, k2); err != nil || n != 0 {
+		t.Fatalf("a repeated rekey skips files already under the new key: %d %v", n, err)
+	}
+	half, err := newSessionKBXPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rekeyFileTo(f2, half, k2, k3, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := rekeyDataDir(k2, k3); err != nil || n != 1 || fileExists(f2) || !fileExists(half) || len(kbxFilesIn(t, stateDir())) != 1 {
+		t.Fatalf("a rekey interrupted before removing the old file must drop that leftover, not rekey it twice: %d %v %v", n, err, kbxFilesIn(t, stateDir()))
+	}
+	if got := sealedPath(t, id, k3); got != half {
+		t.Fatalf("the session must be found under its rekeyed file %s, got %s", half, got)
+	}
+
+	tmp := filepath.Join(sessionsDir(), "."+id+".extract")
+	keys, err := extractSession(half, tmp, k3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(keys.Inner["state/kb.db"], k1) {
+		t.Fatal("the archive must remember the inner kb.db key")
+	}
+	if string(mustReadFile(t, filepath.Join(tmp, ".kbtool-seed"))) != "seed-value\n" || !fileExists(filepath.Join(tmp, "consensus", "goals.md")) {
+		t.Fatal("the payload must restore the session files and seed")
+	}
+	if m, err := loadSessionMetaFrom(tmp); err != nil || m.ID != id {
+		t.Fatalf("meta.json must be written from the head: %v", err)
+	}
+	if _, err := moveStateBack(filepath.Join(tmp, "state"), stateDir(), keys.Inner["state/kb.db"], k3); err != nil {
+		t.Fatal(err)
+	}
+	b := mustReadFile(t, filepath.Join(stateDir(), "kb.db"))
+	if _, err := cryptoDecryptBundle(b, k1); err == nil {
+		t.Fatal("the inner kb.db must no longer open with the old key")
+	}
+	plain, err := cryptoDecryptBundle(b, k3)
+	if err != nil {
+		t.Fatalf("the inner kb.db must be re-encrypted under the current key: %v", err)
+	}
+	if files, err := cryptoTarGZExtractMem(plain); err != nil || string(files["kb.db"]) != "DBBYTES" || string(files["board.bin"]) != "BOARD" {
+		t.Fatalf("the re-encrypted kb.db must keep its contents: %v", err)
+	}
+}
+
+func loadSessionMetaFrom(dir string) (*sessionMeta, error) {
+	var m sessionMeta
+	b, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err == nil {
+		err = json.Unmarshal(b, &m)
+	}
+	return &m, err
+}
+
+// TestSessionHeadOnly: why — session ls must not decrypt or unpack a
+// finished session: the head alone (cut off after its first record) is
+// enough, and nothing is extracted.
+func TestSessionHeadOnly(t *testing.T) {
+	key := []byte("k")
+	p, _ := encSessionFixture(t, key)
+	if err := finishSessionNow(p, time.Now(), key, nil); err != nil {
+		t.Fatal(err)
+	}
+	b := mustReadFile(t, sealedPath(t, p.Current, key))
+	n := binary.LittleEndian.Uint32(b[kbx2HeaderLen+1:])
+	headOnly := filepath.Join(t.TempDir(), "head.kbx")
+	writeTestPEM(t, filepath.Dir(headOnly), "head.kbx", b[:kbx2HeaderLen+5+int(n)])
+	h, err := readSessionHead(headOnly, key)
+	if err != nil || h.About == nil || h.About.Summary != "sealed lab" || h.Meta.ID != p.Current {
+		t.Fatalf("the head record alone must describe the session: %v %+v", err, h)
+	}
+	if bytes.Contains(mustReadFile(t, headOnly), []byte("seed-value")) {
+		t.Fatal("the head must not carry the seed")
+	}
+}
+
+// TestWorkdirOneLiner: why — resuming outside the session's working
+// directory would point the agents at the wrong AGENTS_COLLABORATION.md, so
+// the user gets a copy-paste command instead.
+func TestWorkdirOneLiner(t *testing.T) {
+	m := &sessionMeta{ID: "20260101T000000Z_abcdef", Workdir: "/work/my repo"}
+	if err := checkWorkdir(m, "/work/my repo"); err != nil {
+		t.Fatal(err)
+	}
+	err := checkWorkdir(m, "/elsewhere")
+	if err == nil || !strings.Contains(err.Error(), "cd '/work/my repo' && kbtool collaborate resume -id 20260101T000000Z_abcdef") {
+		t.Fatalf("the error must carry the one-liner: %v", err)
+	}
+}
+
+// TestEncryptDataDirConvertsHistory: why — -encrypt keys the whole data dir:
+// a finished plain session's plain kb.db + board.bin become one encrypted
+// kb.db inside its sealed archive, and session.json stays encrypted.
+func TestEncryptDataDirConvertsHistory(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	key := []byte("history key")
+	m, err := createSession("host", t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(sessionDir(m.ID), "state"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(sessionDir(m.ID), "state"), "kb.db", []byte(magic+"plain-db"))
+	writeTestPEM(t, filepath.Join(sessionDir(m.ID), "state"), "board.bin", []byte("plain-board"))
+	if got := encryptReasons(nil); len(got) != 3 || !strings.Contains(got[1], m.ID) {
+		t.Fatalf("the caution must name the sessions to encrypt: %q", got)
+	}
+	if err := encryptDataDir(nil, key); err != nil {
+		t.Fatal(err)
+	}
+	if dirExists(sessionDir(m.ID)) || !encryptedDataDir() {
+		t.Fatal("the session must be sealed and session.json encrypted")
+	}
+	tmp := filepath.Join(t.TempDir(), "x")
+	keys, err := extractSession(sealedPath(t, m.ID, key), tmp, key)
+	if err != nil || !bytes.Equal(keys.Inner["state/kb.db"], key) {
+		t.Fatalf("extract: %v %v", err, keys)
+	}
+	if fileExists(filepath.Join(tmp, "state", "board.bin")) {
+		t.Fatal("board.bin must be packed into the encrypted kb.db")
+	}
+	plain, err := cryptoDecryptBundle(mustReadFile(t, filepath.Join(tmp, "state", "kb.db")), key)
+	files, ferr := cryptoTarGZExtractMem(plain)
+	if err != nil || ferr != nil || string(files["kb.db"]) != magic+"plain-db" || string(files["board.bin"]) != "plain-board" {
+		t.Fatalf("kb.db must hold the db and board, encrypted: %v %v", err, ferr)
+	}
+	if err := saveSessionPointer(&sessionPointer{Current: m.ID}); err != nil || !encryptedDataDir() {
+		t.Fatal("once encrypted, session.json stays encrypted")
+	}
+}
+
+// TestEncryptedDataDirNeedsSecret: why — with "encrypt": true kbtool must
+// fail rather than prompt or write plain data when KBTOOL_SECRET is unset,
+// and a file inside the data dir cannot be rekeyed on its own.
+func TestEncryptedDataDirNeedsSecret(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	t.Setenv(secretEnv, "")
+	if err := writeJSON0600(sessionJSONPath(), &sessionPointer{Encrypt: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := requireSecret("", "", "list sessions"); err == nil || !strings.Contains(err.Error(), secretEnv) {
+		t.Fatalf("a missing secret must name %s: %v", secretEnv, err)
+	}
+	kb := filepath.Join(stateDir(), "kb.db")
+	writeTestPEM(t, stateDir(), "kb.db", cryptoEncryptBundle([]byte("x"), []byte("k")))
+	if _, err := openStore(kb, "", "", true, true); err == nil || !strings.Contains(err.Error(), secretEnv) {
+		t.Fatalf("an encrypted data dir never prompts: %v", err)
+	}
+	t.Setenv(secretEnv, "from-env")
+	if k, err := requireSecret("", "", "x"); err != nil || string(k) != "from-env" {
+		t.Fatalf("requireSecret reads %s: %v", secretEnv, err)
+	}
+	if !inDataDir(kb) || !inDataDir(filepath.Join(stateDir(), "sessions", "a.kbx")) || inDataDir(filepath.Join(t.TempDir(), "a.kbx")) {
+		t.Fatal("inDataDir must tell data dir files apart")
+	}
+	out := filepath.Join(t.TempDir(), "export.kbx")
+	writeTestPEM(t, filepath.Dir(out), "export.kbx", cryptoEncryptBundle([]byte("payload"), []byte("old")))
+	if err := rekeyFile(out, []byte("old"), []byte("new"), nil); err != nil || !kbxOpensWith(out, []byte("new")) {
+		t.Fatalf("a KBX1 file outside the data dir is rekeyed in place: %v", err)
+	}
+}
+
+// TestEncryptedCollaborateCLI: why — end to end with the real binary:
+// host -encrypt, `daemon stop` finishing (sealing) the session, ls needing
+// KBTOOL_SECRET, resume refusing other directories with a one-liner, one
+// active session at a time, kbx rekey refused while active, and a resume
+// after a rekey serving the re-encrypted kb.db.
+// Then a killed daemon (an unclean shutdown): every command refuses with the
+// warning until `session validate` checks and seals the session.
+func TestEncryptedCollaborateCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, hostDir := filepath.Join(shortStateDir(t), "new"), shortStateDir(t) // relay start creates its state dir
+	hostWork := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostWork, "repo", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(hostWork, "repo"), "a.go", []byte("package a\nfunc Alpha() {}\n"))
+	run := func(cwd, secret string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+hostDir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=",
+			secretEnv+"="+secret, "MYKEY=first key", "NEWKEY=second key")
+		c.Dir = cwd
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	rdir := func(args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+relayDir, "HOME="+work, "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=")
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	hp := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if out, err := rdir("relay", "start", "-bind", hp); err != nil {
+		t.Fatalf("relay start: %v\n%s", err, out)
+	}
+	if fi, err := os.Stat(relayDir); err != nil || fi.Mode().Perm() != 0700 {
+		t.Fatalf("relay start creates a missing state dir, mode 0700: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = run(hostWork, "second key", "collaborate", "finish")
+		_, _ = run(hostWork, "first key", "collaborate", "finish")
+		_, _ = rdir("relay", "stop")
+	})
+	if out, err := run(work, "", "relay", "join", "https://"+hp+"/"); err != nil {
+		t.Fatalf("relay join: %v\n%s", err, out)
+	}
+	if out, err := run(hostWork, "", "collaborate", "host", "-encrypt", "-db-key-env", "MYKEY"); err == nil || !strings.Contains(out, "keys the whole kbtool data dir") {
+		t.Fatalf("-encrypt must caution and ask for confirmation: %v\n%s", err, out)
+	}
+	out, err := run(hostWork, "", "collaborate", "host", "-yes", "-encrypt", "-db-key-env", "MYKEY")
+	if err != nil || !strings.Contains(out, "ENCRYPTED") || !strings.Contains(out, "export "+secretEnv) {
+		t.Fatalf("collaborate host -encrypt: %v\n%s", err, out)
+	}
+	var sp sessionPointer
+	if err := json.Unmarshal(mustReadFile(t, filepath.Join(hostDir, "session.json")), &sp); err != nil || !sp.Encrypt || !sp.Active {
+		t.Fatalf("session.json must be encrypted and active: %v %+v", err, sp)
+	}
+	id := sp.Current
+	if out, err := run(hostWork, "first key", "collaborate", "host", "-yes"); err == nil || !strings.Contains(out, "collaborate finish") {
+		t.Fatalf("a second session must be refused while one is active: %v\n%s", err, out)
+	}
+	if out, err := run(work, "first key", "kbx", "rekey", "-new-key-env", "NEWKEY"); err == nil || !strings.Contains(out, "active") {
+		t.Fatalf("kbx rekey must be refused while a session is active: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "daemon", "stop"); err != nil {
+		t.Fatalf("daemon stop: %v\n%s", err, out)
+	}
+	sealedFiles := kbxFilesIn(t, hostDir)
+	if dirExists(filepath.Join(hostDir, "sessions", id)) || len(sealedFiles) != 1 || !randomKBXRe.MatchString(filepath.Base(sealedFiles[0])) {
+		t.Fatalf("daemon stop must finish and encrypt the session under a random name: %v", sealedFiles)
+	}
+	if out, err := run(work, "", "session", "ls"); err == nil || !strings.Contains(out, secretEnv) {
+		t.Fatalf("session ls must need %s: %v\n%s", secretEnv, err, out)
+	}
+	if out, err := run(work, "first key", "session", "ls"); err != nil || !strings.Contains(out, "finished, encrypted") || !strings.Contains(out, id) || !strings.Contains(out, "host") {
+		t.Fatalf("session ls with the key: %v\n%s", err, out)
+	}
+	if out, err := run(work, "first key", "board", "dump", "-session", id); err != nil || !strings.Contains(out, "How this board works") {
+		t.Fatalf("board dump decrypts the sealed host session in memory: %v\n%.300s", err, out)
+	}
+	if out, err := run(work, "second key", "board", "dump", "-session", id); err == nil {
+		t.Fatalf("board dump with a wrong key must fail:\n%.300s", out)
+	}
+	if after := kbxFilesIn(t, hostDir); len(after) != 1 || after[0] != sealedFiles[0] {
+		t.Fatalf("board dump leaves the archive untouched: %v", after)
+	}
+	if out, err := run(work, "first key", "collaborate", "resume"); err == nil || !strings.Contains(out, "cd "+hostWork+" && kbtool collaborate resume -id "+id) {
+		t.Fatalf("resume elsewhere must print the one-liner: %v\n%s", err, out)
+	}
+	if out, err := run(work, "first key", "kbx", "rekey", "-new-key-env", "NEWKEY", sealedFiles[0]); err == nil || !strings.Contains(out, "share one key") {
+		t.Fatalf("a data dir file cannot be rekeyed alone: %v\n%s", err, out)
+	}
+	if out, err := run(work, "first key", "kbx", "rekey", "-new-key-env", "NEWKEY"); err != nil || !strings.Contains(out, "rekeyed 1 file") {
+		t.Fatalf("kbx rekey: %v\n%s", err, out)
+	}
+	if now := kbxFilesIn(t, hostDir); len(now) != 1 || now[0] == sealedFiles[0] || !randomKBXRe.MatchString(filepath.Base(now[0])) {
+		t.Fatalf("kbx rekey must rename the archive: before %v, after %v", sealedFiles, now)
+	}
+	out, err = run(hostWork, "second key", "collaborate", "resume")
+	if err != nil || !strings.Contains(out, "decrypted session") || !strings.Contains(out, "daemon started") {
+		t.Fatalf("resume after rekey: %v\n%s", err, out)
+	}
+	if len(kbxFilesIn(t, hostDir)) != 0 {
+		t.Fatal("resume must delete the decrypted archive")
+	}
+	if out, err := run(hostWork, "", "query", "Alpha"); err != nil || !strings.Contains(out, "a.go") {
+		t.Fatalf("the daemon must serve the kb.db re-encrypted under the new key: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "board", "signup", "-seed-file", filepath.Join(t.TempDir(), "agent.seed"), "lab-agent"); err == nil || !strings.Contains(out, "leave out -seed-file") {
+		t.Fatalf("in a session the seed lives in the session: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "board", "signup", "lab-agent"); err != nil || !strings.Contains(out, "seed stored in this session") {
+		t.Fatalf("board signup: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "board", "signup", "other-name"); err == nil || !strings.Contains(out, "already signed up as lab-agent") {
+		t.Fatalf("a valid signup refuses another one: %v\n%s", err, out)
+	}
+	writeTestPEM(t, hostWork, "decision.md", []byte("we go with plan B\n"))
+	out, err = run(hostWork, "", "steer", "-m", "Humans agreed: plan B. Read the attached decision.", "decision.md")
+	steerRe := regexp.MustCompile(`posted attachment system#(\d+) \(decision\.md\)\nposted steering message system#(\d+)`)
+	sm := steerRe.FindStringSubmatch(out)
+	if err != nil || sm == nil {
+		t.Fatalf("steer: %v\n%s", err, out)
+	}
+	attSeq, steerSeq := sm[1], sm[2]
+	if err := os.Remove(filepath.Join(hostDir, "system-seen.json")); err != nil {
+		t.Fatal(err)
+	}
+	notice := "notice: new steering message from the session host: system#" + steerSeq + "; read it with: kbtool board read system#" + steerSeq
+	if out, err := run(work, "", "board", "read", "welcome"); err != nil || !strings.Contains(out, notice) {
+		t.Fatalf("an agent's board command must print the steering notice on stderr: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "query", "Alpha"); err != nil || !strings.Contains(out, notice) {
+		t.Fatalf("the notice repeats on any daemon command until read: %v\n%s", err, out)
+	}
+	out, err = run(work, "", "board", "read", "system#"+steerSeq)
+	if err != nil || !strings.Contains(out, "Humans agreed: plan B") || !strings.Contains(out, "kbtool board fetch -o DIR system#"+attSeq) || strings.Contains(out, "notice:") {
+		t.Fatalf("reading the steering message: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "board", "fetch", "-o", "got", "system#"+attSeq); err != nil || strings.Contains(out, "notice:") || !strings.Contains(out, "memory/got/decision.md") {
+		t.Fatalf("fetching the steering attachment into memory (and no notice once read): %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "memory", "cat", "got/decision.md"); err != nil || !strings.Contains(out, "we go with plan B") {
+		t.Fatalf("the steering attachment must be in memory: %v\n%s", err, out)
+	}
+	if out, err := run(work, "", "board", "fetch", "-o", t.TempDir(), "system#"+attSeq); err == nil || !strings.Contains(out, "memory:") {
+		t.Fatalf("in a session board fetch extracts only into memory: %v\n%s", err, out)
+	}
+	if out, err := run(hostWork, "", "steer"); err == nil || !strings.Contains(out, "usage: kbtool steer") {
+		t.Fatalf("steer without a message: %v\n%s", err, out)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(mustReadFile(t, filepath.Join(hostDir, "daemon.pid")))))
+	if pid <= 0 {
+		t.Fatal("no daemon pid")
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	for deadline := time.Now().Add(10 * time.Second); pidAlive(pid) && time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+	}
+	for _, args := range [][]string{{"daemon", "start"}, {"collaborate", "resume"}, {"session", "ls"}} {
+		if out, err := run(hostWork, "second key", args...); err == nil || !strings.Contains(out, "unclean shutdown") || !strings.Contains(out, "kbtool session validate") {
+			t.Fatalf("%v after a crash must refuse with the warning: %v\n%s", args, err, out)
+		}
+	}
+	if daemonLog := filepath.Join(hostDir, "daemon.sock"); fileExists(daemonLog) && socketAlive(daemonLog) {
+		t.Fatal("daemon start must do nothing after a crash")
+	}
+	if out, err := run(work, "", "session", "validate"); err == nil || !strings.Contains(out, secretEnv) {
+		t.Fatalf("sealing needs the key: %v\n%s", err, out)
+	}
+	out, err = run(work, "second key", "session", "validate")
+	if err != nil || !strings.Contains(out, "sealed into") || !strings.Contains(out, "cd "+hostWork+" && kbtool collaborate resume -id "+id) {
+		t.Fatalf("validate must seal the crashed session and print the resume command: %v\n%s", err, out)
+	}
+	if dirExists(filepath.Join(hostDir, "sessions", id)) || len(kbxFilesIn(t, hostDir)) != 1 {
+		t.Fatal("validate must leave only the sealed archive")
+	}
+	if out, err := run(hostWork, "second key", "collaborate", "resume"); err != nil || !strings.Contains(out, "daemon started") {
+		t.Fatalf("resume after validate: %v\n%s", err, out)
+	}
+	if out, err := run(hostWork, "second key", "collaborate", "finish"); err != nil || len(kbxFilesIn(t, hostDir)) != 1 {
+		t.Fatalf("finish: %v\n%s", err, out)
+	}
+}
+
+// uncleanFixture is an active host session of an encrypted data dir left
+// plain with its state loose, as a killed daemon leaves it.
+func uncleanFixture(t *testing.T, key []byte) *sessionPointer {
+	t.Helper()
+	p, _ := encSessionFixture(t, key)
+	m, err := loadSessionMeta(p.Current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Role = "host"
+	if err := saveSessionMeta(m); err != nil {
+		t.Fatal(err)
+	}
+	st := &kbStore{path: filepath.Join(stateDir(), "kb.db")}
+	st.setKey(key)
+	if err := st.writeBundle(dbMarshal(&DB{Dim: 8}), boardMarshal(newBoard())); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, stateDir(), "daemon.pid", []byte("999999999\n"))
+	return p
+}
+
+// TestUncleanSessionValidateSeals: why — a daemon that died without sealing
+// leaves the active encrypted session plain. That state must be detected,
+// thoroughly validated (a failure leaves it untouched and says why), and on
+// success sealed at once, with the copy-paste resume command printed.
+func TestUncleanSessionValidateSeals(t *testing.T) {
+	key := []byte("unclean key")
+	p := uncleanFixture(t, key)
+	id := p.Current
+	if q, ok := uncleanSession(); !ok || q.Current != id {
+		t.Fatal("a plain active host session with no daemon is unclean")
+	}
+	if w := uncleanSessionWarning(id); !strings.Contains(w, "unclean shutdown") || !strings.Contains(w, "kbtool session validate") {
+		t.Fatalf("the warning must name the cause and the fix: %q", w)
+	}
+	writeTestPEM(t, stateDir(), "board.bin", []byte("plain board"))
+	writeTestPEM(t, sessionsDir(), "0123456789abcdef0123456789abcdef.kbx.tmp", []byte("half written"))
+	var out bytes.Buffer
+	if validateUnclean(&out, p, key, time.Now()) {
+		t.Fatalf("a plain board.bin must fail the check:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "board.bin is a plain message board") || !strings.Contains(out.String(), "failed") || !dirExists(sessionDir(id)) || len(kbxFilesIn(t, stateDir())) != 0 {
+		t.Fatalf("a failed check reports and leaves the session plain:\n%s", out.String())
+	}
+	if fileExists(filepath.Join(sessionsDir(), "0123456789abcdef0123456789abcdef.kbx.tmp")) || fileExists(pidPath("daemon")) {
+		t.Fatal("leftovers of interrupted work and stale pid files are removed")
+	}
+	if err := os.Remove(filepath.Join(stateDir(), "board.bin")); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if !validateUnclean(&out, p, key, time.Now()) {
+		t.Fatalf("a sound session must validate:\n%s", out.String())
+	}
+	sealed := sealedPath(t, id, key)
+	m, _ := readSessionHead(sealed, key)
+	want := "cd " + shellQuote(m.Meta.Workdir) + " && kbtool collaborate resume -id " + id
+	if !strings.Contains(out.String(), "sealed into "+sealed) || !strings.Contains(out.String(), want) {
+		t.Fatalf("success seals and prints the resume command %q:\n%s", want, out.String())
+	}
+	if dirExists(sessionDir(id)) || encryptedActive(t) {
+		t.Fatal("the session must be sealed and no longer active")
+	}
+	if _, ok := uncleanSession(); ok {
+		t.Fatal("after sealing nothing is unclean")
+	}
+}
+
+func encryptedActive(t *testing.T) bool {
+	t.Helper()
+	p, err := loadSessionPointer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p != nil && p.Active
+}
+
+// TestUncleanSessionWrongKeyAndSealedLeftover: why — a wrong key must fail
+// the check without sealing, and a finish that sealed the archive but died
+// before removing the plain directory is completed, not sealed twice.
+func TestUncleanSessionWrongKeyAndSealedLeftover(t *testing.T) {
+	key := []byte("the key")
+	p := uncleanFixture(t, key)
+	id := p.Current
+	var out bytes.Buffer
+	if validateUnclean(&out, p, []byte("not the key"), time.Now()) || !strings.Contains(out.String(), "does not open with "+secretEnv) {
+		t.Fatalf("a wrong key fails on kb.db:\n%s", out.String())
+	}
+	m, err := loadSessionMeta(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := moveStateInto(stateDir(), filepath.Join(sessionDir(id), "state"), nil); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := newSessionKBXPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sealSession(sessionDir(id), dest, key, nil, sessionHead{Meta: *m}, false, kbxKeys{}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if !validateUnclean(&out, p, key, time.Now()) || !strings.Contains(out.String(), "already sealed") {
+		t.Fatalf("an already sealed session only loses its leftover directory:\n%s", out.String())
+	}
+	if dirExists(sessionDir(id)) || sealedPath(t, id, key) != dest || encryptedActive(t) {
+		t.Fatal("the leftover directory is removed and the session finished")
+	}
+}
+
+// TestSealedSessionCatalog: why — a sealed session's identity is its
+// encrypted head, never its file name; the catalog decrypts each head once
+// (the daemon keeps one for its lifetime), and the daemon's socket method
+// serves the list only to a caller that proves it holds the key.
+func TestSealedSessionCatalog(t *testing.T) {
+	key := []byte("catalog key")
+	p, _ := encSessionFixture(t, key)
+	id := p.Current
+	if err := finishSessionNow(p, time.Now(), key, nil); err != nil {
+		t.Fatal(err)
+	}
+	orig := sealedPath(t, id, key)
+	renamed := filepath.Join(sessionsDir(), "anything.kbx")
+	if err := os.Rename(orig, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if a, err := findSessionArchive(id, key); err != nil || a == nil || a.path() != renamed {
+		t.Fatalf("the head, not the file name, identifies the session: %v %+v", err, a)
+	}
+	writeTestPEM(t, sessionsDir(), "garbage.kbx", []byte("not an archive"))
+	rows, err := listSessions(key)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("ls lists the session and the unreadable file: %v %+v", err, rows)
+	}
+	var bad, good bool
+	for _, r := range rows {
+		bad = bad || (r.ID == "?" && strings.Contains(r.Summary, "garbage.kbx"))
+		good = good || (r.ID == id && r.Role == "attendee")
+	}
+	if !bad || !good {
+		t.Fatalf("rows: %+v", rows)
+	}
+	if err := os.Remove(filepath.Join(sessionsDir(), "garbage.kbx")); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newSessionCatalog(key)
+	if as, err := c.archives(); err != nil || len(as) != 1 || as[0].Head == nil {
+		t.Fatalf("first load: %v %+v", err, as)
+	}
+	fi, _ := os.Stat(renamed)
+	b := mustReadFile(t, renamed)
+	if err := os.WriteFile(renamed, bytes.Repeat([]byte{0}, len(b)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(renamed, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if as, _ := c.archives(); len(as) != 1 || as[0].Head == nil || as[0].Head.Meta.ID != id {
+		t.Fatalf("an unchanged file (same size and time) must come from the cache: %+v", as)
+	}
+	if err := os.WriteFile(renamed, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	dup := filepath.Join(sessionsDir(), "copy.kbx")
+	writeTestPEM(t, sessionsDir(), "copy.kbx", b)
+	if _, err := findSessionArchive(id, key); err == nil || !strings.Contains(err.Error(), "sealed in 2 files") {
+		t.Fatalf("two files with one session's head must be refused: %v", err)
+	}
+	if err := os.Remove(dup); err != nil {
+		t.Fatal(err)
+	}
+
+	st := &kbStore{path: filepath.Join(stateDir(), "kb.db")}
+	st.setKey(key)
+	tb := &Toolbox{Store: st}
+	call := func(verifier string) rpcResult {
+		line := mustMarshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": methodSessions, "params": map[string]string{"verifier": verifier}})
+		var res rpcResult
+		if err := json.Unmarshal(handleHostMethod(line, bufio.NewReader(strings.NewReader("")), tb), &res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := call(hex.EncodeToString(sessionListVerifier([]byte("wrong")))); res.Error == nil || !strings.Contains(res.Error.Message, "does not match") {
+		t.Fatalf("a wrong key gets nothing: %+v", res)
+	}
+	res := call(hex.EncodeToString(sessionListVerifier(key)))
+	var out struct {
+		Sessions []sessionArchive `json:"sessions"`
+	}
+	if res.Error != nil || json.Unmarshal(res.Result, &out) != nil || len(out.Sessions) != 1 || out.Sessions[0].Head.Meta.ID != id || out.Sessions[0].File != "anything.kbx" {
+		t.Fatalf("the daemon serves its catalog: %+v %s", res.Error, res.Result)
+	}
+	if tb.sessionCat == nil {
+		t.Fatal("the daemon must keep the catalog loaded")
+	}
+	if bytes.Contains(res.Result, []byte("seed-value")) {
+		t.Fatal("the listing carries heads only, never the seed")
+	}
+}
+
+// ---------- 45. kbtool steer and system notices (plans/steer-and-system-notices-plan.md) ----------
+
+func steerTarGZ(t *testing.T, name, body string) []byte {
+	t.Helper()
+	data, _, err := attachPack([]tarGZMember{{Name: name, Data: []byte(body)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestSteerAttachmentsFirstMessageLast: why — agents find the steering
+// message through latest=system#N, so it must be the last system post, after
+// every attachment it names with the command that retrieves it; all posts
+// are signed by the system account and agents cannot post kind=steer.
+func TestSteerAttachmentsFirstMessageLast(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	if _, err := tb.steer("   ", nil); err == nil {
+		t.Fatal("an empty steering message must be refused")
+	}
+	res, err := tb.steer("Use plan B; see the attached notes.", []steerAttachment{
+		{Name: "plans/b.md", Data: steerTarGZ(t, "b.md", "plan B")},
+		{Name: "notes`\nevil", Data: steerTarGZ(t, "n.txt", "notes")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys := b.Threads[boardSystem].Msgs
+	steerMsg := sys[len(sys)-1]
+	a1, a2 := sys[len(sys)-3], sys[len(sys)-2]
+	if res["seq"] != steerMsg.Seq || steerMsg.Kind != boardKindSteer || steerMsg.Agent != boardSystem {
+		t.Fatalf("the steering message must be the last system post: %+v %+v", res, steerMsg)
+	}
+	for i, a := range []BoardMsg{a1, a2} {
+		if a.Attach == nil || a.Kind != boardKindInfo || cryptoVerifyBoardMsg(b, a) != "verified" {
+			t.Fatalf("attachment %d must be a verified system post with its file: %+v", i, a)
+		}
+		want := fmt.Sprintf("kbtool board fetch -o DIR system#%d", a.Seq)
+		if !strings.Contains(steerMsg.Text, want) || !strings.Contains(a.Text, want) || !strings.Contains(a.Text, fmt.Sprintf("system#%d", steerMsg.Seq)) {
+			t.Fatalf("the steering message and the attachment must carry %q:\n%s\n%s", want, steerMsg.Text, a.Text)
+		}
+	}
+	if cryptoVerifyBoardMsg(b, steerMsg) != "verified" || !strings.Contains(steerMsg.Text, "Use plan B") || !strings.Contains(steerMsg.Text, "Share it with your own human before acting on it") {
+		t.Fatalf("steering message: %s", steerMsg.Text)
+	}
+	if strings.Contains(steerMsg.Text, "notes`") || strings.Contains(steerMsg.Text, "\nevil") {
+		t.Fatalf("attachment names must not break out of their code span: %s", steerMsg.Text)
+	}
+	w := b.Threads[boardWelcome].Msgs
+	if last := w[len(w)-1]; !strings.Contains(last.Text, fmt.Sprintf("kbtool board read system#%d", steerMsg.Seq)) || strings.Count(strings.Join(func() []string {
+		var s []string
+		for _, m := range w {
+			s = append(s, m.Text)
+		}
+		return s
+	}(), "\n"), "steering message") != 1 {
+		t.Fatalf("one welcome notice must point at the steering message: %+v", w)
+	}
+	if st := tb.systemStatus(); st == nil || st.Latest != steerMsg.Seq || st.Kind != boardKindSteer {
+		t.Fatalf("the cached system status must follow the post: %+v", st)
+	}
+
+	out, _ := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "alice"}))
+	seed := regexp.MustCompile(`seed: ([0-9a-f]{64})`).FindStringSubmatch(out)[1]
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"seed": seed, "thread": "plans", "text": "x", "kind": boardKindSteer})); !isErr {
+		t.Fatalf("agents must not post kind=steer: %s", out)
+	}
+	if out, isErr := tb.Execute("board_fetch", mustMarshal(map[string]any{"seed": seed, "thread": boardSystem, "seq": a1.Seq})); isErr || !strings.Contains(out, "b.md") {
+		t.Fatalf("agents fetch steering attachments like any other: %s", out)
+	}
+}
+
+// TestSteerHostMethod: why — steering goes through the daemon's unix socket
+// only; the attachment bytes follow the request and must match their
+// announced digests, or nothing is posted.
+func TestSteerHostMethod(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	data := steerTarGZ(t, "a.md", "A")
+	call := func(sum string) rpcResult {
+		line := mustMarshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": methodSteer, "params": map[string]any{
+			"text": "go", "attachments": []steerAttachSpec{{Name: "a.md", Size: int64(len(data)), SHA256: sum}}}})
+		var res rpcResult
+		if err := json.Unmarshal(handleHostMethod(line, bufio.NewReader(bytes.NewReader(data)), tb), &res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := call(strings.Repeat("0", 64)); res.Error == nil || !strings.Contains(res.Error.Message, "checksum mismatch") {
+		t.Fatalf("a wrong digest must be refused: %+v", res)
+	}
+	if st := tb.systemStatus(); st != nil && st.Kind == boardKindSteer {
+		t.Fatal("nothing may be posted after a refused request")
+	}
+	if res := call(sha256Hex(data)); res.Error != nil {
+		t.Fatalf("steer over the socket: %+v", res.Error)
+	}
+	if st := tb.systemStatus(); st == nil || st.Kind != boardKindSteer {
+		t.Fatalf("status after steering: %+v", st)
+	}
+	var res rpcResult
+	_ = json.Unmarshal(handleLine(mustMarshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": methodSteer}), tb), &res)
+	if res.Error == nil {
+		t.Fatal("kbtool/steer must not exist outside the unix socket")
+	}
+}
+
+// TestSystemNoticeOnStderr: why — every tool result carries the system
+// status, and the CLI prints one notice per command while a newer system
+// message is unread here; reading it (board read's "showing A..B") stops
+// the notices, and a new board (another system key) starts over.
+func TestSystemNoticeOnStderr(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	if _, err := tb.steer("Pause all work.", nil); err != nil {
+		t.Fatal(err)
+	}
+	r, err := dispatch(tb, "tools/call", mustMarshal(map[string]any{"name": "board_threads", "arguments": map[string]any{}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := mustMarshal(r)
+	if !bytes.Contains(raw, []byte(`"kbtool/system"`)) {
+		t.Fatalf("tool results must carry _meta kbtool/system: %s", raw)
+	}
+	defer func() { lastSystem, systemNoticeDone, quietSystem = nil, false, false }()
+	lastSystem, systemNoticeDone = nil, false
+	noteSystemMeta(raw)
+	st := lastSystem
+	if st == nil || st.Kind != boardKindSteer {
+		t.Fatalf("the client must read the status: %+v", st)
+	}
+	var buf bytes.Buffer
+	systemNoticeDone = false
+	systemNotice(&buf, st)
+	want := fmt.Sprintf("notice: new steering message from the session host: system#%d", st.Latest)
+	if !strings.Contains(buf.String(), want) || !strings.Contains(buf.String(), fmt.Sprintf("kbtool board read system#%d", st.Latest)) {
+		t.Fatalf("notice: %q", buf.String())
+	}
+	buf.Reset()
+	systemNotice(&buf, st)
+	if buf.Len() != 0 {
+		t.Fatal("at most one notice per command")
+	}
+	markSystemRead(fmt.Sprintf("thread %q — %d message(s), showing %d..%d\n\n", boardSystem, st.Latest+1, st.Latest, st.Latest))
+	systemNoticeDone = false
+	systemNotice(&buf, st)
+	if buf.Len() != 0 {
+		t.Fatalf("a read message must not be noticed again: %q", buf.String())
+	}
+	systemNoticeDone = false
+	systemNotice(&buf, &sysStatus{Latest: st.Latest + 2, Kind: boardKindInfo, Pub: st.Pub})
+	if !strings.Contains(buf.String(), "new system message") || !strings.Contains(buf.String(), "(2 unread system messages)") {
+		t.Fatalf("a newer plain system message: %q", buf.String())
+	}
+	buf.Reset()
+	systemNoticeDone = false
+	systemNotice(&buf, &sysStatus{Latest: 0, Kind: boardKindInfo, Pub: "another board"})
+	if !strings.Contains(buf.String(), "system#0") {
+		t.Fatalf("another board's system key starts over: %q", buf.String())
+	}
+}
+
+// ---------- 46. session files through kbtool: memory, consensus, deliverables (plans/memory-consensus-deliverables-plan.md) ----------
+
+// Why: every path an agent passes must stay inside its directory; `..` is
+// refused outright (not cleaned away) so a typo can never reach kbtool state.
+func TestSanitizeRel(t *testing.T) {
+	ok := map[string]string{
+		".": ".", "./": ".", "": ".", "a": "a", "./a/b": "a/b", "a//b/": "a/b",
+		`a\b`: "a/b", "a/./b": "a/b", "x..y": "x..y", "a/~b": "a/~b",
+	}
+	for in, want := range ok {
+		got, err := sanitizeRel(in)
+		if err != nil || got != want {
+			t.Errorf("sanitizeRel(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"..", "../x", "a/../b", "./../../etc", `a\..\b`, "/etc/passwd", `\x`,
+		"C:/x", `c:\x`, "C:x", "//host/share", "~", "~/x", "~root", "a\x00b", "a\nb"} {
+		if got, err := sanitizeRel(in); err == nil {
+			t.Errorf("sanitizeRel(%q) = %q; want an error", in, got)
+		}
+	}
+}
+
+// Why: a symlink planted inside memory/ must not lead outside it.
+func TestSandboxPathRefusesSymlinks(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	os.WriteFile(filepath.Join(outside, "secret"), []byte("s"), 0600)
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Skip("symlinks unsupported:", err)
+	}
+	for _, p := range []string{"link", "link/secret", "link/new"} {
+		if _, _, err := sandboxPath(root, p); err == nil || !strings.Contains(err.Error(), "symbolic") {
+			t.Fatalf("sandboxPath(%q) must refuse the symlink: %v", p, err)
+		}
+	}
+	full, rel, err := sandboxPath(root, "./new/dir/f.md")
+	if err != nil || rel != "new/dir/f.md" || full != filepath.Join(root, "new", "dir", "f.md") {
+		t.Fatalf("a path that does not exist yet resolves inside root: %q %q %v", full, rel, err)
+	}
+	ft := &fileTools{name: "memory", root: root, writable: true, out: io.Discard, err: io.Discard}
+	var buf bytes.Buffer
+	ft.out = &buf
+	if err := ft.find(nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "secret") {
+		t.Fatalf("find must not follow symlinks: %q", buf.String())
+	}
+}
+
+// memSession creates an active session in a fresh data dir and returns its directory.
+func memSession(t *testing.T) string {
+	t.Helper()
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	t.Setenv(secretEnv, "")
+	m, err := createSession("host", t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSessionPointer(&sessionPointer{Current: m.ID, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	return sessionDir(m.ID)
+}
+
+func runFT(t *testing.T, name string, writable bool, in string, cmd string, args ...string) (string, error) {
+	t.Helper()
+	root, err := sessionSubdir(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	ft := &fileTools{name: name, root: root, writable: writable, out: &out, err: &errb}
+	sdir, _ := activeSessionDir()
+	ok, err := runFileTool(ft, cmd, args, sdir, strings.NewReader(in))
+	if !ok {
+		t.Fatalf("%s is not a %s command", cmd, name)
+	}
+	return out.String(), err
+}
+
+// Why: agents organize their memory only through these commands, so each
+// must work like its familiar counterpart and stay inside memory/.
+func TestMemoryCommands(t *testing.T) {
+	dir := memSession(t)
+	if _, err := os.Stat(filepath.Join(dir, "scratch")); err == nil {
+		t.Fatal("sessions no longer have scratch/")
+	}
+	must := func(out string, err error) string {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	must(runFT(t, "memory", true, "one\ntwo\nthree\nTwo again\n", "write", "notes/plan.md"))
+	must(runFT(t, "memory", true, "four\n", "write", "-append", "notes/plan.md"))
+	must(runFT(t, "memory", true, "x", "write", ".hidden"))
+	if got := must(runFT(t, "memory", true, "", "cat", "notes/plan.md")); got != "one\ntwo\nthree\nTwo again\nfour\n" {
+		t.Fatalf("cat: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "head", "-n", "2", "notes/plan.md")); got != "one\ntwo\n" {
+		t.Fatalf("head: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "tail", "-n", "1", "notes/plan.md")); got != "four\n" {
+		t.Fatalf("tail: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "wc", "-l", "notes/plan.md")); !strings.Contains(got, "5 memory/notes/plan.md") {
+		t.Fatalf("wc: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "ls")); got != "memory/notes/\n" {
+		t.Fatalf("ls hides dotfiles: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "ls", "-a", "-R")); !strings.Contains(got, "memory/.hidden") || !strings.Contains(got, "memory/notes/plan.md") {
+		t.Fatalf("ls -a -R: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "grep", "-i", "-n", "two")); got != "memory/notes/plan.md:2:two\nmemory/notes/plan.md:4:Two again\n" {
+		t.Fatalf("grep: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "grep", "-c", "-F", "o")); got != "memory/notes/plan.md:4\n" {
+		t.Fatalf("grep -c -F: %q", got)
+	}
+	if _, err := runFT(t, "memory", true, "", "grep", "nomatch"); err != errNoMatch {
+		t.Fatalf("grep without a match: %v", err)
+	}
+	must(runFT(t, "memory", true, "", "mkdir", "-p", "a/b"))
+	must(runFT(t, "memory", true, "", "mv", "notes/plan.md", "a/b"))
+	if got := must(runFT(t, "memory", true, "", "find", "-name", "*.md")); got != "memory/a/b/plan.md\n" {
+		t.Fatalf("find -name after mv: %q", got)
+	}
+	if got := must(runFT(t, "memory", true, "", "find", ".", "-type", "d", "-maxdepth", "1")); got != "memory/\nmemory/a\nmemory/notes\n" {
+		t.Fatalf("find -type d -maxdepth 1: %q", got)
+	}
+	if _, err := runFT(t, "memory", true, "", "mv", "a", "a/b"); err == nil {
+		t.Fatal("moving a directory into itself must fail")
+	}
+	if _, err := runFT(t, "memory", true, "", "rm", "a"); err == nil || !strings.Contains(err.Error(), "-r") {
+		t.Fatalf("rm of a directory needs -r: %v", err)
+	}
+	must(runFT(t, "memory", true, "", "rm", "-r", "a"))
+	if _, err := runFT(t, "memory", true, "", "rm", "-r", "."); err == nil {
+		t.Fatal("memory/ itself cannot be removed")
+	}
+	for _, bad := range [][]string{{"cat", "../about.json"}, {"cat", "/etc/passwd"}, {"ls", "../state"}, {"rm", "-r", "../consensus"}, {"mv", ".hidden", "../x"}} {
+		if _, err := runFT(t, "memory", true, "", bad[0], bad[1:]...); err == nil {
+			t.Fatalf("%v must be refused", bad)
+		}
+	}
+	if _, err := runFT(t, "memory", true, "", "write", "../about.json"); err == nil {
+		t.Fatal("write outside memory must be refused")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "about.json")); !strings.Contains(string(b), "participants") {
+		t.Fatalf("about.json must be untouched: %q", b)
+	}
+
+	// import from the working directory
+	work := t.TempDir()
+	old, _ := os.Getwd()
+	os.Chdir(work)
+	t.Cleanup(func() { os.Chdir(old) })
+	os.MkdirAll(filepath.Join(work, "plans", ".git"), 0700)
+	os.WriteFile(filepath.Join(work, "plans", "p.md"), []byte("P"), 0600)
+	os.WriteFile(filepath.Join(work, "plans", ".git", "HEAD"), []byte("ref"), 0600)
+	os.WriteFile(filepath.Join(work, "plans", ".kbtool-seed"), []byte("seed"), 0600)
+	must(runFT(t, "memory", true, "", "import", "plans"))
+	if b, err := os.ReadFile(filepath.Join(dir, "memory", "plans", "p.md")); err != nil || string(b) != "P" {
+		t.Fatalf("import copies the directory: %q %v", b, err)
+	}
+	for _, skip := range []string{"plans/.git/HEAD", "plans/.kbtool-seed"} {
+		if _, err := os.Stat(filepath.Join(dir, "memory", filepath.FromSlash(skip))); err == nil {
+			t.Fatalf("import must skip %s", skip)
+		}
+	}
+	for _, bad := range []string{"..", "../x", "/etc", "."} {
+		if _, err := runFT(t, "memory", true, "", "import", bad); err == nil {
+			t.Fatalf("import %q must be refused", bad)
+		}
+	}
+}
+
+// Why: consensus/ and deliverables/ change only by vote; their commands read.
+func TestSharedDirsReadOnly(t *testing.T) {
+	dir := memSession(t)
+	os.WriteFile(filepath.Join(dir, "deliverables", "01.md"), []byte("ticket\n"), 0600)
+	os.MkdirAll(filepath.Join(dir, "deliverables", "sub"), 0700)
+	os.WriteFile(filepath.Join(dir, "deliverables", "sub", "02.md"), []byte("two\n"), 0600)
+	if got, err := runFT(t, "deliverables", false, "", "cat", "01.md"); err != nil || got != "ticket\n" {
+		t.Fatalf("cat: %q %v", got, err)
+	}
+	for _, cmd := range []string{"import", "mkdir", "mv", "rm"} {
+		_, err := runFT(t, "deliverables", false, "", cmd, "x")
+		if err == nil || !strings.Contains(err.Error(), "read-only") {
+			t.Fatalf("deliverables %s must be refused: %v", cmd, err)
+		}
+	}
+	root, _ := sessionSubdir("consensus")
+	ok, err := runFileTool(&fileTools{name: "consensus", root: root, out: io.Discard, err: io.Discard}, "write", []string{"x"}, dir, strings.NewReader(""))
+	if !ok || err == nil || !strings.Contains(err.Error(), "consensus propose") {
+		t.Fatalf("consensus write must point at consensus propose: %v", err)
+	}
+	got, err := runFT(t, "deliverables", false, "", "checksum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ := dirChecksumList(dir, "deliverables")
+	want := sha256Hex([]byte("ticket\n")) + "  deliverables/01.md\n" + sha256Hex([]byte("two\n")) + "  deliverables/sub/02.md\n"
+	if list != want {
+		t.Fatalf("checksum list (shasum format, session-relative, sorted):\n%s\nwant\n%s", list, want)
+	}
+	if !strings.HasSuffix(got, "unified "+sha256Hex([]byte(want))+"  deliverables/\n") {
+		t.Fatalf("unified checksum is the sha256 of the list: %q", got)
+	}
+	u, err := writeDirChecksum(dir, "deliverables")
+	if b, _ := os.ReadFile(filepath.Join(dir, "deliverables.sha256")); err != nil || string(b) != want || u != sha256Hex([]byte(want)) {
+		t.Fatalf("deliverables.sha256 lives in the session dir: %q %v", b, err)
+	}
+	if l, _ := dirChecksumList(dir, "consensus"); l != "" {
+		t.Fatalf("an empty directory has an empty list: %q", l)
+	}
+}
+
+func tarNames(t *testing.T, data []byte) map[string]string {
+	t.Helper()
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(zr)
+	got := map[string]string{}
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return got
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(tr)
+		got[h.Name] = string(b)
+	}
+}
+
+// Why: memory (and the shared dirs) can be exported from the active session,
+// a finished plain session and a sealed one, streamed without temp files.
+func TestSessionDirExport(t *testing.T) {
+	dir := memSession(t)
+	id := filepath.Base(dir)
+	os.MkdirAll(filepath.Join(dir, "memory", "n"), 0700)
+	os.WriteFile(filepath.Join(dir, "memory", "n", "a.md"), []byte("A"), 0600)
+	os.WriteFile(filepath.Join(dir, "consensus", "c.md"), []byte("C"), 0600)
+	os.MkdirAll(filepath.Join(dir, "state"), 0700)
+	os.WriteFile(filepath.Join(dir, "state", "x"), []byte("state"), 0600)
+
+	var buf bytes.Buffer
+	if n, err := exportSessionDir(&buf, "memory", "", nil); err != nil || n != 1 {
+		t.Fatalf("active export: %d %v", n, err)
+	}
+	if got := tarNames(t, buf.Bytes()); got["memory/n/a.md"] != "A" || len(got) != 3 {
+		t.Fatalf("active memory export: %v", got)
+	}
+	buf.Reset()
+	if _, err := exportSessionDir(&buf, "consensus", id, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := tarNames(t, buf.Bytes()); got["consensus/c.md"] != "C" {
+		t.Fatalf("plain finished-session export: %v", got)
+	}
+
+	// seal it, then slice memory/ out of the encrypted archive
+	key := []byte("export-secret")
+	m, err := loadSessionMeta(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveSessionPointer(&sessionPointer{Current: id})
+	if _, err := sealSessionDir(id, m, key, make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatal("sealing removes the directory")
+	}
+	if _, err := exportSessionDir(&buf, "memory", id, nil); err == nil || !strings.Contains(err.Error(), secretEnv) {
+		t.Fatalf("a sealed session needs %s: %v", secretEnv, err)
+	}
+	buf.Reset()
+	if n, err := exportSessionDir(&buf, "memory", id, key); err != nil || n != 1 {
+		t.Fatalf("sealed export: %d %v", n, err)
+	}
+	got := tarNames(t, buf.Bytes())
+	if got["memory/n/a.md"] != "A" {
+		t.Fatalf("sealed memory export: %v", got)
+	}
+	for name := range got {
+		if !strings.HasPrefix(name, "memory/") {
+			t.Fatalf("the slice holds only memory/: %s", name)
+		}
+	}
+	if _, err := exportSessionDir(&buf, "memory", id, []byte("wrong")); err == nil {
+		t.Fatal("a wrong key must fail")
+	}
+	if _, err := exportSessionDir(&buf, "memory", "../x", key); err == nil {
+		t.Fatal("a bad session ID must fail")
+	}
+	if ents, _ := os.ReadDir(sessionsDir()); len(ents) != 1 {
+		t.Fatalf("export leaves no files behind: %v", ents)
+	}
+}
+
+// Why: agents set the session summary and participants without editing
+// about.json by path.
+func TestSessionAboutCommand(t *testing.T) {
+	dir := memSession(t)
+	var out bytes.Buffer
+	if err := sessionAboutCmd(&out, nil); err != nil || !strings.Contains(out.String(), "to fix:") {
+		t.Fatalf("an unfilled about lists what to fix: %q %v", out.String(), err)
+	}
+	out.Reset()
+	if err := sessionAboutCmd(&out, []string{"-summary", "  branch   protection migration ", "-participant", "Sam", "-participant", "Josh", "-participant", "sam"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "to fix:") || !strings.Contains(out.String(), "participants: Sam, Josh") {
+		t.Fatalf("about: %q", out.String())
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "about.json"))
+	if a, probs := validateAbout(b); len(probs) != 0 || a.Summary != "branch protection migration" {
+		t.Fatalf("about.json: %s %v", b, probs)
+	}
+}
+
+// ---------- 47. consensus voting (plans/memory-consensus-deliverables-plan.md) ----------
+
+var consSeedRe = regexp.MustCompile(`seed: ([0-9a-f]{64})`)
+
+func consSignup(t *testing.T, tb *Toolbox, name string, local bool) string {
+	t.Helper()
+	args := mustMarshal(map[string]any{"name": name})
+	var out string
+	var isErr bool
+	if local {
+		line := mustMarshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+			"params": map[string]any{"name": "board_signup", "arguments": json.RawMessage(args)}})
+		resp := handleLineFrom(line, tb, true)
+		var r struct {
+			Result struct {
+				Content []struct{ Text string } `json:"content"`
+				IsError bool                    `json:"isError"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(resp, &r); err != nil || len(r.Result.Content) == 0 {
+			t.Fatalf("local signup: %s", resp)
+		}
+		out, isErr = r.Result.Content[0].Text, r.Result.IsError
+	} else {
+		out, isErr = tb.Execute("board_signup", args)
+	}
+	m := consSeedRe.FindStringSubmatch(out)
+	if isErr || m == nil {
+		t.Fatalf("signup %s: %s", name, out)
+	}
+	if strings.Contains(out, "session host's agent") != local {
+		t.Fatalf("only a signup over the unix socket is the host's agent (local=%v): %s", local, out)
+	}
+	return m[1]
+}
+
+func consTGZ(t *testing.T, files map[string]string) string {
+	t.Helper()
+	var ms []tarGZMember
+	for k, v := range files {
+		ms = append(ms, tarGZMember{Name: k, Data: []byte(v)})
+	}
+	var buf bytes.Buffer
+	if err := tarGZWrite(&buf, ms); err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func consCall(t *testing.T, tb *Toolbox, local bool, name string, args map[string]any) (string, bool) {
+	t.Helper()
+	if local {
+		return tb.ExecuteLocal(name, mustMarshal(args))
+	}
+	return tb.Execute(name, mustMarshal(args))
+}
+
+func consBoard(t *testing.T, tb *Toolbox) *Board {
+	t.Helper()
+	b, err := tb.store().loadBoard(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// consAge makes agents look offline (last seen long ago).
+func consAge(t *testing.T, tb *Toolbox, names ...string) {
+	t.Helper()
+	st := tb.store()
+	b := consBoard(t, tb)
+	for _, n := range names {
+		b.Agents[n].LastSeen -= 3600
+	}
+	if err := st.saveBoard(b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Why: the host's agent is recognized only through the daemon's unix socket,
+// may accept alone only with -host-accepted, and gets "talk to your human" otherwise.
+func TestConsensusHostAgent(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	host := consSignup(t, tb, "alice", true)
+	if b := consBoard(t, tb); b.Cons.HostAgent != "alice" {
+		t.Fatalf("host agent: %q", b.Cons.HostAgent)
+	}
+	files := consTGZ(t, map[string]string{"consensus/goals.md": "goals\n", "deliverables/01.md": "t1\n"})
+	out, isErr := consCall(t, tb, true, "board_propose", map[string]any{"seed": host, "text": "first goals", "attachment": files})
+	if !isErr || !strings.Contains(out, "talk to your human") {
+		t.Fatalf("the host's agent alone must be told to talk to its human: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_propose", map[string]any{"seed": host, "text": "x", "attachment": files, "host_accepted": true}); !isErr || !strings.Contains(out, "host's own kbtool") {
+		t.Fatalf("-host-accepted must arrive over the unix socket: %s", out)
+	}
+	out, isErr = consCall(t, tb, true, "board_propose", map[string]any{"seed": host, "text": "first goals", "attachment": files, "host_accepted": true})
+	if isErr || !strings.Contains(out, "accepted") {
+		t.Fatalf("host-accepted proposal: %s", out)
+	}
+	b := consBoard(t, tb)
+	if p := b.Cons.proposal(1); p == nil || p.State != propAccepted || !p.HostAccepted {
+		t.Fatalf("proposal 1: %+v", p)
+	}
+	if b.Cons.Files["consensus/goals.md"].SHA256 != sha256Hex([]byte("goals\n")) {
+		t.Fatalf("accepted tree: %+v", b.Cons.Files)
+	}
+	msgs := b.Threads[boardConsThread].Msgs
+	if len(msgs) != 2 || msgs[0].Kind != boardKindProposal || msgs[0].Agent != "alice" || msgs[1].Agent != boardSystem || msgs[1].Kind != boardKindOutcome {
+		t.Fatalf("consensus thread: proposal by alice then outcome by system: %+v", msgs)
+	}
+	for _, m := range msgs {
+		if cryptoVerifyBoardMsg(b, m) != "verified" {
+			t.Fatalf("message %d does not verify", m.Seq)
+		}
+	}
+
+	// a second agent signing up remotely is not the host's agent
+	bob := consSignup(t, tb, "bob", false)
+	if b := consBoard(t, tb); b.Cons.HostAgent != "alice" {
+		t.Fatalf("a remote signup must not take over: %q", b.Cons.HostAgent)
+	}
+	if out, isErr := consCall(t, tb, true, "board_propose", map[string]any{"seed": bob, "text": "x", "attachment": files, "host_accepted": true}); !isErr {
+		t.Fatalf("-host-accepted is for the host's agent only: %s", out)
+	}
+	// with alice offline, bob's proposal needs alice (the host's agent)
+	consAge(t, tb, "alice")
+	out, isErr = consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "more", "attachment": consTGZ(t, map[string]string{"deliverables/02.md": "t2\n"})})
+	if isErr || !strings.Contains(out, "waiting for: alice\n") {
+		t.Fatalf("with nobody else active the host's agent must vote: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_vote", map[string]any{"seed": host, "n": 2, "vote": "yes"}); isErr || !strings.Contains(out, "accepted") {
+		t.Fatalf("host's yes accepts: %s", out)
+	}
+}
+
+// Why: every other active agent must vote yes; one no with a reason rejects
+// at once; a no needs a reason; the proposer cannot vote.
+func TestConsensusVoting(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := consSignup(t, tb, "alice", true)
+	bob := consSignup(t, tb, "bob", false)
+	carol := consSignup(t, tb, "carol", false)
+	_ = alice
+	files := consTGZ(t, map[string]string{"consensus/goals.md": "goals\n"})
+	out, isErr := consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "goals", "attachment": files})
+	if isErr || !strings.Contains(out, "waiting for: alice, carol") {
+		t.Fatalf("propose: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_vote", map[string]any{"seed": bob, "n": 1, "vote": "yes"}); !isErr || !strings.Contains(out, "counts as your yes") {
+		t.Fatalf("the proposer cannot vote: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_vote", map[string]any{"seed": carol, "n": 1, "vote": "no"}); !isErr || !strings.Contains(out, "needs a reason") {
+		t.Fatalf("a no needs a reason: %s", out)
+	}
+	out, _ = consCall(t, tb, false, "board_vote", map[string]any{"seed": carol, "n": 1, "vote": "yes"})
+	if !strings.Contains(out, "waiting for: alice") {
+		t.Fatalf("still waiting for alice: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_vote", map[string]any{"seed": carol, "n": 1, "vote": "yes"}); !isErr || !strings.Contains(out, "already voted") {
+		t.Fatalf("one vote each: %s", out)
+	}
+	out, _ = consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 1, "vote": "yes"})
+	if !strings.Contains(out, "accepted") {
+		t.Fatalf("all yes accepts: %s", out)
+	}
+	b := consBoard(t, tb)
+	want := sha256Hex([]byte("goals\n")) + "  consensus/goals.md\n"
+	if consList(b, sessConsensus) != want || consUnified(b, sessConsensus) != unifiedChecksum(want) {
+		t.Fatalf("accepted list: %q", consList(b, sessConsensus))
+	}
+	if consList(b, sessDeliverables) != "" {
+		t.Fatalf("deliverables untouched: %q", consList(b, sessDeliverables))
+	}
+
+	// a no with a reason rejects at once
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": carol, "text": "rewrite", "attachment": consTGZ(t, map[string]string{"consensus/goals.md": "other\n"})})
+	out, _ = consCall(t, tb, false, "board_vote", map[string]any{"seed": bob, "n": 2, "vote": "no", "reason": "loses the goals"})
+	if !strings.Contains(out, "rejected") {
+		t.Fatalf("no rejects: %s", out)
+	}
+	if out, isErr := consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 2, "vote": "yes"}); !isErr || !strings.Contains(out, "already rejected") {
+		t.Fatalf("a closed proposal takes no votes: %s", out)
+	}
+	if b := consBoard(t, tb); b.Cons.Files["consensus/goals.md"].SHA256 != sha256Hex([]byte("goals\n")) {
+		t.Fatal("a rejected proposal changes nothing")
+	}
+
+	// stale: two proposals on the same file; accepting one closes the other
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "v2", "attachment": consTGZ(t, map[string]string{"consensus/goals.md": "v2\n"})})
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": carol, "text": "v3", "attachment": consTGZ(t, map[string]string{"consensus/goals.md": "v3\n"})})
+	consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 3, "vote": "yes"})
+	consCall(t, tb, false, "board_vote", map[string]any{"seed": carol, "n": 3, "vote": "yes"})
+	b = consBoard(t, tb)
+	if b.Cons.proposal(3).State != propAccepted || b.Cons.proposal(4).State != propStale || !strings.Contains(b.Cons.proposal(4).Reason, "proposal 3") {
+		t.Fatalf("stale handling: %+v %+v", b.Cons.proposal(3), b.Cons.proposal(4))
+	}
+
+	// unchanged files and empty proposals
+	if out, isErr := consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "same", "attachment": consTGZ(t, map[string]string{"consensus/goals.md": "v2\n"})}); !isErr || !strings.Contains(out, "nothing would change") {
+		t.Fatalf("an unchanged file is not a proposal: %s", out)
+	}
+	for _, bad := range []map[string]string{{"memory/x.md": "x"}, {"goals.md": "x"}} {
+		if out, isErr := consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "bad", "attachment": consTGZ(t, bad)}); !isErr || !strings.Contains(out, "consensus/ or deliverables/") {
+			t.Fatalf("files outside the shared dirs are refused: %s", out)
+		}
+	}
+	// delete
+	if out, isErr := consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "drop", "delete": []string{"deliverables/none"}}); !isErr || !strings.Contains(out, "nothing accepted") {
+		t.Fatalf("deleting nothing: %s", out)
+	}
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "drop goals", "delete": []string{"consensus"}})
+	consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 5, "vote": "yes"})
+	consCall(t, tb, false, "board_vote", map[string]any{"seed": carol, "n": 5, "vote": "yes"})
+	if b := consBoard(t, tb); len(b.Cons.Files) != 0 || b.Cons.proposal(5).State != propAccepted {
+		t.Fatalf("delete of a directory: %+v", b.Cons.Files)
+	}
+}
+
+// Why: an agent holding a vote stays ACTIVE (and required); agents only
+// write the consensus thread through the consensus tools.
+func TestConsensusActivityAndThread(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := consSignup(t, tb, "alice", true)
+	bob := consSignup(t, tb, "bob", false)
+	consSignup(t, tb, "carol", false)
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "goals", "attachment": consTGZ(t, map[string]string{"consensus/goals.md": "g\n"})})
+	consAge(t, tb, "bob", "carol")
+	b := consBoard(t, tb)
+	now := time.Now().Unix()
+	if !boardAgentActive(b, b.Agents["bob"], now) || boardAgentActive(b, b.Agents["carol"], now) {
+		t.Fatal("bob holds a vote (his proposal) and stays ACTIVE; carol does not")
+	}
+	if r := boardRoster(b, now); !regexp.MustCompile(`ACTIVE +bob`).MatchString(r) {
+		t.Fatalf("roster shows bob ACTIVE: %s", r)
+	}
+	// carol went offline: alice's yes is enough now
+	out, _ := consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 1, "vote": "yes"})
+	if !strings.Contains(out, "accepted") {
+		t.Fatalf("live required voters: %s", out)
+	}
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"seed": alice, "thread": "consensus", "text": "hi"})); !isErr || !strings.Contains(out, "kbtool consensus") {
+		t.Fatalf("board_post to consensus is refused: %s", out)
+	}
+	if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"seed": alice, "thread": "plans", "text": "hi", "kind": "proposal"})); !isErr {
+		t.Fatalf("kind proposal is not a board_post kind: %s", out)
+	}
+}
+
+// Why: the accepted tree survives a save/load and is served as a tar.gz built
+// from the proposal attachments, matching what the client checksums.
+func TestConsensusSyncAndPersistence(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := consSignup(t, tb, "alice", true)
+	files := map[string]string{"consensus/goals.md": "g\n", "deliverables/a/01.md": "one\n", "deliverables/02.md": "two\n"}
+	consCall(t, tb, true, "board_propose", map[string]any{"seed": alice, "text": "start", "attachment": consTGZ(t, files), "host_accepted": true})
+	consCall(t, tb, true, "board_propose", map[string]any{"seed": alice, "text": "edit", "attachment": consTGZ(t, map[string]string{"deliverables/02.md": "TWO\n"}), "host_accepted": true})
+	b := consBoard(t, tb)
+	c, err := readBoard(bytes.NewReader(boardMarshal(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.Cons, b.Cons) || c.SystemSeed == nil {
+		t.Fatalf("consensus trailer round trip:\n%+v\n%+v", c.Cons, b.Cons)
+	}
+	out, isErr := consCall(t, tb, false, "board_consensus", map[string]any{"seed": alice, "sync": "deliverables",
+		"have": map[string]string{"deliverables": strings.Repeat("a", 64)}})
+	if isErr {
+		t.Fatal(out)
+	}
+	data, err := attachUnarmor(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := tarGZAllMem(data)
+	want := map[string][]byte{"deliverables/a/01.md": []byte("one\n"), "deliverables/02.md": []byte("TWO\n")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sync tar.gz: %q", got)
+	}
+	sdir := t.TempDir()
+	for k, v := range got {
+		os.MkdirAll(filepath.Join(sdir, filepath.Dir(k)), 0700)
+		os.WriteFile(filepath.Join(sdir, k), v, 0600)
+	}
+	if l, _ := dirChecksumList(sdir, sessDeliverables); unifiedChecksum(l) != consUnified(consBoard(t, tb), sessDeliverables) {
+		t.Fatal("client and server unified checksums must agree")
+	}
+	if !strings.Contains(out, "unified checksum "+consUnified(consBoard(t, tb), sessDeliverables)) {
+		t.Fatalf("status names the unified checksums: %s", out)
+	}
+	if k := consBoard(t, tb).Cons.Known["alice"]; k["deliverables"] != strings.Repeat("a", 64) {
+		t.Fatalf("reported checksums are recorded: %v", k)
+	}
+	if _, err := readBoard(bytes.NewReader(append(boardMarshal(b), []byte("\x04\x00\x00\x00XXXX")...))); err == nil {
+		t.Fatal("an unknown trailer is corruption")
+	}
+}
+
+// Why: review -diff shows what a proposal changes in a familiar form.
+func TestWriteLineDiff(t *testing.T) {
+	var buf bytes.Buffer
+	writeLineDiff(&buf, "consensus/g.md", "a\nb\nc\nd\ne\nf\ng\n", "a\nb\nc\nD\ne\nf\ng\n")
+	want := "=== consensus/g.md\n@@\n  b\n  c\n- d\n+ D\n  e\n  f\n"
+	if buf.String() != want {
+		t.Fatalf("diff:\n%s\nwant:\n%s", buf.String(), want)
+	}
+	buf.Reset()
+	writeLineDiff(&buf, "x", "", "1\n2\n")
+	if !strings.HasPrefix(buf.String(), "=== x: new file, 2 line(s)\n+ 1\n+ 2\n") {
+		t.Fatalf("new file: %q", buf.String())
+	}
+}
+
+// Why: propose packs memory files under their consensus/ or deliverables/
+// names; sources stay inside memory and dotfiles are left out.
+func TestConsensusMembers(t *testing.T) {
+	mem := t.TempDir()
+	os.MkdirAll(filepath.Join(mem, "tickets", ".backup"), 0700)
+	os.WriteFile(filepath.Join(mem, "tickets", "01.md"), []byte("1"), 0600)
+	os.WriteFile(filepath.Join(mem, "tickets", ".hidden"), []byte("h"), 0600)
+	os.WriteFile(filepath.Join(mem, "tickets", ".backup", "old.md"), []byte("o"), 0600)
+	os.WriteFile(filepath.Join(mem, "goals.md"), []byte("g"), 0600)
+	ms, err := consensusMembers(mem, []string{"tickets=deliverables", "goals.md=consensus/goals.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range ms {
+		names = append(names, m.Name)
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "consensus/goals.md,deliverables/01.md" {
+		t.Fatalf("members: %v", names)
+	}
+	for _, bad := range []string{"goals.md", "../x=consensus/x", "goals.md=memory/x", "goals.md=consensus", "goals.md=consensus/../x", "/etc/passwd=consensus/p"} {
+		if _, err := consensusMembers(mem, []string{bad}); err == nil {
+			t.Fatalf("%q must be refused", bad)
+		}
+	}
+	if _, err := consensusMembers(mem, []string{"goals.md=consensus/g", "goals.md=consensus/g"}); err == nil {
+		t.Fatal("a destination given twice is refused")
+	}
+}
+
+// Why: every tool result tells the client the accepted checksums, and the
+// client brings its copy up to date in the background, keeping what it
+// replaces, then reports the checksums it now has.
+func TestConsensusBackgroundSync(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := consSignup(t, tb, "alice", true)
+	bob := consSignup(t, tb, "bob", false)
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "start",
+		"attachment": consTGZ(t, map[string]string{"consensus/goals.md": "goals\n", "deliverables/t/01.md": "one\n"})})
+	consCall(t, tb, false, "board_vote", map[string]any{"seed": alice, "n": 1, "vote": "yes"})
+
+	// the status rides on every tool result
+	line := mustMarshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "board_threads", "arguments": map[string]any{"seed": bob}}})
+	var r struct {
+		Result struct {
+			Meta map[string]json.RawMessage `json:"_meta"`
+		} `json:"result"`
+	}
+	json.Unmarshal(handleLine(line, tb), &r)
+	var cs consStatus
+	if err := json.Unmarshal(r.Result.Meta["kbtool/consensus"], &cs); err != nil || cs.Accepted != 1 || cs.Consensus != consUnified(consBoard(t, tb), sessConsensus) {
+		t.Fatalf("_meta kbtool/consensus: %s %v", r.Result.Meta["kbtool/consensus"], err)
+	}
+
+	sdir := memSession(t)
+	os.WriteFile(filepath.Join(sdir, "consensus", "goals.md"), []byte("my edit\n"), 0600)
+	os.WriteFile(filepath.Join(sdir, "deliverables", "stray.md"), []byte("stray\n"), 0600)
+	var notes bytes.Buffer
+	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	consBackground(tb, &notes, sdir, bob, &cs, now)
+	for name, want := range map[string]string{"consensus/goals.md": "goals\n", "deliverables/t/01.md": "one\n"} {
+		if b, _ := os.ReadFile(filepath.Join(sdir, name)); string(b) != want {
+			t.Fatalf("%s = %q after the background update", name, b)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(sdir, "deliverables", "stray.md")); err == nil {
+		t.Fatal("files the board does not have are removed")
+	}
+	bk := filepath.Join(sdir, "memory", ".backup", "20261002T120000Z")
+	if b, _ := os.ReadFile(filepath.Join(bk, "consensus", "goals.md")); string(b) != "my edit\n" {
+		t.Fatalf("the replaced copy is kept in memory/.backup: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(bk, "deliverables", "stray.md")); string(b) != "stray\n" {
+		t.Fatalf("the removed file is kept in memory/.backup: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(bk, "deliverables", "t", "01.md")); err == nil {
+		t.Fatal("files that were not changed locally need no backup")
+	}
+	n := notes.String()
+	if !strings.Contains(n, "notice: background update of consensus/ and deliverables/ (proposal 1 accepted); review it with: kbtool consensus review 1") ||
+		!strings.Contains(n, "memory/.backup/20261002T120000Z") {
+		t.Fatalf("notices: %q", n)
+	}
+	if l, _ := dirChecksumList(sdir, "consensus"); unifiedChecksum(l) != cs.Consensus {
+		t.Fatal("the local copy now has the accepted checksum")
+	}
+	if b, _ := os.ReadFile(filepath.Join(sdir, "deliverables.sha256")); !strings.Contains(string(b), "deliverables/t/01.md") {
+		t.Fatalf("deliverables.sha256 regenerated: %q", b)
+	}
+	b := consBoard(t, tb)
+	if r := boardRoster(b, time.Now().Unix()); !regexp.MustCompile(`bob .*copies=in-sync`).MatchString(r) {
+		t.Fatalf("the board knows bob's copies are in sync: %s", r)
+	}
+
+	// in sync: nothing to do, no notice
+	notes.Reset()
+	consBackground(tb, &notes, sdir, bob, &cs, now)
+	if notes.Len() != 0 {
+		t.Fatalf("no notice when in sync: %q", notes.String())
+	}
+
+	// an open proposal waiting for this agent's vote
+	consCall(t, tb, false, "board_propose", map[string]any{"seed": bob, "text": "more", "attachment": consTGZ(t, map[string]string{"deliverables/t/02.md": "two\n"})})
+	st := consStatusOf(consBoard(t, tb), time.Now().Unix())
+	consBackground(tb, &notes, sdir, alice, st, now)
+	if !strings.Contains(notes.String(), "notice: proposal 2 by bob waits for your vote; review it with: kbtool consensus review 2") {
+		t.Fatalf("vote notice: %q", notes.String())
+	}
+	notes.Reset()
+	consBackground(tb, &notes, sdir, bob, st, now)
+	if strings.Contains(notes.String(), "waits for your vote") {
+		t.Fatalf("the proposer is not asked to vote: %q", notes.String())
+	}
+}
+
+// Why: accepted documents are searchable on the host, labelled with whether
+// the hit is the current version.
+func TestConsensusDocsSearchable(t *testing.T) {
+	t.Setenv("KB_EMBED_URL", "")
+	db := makeDB(t, []Chunk{{Path: "a", Kind: "code", Text: "some base chunk"}})
+	tb := newBoardToolbox(t, db)
+	alice := consSignup(t, tb, "alice", true)
+	consCall(t, tb, true, "board_propose", map[string]any{"seed": alice, "text": "plan", "host_accepted": true,
+		"attachment": consTGZ(t, map[string]string{"consensus/goals.md": "migrate branch protection to zygomorphic org jobs\n"})})
+	out, _ := tb.Execute("board_search", mustMarshal(map[string]any{"q": "zygomorphic", "seed": alice}))
+	if !strings.Contains(out, "board/consensus-docs/consensus/goals.md@1") || !strings.Contains(out, "current version, proposal 1") {
+		t.Fatalf("accepted doc in board search: %s", out)
+	}
+	consCall(t, tb, true, "board_propose", map[string]any{"seed": alice, "text": "v2", "host_accepted": true,
+		"attachment": consTGZ(t, map[string]string{"consensus/goals.md": "zygomorphic v2\n"})})
+	out, _ = tb.Execute("board_search", mustMarshal(map[string]any{"q": "zygomorphic", "seed": alice, "k": 20}))
+	if !strings.Contains(out, "superseded by proposal 2") || !strings.Contains(out, "goals.md@2") {
+		t.Fatalf("superseded versions are labelled: %s", out)
+	}
+	chunks := consDocChunks(consBoard(t, tb), 2)
+	if len(chunks) != 1 || chunks[0].Start != 1 || !strings.HasPrefix(chunks[0].Text, "consensus/goals.md\n") {
+		t.Fatalf("doc chunks: %+v", chunks)
+	}
+}
+
+// ---------- 48. board export from finished sessions (plans/memory-consensus-deliverables-plan.md) ----------
+
+func boardWithPost(t *testing.T, text string) *Board {
+	t.Helper()
+	b := newBoard()
+	if _, err := ensureSystem(b, boardSysInfo{WelcomeWords: 40}, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	boardSystemPost(b, text, time.Now().Unix())
+	return b
+}
+
+// Why: past host sessions' boards can be reviewed: a plain session dir, and a
+// sealed archive decrypted in memory with the inner kb.db key from its keys
+// record; attendee sessions have no board and say so.
+func TestSessionBoardExport(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	t.Setenv(secretEnv, "")
+	host, err := createSession("host", t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.MkdirAll(filepath.Join(sessionDir(host.ID), "state"), 0700)
+	os.WriteFile(filepath.Join(sessionDir(host.ID), "state", "board.bin"), boardMarshal(boardWithPost(t, "plain session marker")), 0600)
+	b, err := sessionBoard(host.ID, nil)
+	if err != nil || !strings.Contains(b.Threads[boardSystem].Msgs[1].Text, "plain session marker") {
+		t.Fatalf("plain host session: %v", err)
+	}
+
+	att, _ := createSession("attendee", t.TempDir(), time.Now().Add(time.Second))
+	if _, err := sessionBoard(att.ID, nil); err != errAttendeeBoard {
+		t.Fatalf("attendee session: %v", err)
+	}
+
+	// a sealed host session whose kb.db is an encrypted store under its own key
+	enc, _ := createSession("host", t.TempDir(), time.Now().Add(2*time.Second))
+	inner := []byte("inner store key")
+	var tgz bytes.Buffer
+	tarGZWrite(&tgz, []tarGZMember{{Name: "board.bin", Data: boardMarshal(boardWithPost(t, "sealed session marker"))}})
+	sealed := newBundleSealer(inner).seal(tgz.Bytes())
+	dir := sessionDir(enc.ID)
+	os.MkdirAll(filepath.Join(dir, "state"), 0700)
+	os.WriteFile(filepath.Join(dir, "state", "kb.db"), sealed, 0600)
+	outer := []byte("archive key")
+	dest, _ := newSessionKBXPath()
+	if err := sealSession(dir, dest, outer, make([]byte, 16), sessionHead{Meta: *enc}, false, kbxKeys{Inner: map[string][]byte{"state/kb.db": inner}}); err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(dir)
+	if _, err := sessionBoard(enc.ID, nil); err == nil || !strings.Contains(err.Error(), secretEnv) {
+		t.Fatalf("a sealed session needs the key: %v", err)
+	}
+	b, err = sessionBoard(enc.ID, outer)
+	if err != nil || !strings.Contains(b.Threads[boardSystem].Msgs[1].Text, "sealed session marker") {
+		t.Fatalf("sealed host session: %v", err)
+	}
+	if _, err := sessionBoard(enc.ID, []byte("wrong")); err == nil {
+		t.Fatal("a wrong key fails")
+	}
+	var html bytes.Buffer
+	if err := renderBoardHTML(&html, boardSnapshotOf(b, time.Now())); err != nil || !strings.Contains(html.String(), "sealed session marker") {
+		t.Fatalf("HTML: %v", err)
+	}
+	if ents, _ := os.ReadDir(sessionsDir()); len(ents) != 3 {
+		t.Fatalf("the export leaves nothing behind: %d entries", len(ents))
+	}
+
+	// the sealed attendee check happens before any payload is read
+	os.MkdirAll(filepath.Join(sessionDir(att.ID), "state"), 0700)
+	m, _ := loadSessionMeta(att.ID)
+	if _, err := sealSessionDir(att.ID, m, outer, make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionBoard(att.ID, outer); err != errAttendeeBoard {
+		t.Fatalf("sealed attendee session: %v", err)
+	}
+}
+
+// ---------- 49. agent-side session layer (plans/session-memory-attachments-plan.md) ----------
+
+func layerCall(t *testing.T, ex executor, name string, args map[string]any) (string, bool) {
+	t.Helper()
+	return ex.Execute(name, mustMarshal(args))
+}
+
+func layerTools(t *testing.T, ex executor) map[string]map[string]any {
+	t.Helper()
+	res, err := dispatch(ex, "tools/list", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]map[string]any{}
+	for _, tl := range res.(map[string]any)["tools"].([]mcpTool) {
+		out[tl.Name] = tl.InputSchema.(map[string]any)
+	}
+	return out
+}
+
+// Why: a human reviewing the board must see which agent is the host's.
+func TestBoardDumpTagsHostAgent(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	alice := consSignup(t, tb, "alice", true)
+	bob := consSignup(t, tb, "bob", false)
+	for _, seed := range []string{alice, bob} {
+		if out, isErr := tb.Execute("board_post", mustMarshal(map[string]any{"thread": "plans", "text": "hello", "seed": seed})); isErr {
+			t.Fatal(out)
+		}
+	}
+	var buf bytes.Buffer
+	if err := renderBoardHTML(&buf, boardSnapshotOf(consBoard(t, tb), time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	page := buf.String()
+	tag := `<span class="host-agent">[host agent]</span>`
+	if !strings.Contains(page, "<td>alice "+tag+"</td>") || !strings.Contains(page, "<b>alice</b> "+tag) {
+		t.Fatal("the host's agent must be tagged in the roster and on its messages")
+	}
+	if !strings.Contains(page, `<span class="tag">host agent: alice</span>`) {
+		t.Fatal("the session tags name the host's agent")
+	}
+	if strings.Count(page, tag) != 2 {
+		t.Fatalf("only the host's agent is tagged: %d tags", strings.Count(page, tag))
+	}
+	buf.Reset()
+	if err := renderBoardHTML(&buf, boardSnapshotOf(newBoard(), time.Now())); err != nil || strings.Contains(buf.String(), tag) {
+		t.Fatalf("no host agent, no tag: %v", err)
+	}
+}
+
+// Why: an agent learns the platform of the kbtool binary it signed up with
+// only from board_whoami; the client reports it from build-time constants,
+// the board keeps it, and the export shows it to the humans.
+func TestSignupPlatform(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	sock := filepath.Join(shortStateDir(t), "daemon.sock")
+	serveToolboxSocket(t, tb, sock)
+	ce := &remoteExec{ep: endpoint{kind: "unix", socket: sock}}
+	out, isErr := ce.Execute("board_signup", mustMarshal(map[string]any{"name": "alice", "platform": "plan9/mips"}))
+	if isErr || strings.Contains(out, clientPlatform) {
+		t.Fatalf("the signup reply stays free of the platform: %s", out)
+	}
+	seed := consSeedRe.FindStringSubmatch(out)[1]
+	if p := consBoard(t, tb).Agents["alice"].Platform; p != clientPlatform {
+		t.Fatalf("the client reports its own binary's platform, whatever the agent passes: %q", p)
+	}
+	if clientPlatform != runtime.GOOS+"/"+runtime.GOARCH {
+		t.Fatal("clientPlatform comes from the build")
+	}
+	if out, _ := tb.Execute("board_whoami", mustMarshal(map[string]any{"seed": seed})); !strings.Contains(out, "platform: "+clientPlatform) {
+		t.Fatalf("whoami shows the platform: %s", out)
+	}
+	if out := boardRoster(consBoard(t, tb), time.Now().Unix()); strings.Contains(out, clientPlatform) {
+		t.Fatalf("the roster stays free of platforms: %s", out)
+	}
+	for _, tl := range toolSchemas() {
+		if b, _ := json.Marshal(tl.InputSchema); strings.Contains(string(b), "platform") {
+			t.Fatalf("%s's schema must not mention platform", tl.Name)
+		}
+	}
+	if out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "bob", "platform": strings.Repeat("x", boardPlatformMax+1)})); !isErr || !strings.Contains(out, "limited to") || consSeedRe.MatchString(out) {
+		t.Fatalf("an over-long platform is refused before any seed is issued: %s", out)
+	}
+	if consBoard(t, tb).Agents["bob"] != nil {
+		t.Fatal("a refused signup registers nothing")
+	}
+	if out, isErr := tb.Execute("board_signup", mustMarshal(map[string]any{"name": "dave", "platform": "Linux AMD64 (custom)"})); isErr {
+		t.Fatalf("an unusual platform within the limit is accepted: %s", out)
+	}
+	consSignup(t, tb, "carol", false)
+	b := consBoard(t, tb)
+	if b.Agents["carol"].Platform != "" {
+		t.Fatal("the daemon never adds its own platform to a signup")
+	}
+	b2, err := readBoard(bytes.NewReader(boardMarshal(b)))
+	if err != nil || b2.Agents["alice"].Platform != clientPlatform || b2.Agents["carol"].Platform != "" {
+		t.Fatalf("the platform survives a save: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := renderBoardHTML(&buf, boardSnapshotOf(b, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	page := buf.String()
+	if !strings.Contains(page, `<span class="tag">`+clientPlatform+` × 1</span>`) || !strings.Contains(page, `<td><span class="tag">`+clientPlatform+`</span></td>`) {
+		t.Fatal("the export shows each agent's platform and the session's platforms")
+	}
+	if !strings.Contains(page, `<span class="tag">3 agent(s), 3 active</span>`) {
+		t.Fatal("the export summarizes the agents")
+	}
+}
+
+// Why: over MCP an agent must see memory paths, not base64, and no seed;
+// outside a session the tools are unchanged.
+func TestSessionLayerSchemas(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	if _, ok := withSession(tb).(*agentExec); !ok {
+		t.Fatal("no session: only the signup guard")
+	}
+	memSession(t)
+	tools := layerTools(t, withSession(tb))
+	props := func(name string) map[string]any { return tools[name]["properties"].(map[string]any) }
+	if _, ok := props("board_post")["attachment"]; ok {
+		t.Error("board_post must not offer base64 attachments in a session")
+	}
+	if _, ok := props("board_post")["attach"]; !ok {
+		t.Error("board_post must take attach (memory paths)")
+	}
+	if _, ok := props("board_fetch")["into"]; !ok {
+		t.Error("board_fetch must take into")
+	}
+	if _, ok := props("board_propose")["files"]; !ok {
+		t.Error("board_propose must take files")
+	}
+	for name, sch := range tools {
+		if req, _ := sch["required"].([]string); strings.HasPrefix(name, "board_") && slices.Contains(req, "seed") {
+			t.Errorf("%s still requires seed", name)
+		}
+	}
+	for _, n := range []string{"memory", "consensus_files", "deliverables_files"} {
+		if tools[n] == nil {
+			t.Errorf("missing tool %s", n)
+		}
+	}
+	if _, ok := props("consensus_files")["content"]; ok {
+		t.Error("consensus_files is read-only")
+	}
+}
+
+// Why: whatever the call method, attaching packs files from memory and
+// fetching extracts into memory, and the seed stays with kbtool.
+func TestSessionLayerAttachFetch(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	sdir := memSession(t)
+	ex := withSession(tb)
+
+	out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "alice"})
+	seed, _ := readSeedFile(filepath.Join(sdir, ".kbtool-seed"))
+	if isErr || seed == "" || strings.Contains(out, seed) || !strings.Contains(out, "seed stored in this session") {
+		t.Fatalf("signup must keep the seed in the session and not show it: %v %s", isErr, out)
+	}
+	if out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "bob"}); !isErr || !strings.Contains(out, "already signed up as alice") {
+		t.Fatalf("a second signup must not replace the seed: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "board_whoami", map[string]any{}); isErr || !strings.Contains(out, "alice") {
+		t.Fatalf("the seed is supplied: %s", out)
+	}
+
+	if out, isErr := layerCall(t, ex, "memory", map[string]any{"command": "write", "args": []string{"notes/plan.md"}, "content": "plan v1\n"}); isErr {
+		t.Fatalf("memory write: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "memory", map[string]any{"command": "cat", "args": []string{"notes/plan.md"}}); isErr || out != "plan v1\n" {
+		t.Fatalf("memory cat: %q", out)
+	}
+	if out, isErr := layerCall(t, ex, "memory", map[string]any{"command": "cat", "args": []string{"../meta.json"}}); !isErr || !strings.Contains(out, "memory:") {
+		t.Fatalf("memory paths must stay in memory: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "memory", map[string]any{"command": "export"}); !isErr {
+		t.Fatalf("export writes a tar.gz to stdout; not an MCP command: %s", out)
+	}
+
+	if out, isErr := layerCall(t, ex, "board_post", map[string]any{"thread": "plans", "text": "x", "attachment": consTGZ(t, map[string]string{"a": "b"})}); !isErr || !strings.Contains(out, "from your memory") {
+		t.Fatalf("base64 attachments must be refused in a session: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "board_post", map[string]any{"thread": "plans", "text": "x", "attach": []string{"../.kbtool-seed"}}); !isErr || !strings.Contains(out, "memory:") {
+		t.Fatalf("attach must stay in memory: %s", out)
+	}
+	out, isErr = layerCall(t, ex, "board_post", map[string]any{"thread": "plans", "text": "plan draft", "attach": []string{"notes"}})
+	if isErr {
+		t.Fatalf("attach from memory: %s", out)
+	}
+	b := consBoard(t, tb)
+	m := b.thread("plans").Msgs[0]
+	if m.Attach == nil || len(m.Attach.Files) != 1 || m.Attach.Files[0].Name != "notes/plan.md" {
+		t.Fatalf("attachment: %+v", m.Attach)
+	}
+
+	out, isErr = layerCall(t, ex, "board_fetch", map[string]any{"thread": "plans", "seq": 0, "list": true})
+	if isErr || !strings.Contains(out, "notes/plan.md") || strings.Contains(out, attachArmorBegin) {
+		t.Fatalf("list: %s", out)
+	}
+	out, isErr = layerCall(t, ex, "board_fetch", map[string]any{"thread": "plans", "seq": 0, "into": "in"})
+	if isErr || !strings.Contains(out, "memory/in/notes/plan.md") || strings.Contains(out, attachArmorBegin) {
+		t.Fatalf("fetch into memory: %s", out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(sdir, "memory", "in", "notes", "plan.md")); string(got) != "plan v1\n" {
+		t.Fatalf("fetched file: %q", got)
+	}
+	if out, isErr := layerCall(t, ex, "board_fetch", map[string]any{"thread": "plans", "seq": 0, "into": "in"}); !isErr || !strings.Contains(out, "overwrite") {
+		t.Fatalf("existing files are kept unless overwrite: %s", out)
+	}
+	if _, isErr := layerCall(t, ex, "board_fetch", map[string]any{"thread": "plans", "seq": 0, "into": "in", "overwrite": true}); isErr {
+		t.Fatal("overwrite")
+	}
+	if out, isErr := layerCall(t, ex, "board_fetch", map[string]any{"thread": "plans", "seq": 0, "into": "/tmp"}); !isErr || !strings.Contains(out, "memory:") {
+		t.Fatalf("fetch must stay in memory: %s", out)
+	}
+
+	if out, isErr := layerCall(t, ex, "consensus_files", map[string]any{"command": "write", "args": []string{"x"}}); !isErr || !strings.Contains(out, "unknown command") && !strings.Contains(out, "read-only") {
+		t.Fatalf("consensus_files is read-only: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "board_propose", map[string]any{"text": "x", "attachment": consTGZ(t, map[string]string{"deliverables/a": "b"})}); !isErr || !strings.Contains(out, "from your memory") {
+		t.Fatalf("base64 proposals must be refused in a session: %s", out)
+	}
+	consSignup(t, tb, "bob", false)
+	out, isErr = layerCall(t, ex, "board_propose", map[string]any{"text": "the plan", "files": []string{"notes/plan.md=deliverables/plan.md"}})
+	if isErr || !strings.Contains(out, "proposal 1") {
+		t.Fatalf("propose from memory: %s", out)
+	}
+	out, isErr = layerCall(t, ex, "board_proposal", map[string]any{"n": 1, "diff": true, "into": "rev"})
+	if isErr || !strings.Contains(out, "+ plan v1") || !strings.Contains(out, "memory/rev") || strings.Contains(out, attachArmorBegin) {
+		t.Fatalf("review into memory: %s", out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(sdir, "memory", "rev", "deliverables", "plan.md")); string(got) != "plan v1\n" {
+		t.Fatalf("proposal files in memory: %q", got)
+	}
+	if out, isErr := layerCall(t, ex, "board_consensus", map[string]any{"sync": true}); !isErr || !strings.Contains(out, "background") {
+		t.Fatalf("sync is kbtool's job: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "deliverables_files", map[string]any{"command": "ls"}); isErr {
+		t.Fatalf("deliverables_files ls: %s", out)
+	}
+}
+
+// ---------- 50. relay honeypot (plans/relay-honeypot-plan.md) ----------
+
+type hpClock struct{ t time.Time }
+
+func (c *hpClock) now() time.Time      { return c.t }
+func (c *hpClock) add(d time.Duration) { c.t = c.t.Add(d) }
+func hpGet(h *honeypot, ip string) *hpClient {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if e := h.clients[ip]; e != nil {
+		c := *e.Value.(*hpClient)
+		return &c
+	}
+	return nil
+}
+
+// Why: / marks a client seen, a honeypot directory blocks it (short the
+// first time, longer after), drops never refresh it, and it is forgotten
+// once it has been quiet for the remember window.
+func TestHoneypotStateMachine(t *testing.T) {
+	clk := &hpClock{t: time.Unix(1_800_000_000, 0)}
+	h := newHoneypot()
+	h.now = clk.now
+	const ip = "203.0.113.7"
+	if h.blocked(ip) {
+		t.Fatal("unknown clients are not blocked")
+	}
+	h.record(ip, false)
+	if c := hpGet(h, ip); c == nil || c.State != hpSeen || h.blocked(ip) {
+		t.Fatalf("GET / marks seen, not blocked: %+v", c)
+	}
+	clk.add(time.Minute)
+	h.record(ip, true)
+	c := hpGet(h, ip)
+	if c.State != hpSuspicious || !c.BlockedUntil.Equal(clk.t.Add(relayDefBlock)) || !h.blocked(ip) {
+		t.Fatalf("the first honeypot directory blocks for the initial block: %+v", c)
+	}
+	seen := c.LastSeen
+	clk.add(10 * time.Minute)
+	for i := 0; i < 3; i++ {
+		h.blocked(ip)
+	}
+	if c := hpGet(h, ip); !c.LastSeen.Equal(seen) || c.Dropped < 3 {
+		t.Fatalf("drops must not refresh last seen: %+v", c)
+	}
+	clk.add(5 * time.Minute)
+	if h.blocked(ip) {
+		t.Fatal("the initial block ends")
+	}
+	h.record(ip, true)
+	if c := hpGet(h, ip); !c.BlockedUntil.Equal(clk.t.Add(relayDefReblock)) {
+		t.Fatalf("an already suspicious client is blocked for the follow-up block: %+v", c)
+	}
+	clk.add(relayDefReblock + time.Minute)
+	h.record(ip, true)
+	if c := hpGet(h, ip); !c.BlockedUntil.Equal(clk.t.Add(relayDefReblock)) {
+		t.Fatal("suspicious again after the block: another follow-up block")
+	}
+	clk.add(relayDefRemember - time.Second)
+	h.sweep()
+	if hpGet(h, ip) == nil {
+		t.Fatal("remembered until the window passes")
+	}
+	clk.add(time.Second)
+	h.sweep()
+	if hpGet(h, ip) != nil {
+		t.Fatal("forgotten after the remember window without an answered request")
+	}
+	h.record(ip, true)
+	if c := hpGet(h, ip); c.State != hpSuspicious || !c.BlockedUntil.Equal(clk.t.Add(relayDefBlock)) {
+		t.Fatal("a forgotten client starts over: its first honeypot directory is an initial block")
+	}
+
+	h.Remember, h.Block = time.Minute, time.Hour
+	clk.add(2 * time.Hour)
+	h.record(ip, true)
+	clk.add(30 * time.Minute)
+	h.sweep()
+	if hpGet(h, ip) == nil || !h.blocked(ip) {
+		t.Fatal("a client stays remembered while it is blocked")
+	}
+}
+
+// Why: a swarm of addresses must not exhaust memory: the least recently
+// seen clients are forgotten first, and the budget scales with memory.
+func TestHoneypotEviction(t *testing.T) {
+	clk := &hpClock{t: time.Unix(1_800_000_000, 0)}
+	h := newHoneypot()
+	h.now = clk.now
+	h.MaxClients = 3
+	for _, ip := range []string{"a", "b", "c"} {
+		h.record(ip, false)
+		clk.add(time.Second)
+	}
+	h.record("a", false)
+	h.record("d", false)
+	if hpGet(h, "b") != nil || hpGet(h, "a") == nil || hpGet(h, "c") == nil || hpGet(h, "d") == nil || h.evicted != 1 {
+		t.Fatal("the least recently seen client is forgotten first")
+	}
+	if n, err := honeypotMaxClientsFor("64MiB"); err != nil || n != 64<<20/honeypotClientCost {
+		t.Fatalf("64MiB: %d %v", n, err)
+	}
+	if n, _ := honeypotMaxClientsFor("1KiB"); n != honeypotMinClients {
+		t.Fatalf("tiny budgets keep a floor: %d", n)
+	}
+	if _, err := honeypotMaxClientsFor("lots"); err == nil {
+		t.Fatal("bad budgets are refused")
+	}
+}
+
+// Why: the listing is random per boot, never names real endpoints, and is
+// the same for one client every time: 1 to 5 of 32 words, picked by a
+// 32-bit mask derived from the client's address.
+func TestHoneypotWordsAndListing(t *testing.T) {
+	h := newHoneypot()
+	seen := map[string]bool{}
+	for i, w := range h.words {
+		if honeypotReserved[w] || len(w) < 3 || len(w) > 12 || seen[w] || h.word(w) != i {
+			t.Fatalf("word %q", w)
+		}
+		seen[w] = true
+		if _, err := time.Parse("2006-01-02 15:04", h.dates[i]); err != nil {
+			t.Fatalf("date %q", h.dates[i])
+		}
+	}
+	if h.word("") != -1 || h.word("ca.crt") != -1 {
+		t.Fatal("only boot words are directories")
+	}
+	if h2 := newHoneypot(); h.words == h2.words {
+		t.Fatal("words are random per boot")
+	}
+	sizes := map[int]bool{}
+	for i := 0; i < 200; i++ {
+		ip := fmt.Sprintf("198.51.100.%d", i)
+		m := h.mask(ip)
+		if n := bits.OnesCount32(m); n < 1 || n > honeypotMaxDirs || m != h.mask(ip) {
+			t.Fatalf("mask for %s: %032b", ip, m)
+		}
+		a, b := h.listing(ip), h.listing(ip)
+		if !slices.Equal(a, b) || len(a) != bits.OnesCount32(m) || !sort.StringsAreSorted(a) {
+			t.Fatalf("listing for %s: %v %v", ip, a, b)
+		}
+		sizes[len(a)] = true
+	}
+	if len(sizes) != honeypotMaxDirs {
+		t.Fatalf("every listing size from 1 to 5 occurs: %v", sizes)
+	}
+}
+
+func hpRequest(t *testing.T, client *http.Client, method, url string) (*http.Response, string) {
+	t.Helper()
+	req, _ := http.NewRequest(method, url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, string(b)
+}
+
+var hpDirRe = regexp.MustCompile(`<a href="([^"?/]+)/">`)
+
+// Why: to a browser or scanner the relay is an Apache directory listing;
+// kbtool's own requests never mark a client; a listed directory blocks the
+// client, whose connections then die silently.
+func TestRelayHoneypotHTTP(t *testing.T) {
+	rs, hp := startTestRelay(t, "", func(rs *relayServer) { rs.Healthz.interval = 0 })
+	plain := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	tlsc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+
+	if _, err := relayFingerprint(hp); err != nil {
+		t.Fatal(err)
+	}
+	if !relayHealthy(hp) {
+		t.Fatal("healthz")
+	}
+	if _, err := relayCheck(hp, relayTrust{}); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := hpRequest(t, plain, "GET", "http://"+hp+"/favicon.ico")
+	if resp.StatusCode != 404 || resp.Header.Get("Server") != honeypotServer || !strings.Contains(body, "<title>404 Not Found</title>") {
+		t.Fatalf("unknown paths are Apache 404s: %d %q", resp.StatusCode, body)
+	}
+	if n := len(rs.Honey.list()); n != 0 {
+		t.Fatalf("kbtool's own requests must not mark a client: %d", n)
+	}
+
+	resp, body = hpRequest(t, plain, "GET", "http://"+hp+"/")
+	if resp.StatusCode != 200 || resp.Header.Get("Server") != honeypotServer || resp.Header.Get("Content-Type") != "text/html;charset=ISO-8859-1" || !strings.Contains(body, "<title>Index of /</title>") {
+		t.Fatalf("GET / is an Apache listing: %d %v %q", resp.StatusCode, resp.Header, body)
+	}
+	if strings.Contains(body, "ca.crt") || strings.Contains(body, "healthz") || strings.Contains(body, "<address>") || honeypotServer != "Apache" {
+		t.Fatalf("the listing hides the real endpoints: %q", body)
+	}
+	var dirs []string
+	for _, m := range hpDirRe.FindAllStringSubmatch(body, -1) {
+		dirs = append(dirs, m[1])
+	}
+	_, tbody := hpRequest(t, tlsc, "GET", "https://"+hp+"/")
+	var tdirs []string
+	for _, m := range hpDirRe.FindAllStringSubmatch(tbody, -1) {
+		tdirs = append(tdirs, m[1])
+	}
+	if len(dirs) < 1 || len(dirs) > honeypotMaxDirs || !slices.Equal(dirs, tdirs) {
+		t.Fatalf("the same listing over HTTP and HTTPS: %v %v", dirs, tdirs)
+	}
+	if c := hpGet(rs.Honey, "127.0.0.1"); c == nil || c.State != hpSeen || c.Requests != 2 {
+		t.Fatalf("GET / marks the client seen: %+v", c)
+	}
+
+	resp, body = hpRequest(t, plain, "GET", "http://"+hp+"/"+dirs[0]+"/")
+	if resp.StatusCode != 200 || !strings.Contains(body, "Index of /"+dirs[0]+"/") || !strings.Contains(body, "Parent Directory") {
+		t.Fatalf("a honeypot directory is answered: %d %q", resp.StatusCode, body)
+	}
+	c := hpGet(rs.Honey, "127.0.0.1")
+	if c.State != hpSuspicious || !rs.Honey.blocked("127.0.0.1") {
+		t.Fatalf("a honeypot directory makes the client suspicious and blocked: %+v", c)
+	}
+	conn, err := net.Dial("tcp", hp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := conn.Read(make([]byte, 64)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("a blocked client gets no answer at all: %d %v", n, err)
+	}
+	conn.Close()
+	if after := hpGet(rs.Honey, "127.0.0.1"); !after.LastSeen.Equal(c.LastSeen) || after.Dropped == 0 {
+		t.Fatalf("drops do not refresh last seen: %+v", after)
+	}
+	rs.Honey.forget([]string{"127.0.0.1"}, false, false)
+	if resp, _ := hpRequest(t, plain, "GET", "http://"+hp+"/healthz"); resp.StatusCode != 200 {
+		t.Fatal("a forgotten client is served again")
+	}
+	if resp, _ := hpRequest(t, plain, "POST", "http://"+hp+"/"); resp.StatusCode != 405 || len(rs.Honey.list()) != 0 {
+		t.Fatal("other methods on / are refused like Apache and mark nobody")
+	}
+}
+
+// Why: health checks are answered at most once per interval, whoever asks.
+func TestRelayHealthzRateLimit(t *testing.T) {
+	_, hp := startTestRelay(t, "", func(rs *relayServer) { rs.Healthz.interval = 300 * time.Millisecond })
+	plain := &http.Client{Timeout: 5 * time.Second}
+	if resp, _ := hpRequest(t, plain, "GET", "http://"+hp+"/healthz"); resp.StatusCode != 200 {
+		t.Fatal("first healthz")
+	}
+	resp, _ := hpRequest(t, plain, "GET", "http://"+hp+"/healthz")
+	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") != "1" || resp.Header.Get("Server") != honeypotServer {
+		t.Fatalf("a second healthz within the interval: %d %v", resp.StatusCode, resp.Header)
+	}
+	time.Sleep(350 * time.Millisecond)
+	if resp, _ := hpRequest(t, plain, "GET", "http://"+hp+"/healthz"); resp.StatusCode != 200 {
+		t.Fatal("answered again after the interval")
+	}
+}
+
+// Why: the operator inspects and clears the honeypot of a running relay
+// without restarting it.
+func TestRelayHoneypotControl(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	rs := newRelayServer(newRelayPKI([]net.IP{net.ParseIP("127.0.0.1")}, nil), "")
+	ln, err := net.Listen("unix", relayControlPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go rs.serveControl(ln)
+	rs.Honey.record("192.0.2.1", false)
+	rs.Honey.record("192.0.2.2", true)
+	rs.Honey.record("2001:db8::1", true)
+	var out bytes.Buffer
+	relayHoneypotCmd([]string{"ls"}, &out)
+	if s := out.String(); !regexp.MustCompile(`(?m)^192\.0\.2\.1 +seen `).MatchString(s) || !regexp.MustCompile(`(?m)^192\.0\.2\.2 +suspicious `).MatchString(s) || !strings.Contains(s, "3 client(s) remembered") {
+		t.Fatalf("ls: %s", s)
+	}
+	out.Reset()
+	relayHoneypotCmd([]string{"ls", "-json"}, &out)
+	var list []hpEntry
+	if err := json.Unmarshal(out.Bytes(), &list); err != nil || len(list) != 3 || list[1].BlockedUntil == 0 {
+		t.Fatalf("ls -json: %v %s", err, out.String())
+	}
+	out.Reset()
+	relayHoneypotCmd([]string{"rm", "2001:0db8:0:0::1"}, &out)
+	if !strings.Contains(out.String(), "forgot 1") || hpGet(rs.Honey, "2001:db8::1") != nil {
+		t.Fatalf("rm normalizes the address: %s", out.String())
+	}
+	out.Reset()
+	relayHoneypotCmd([]string{"clear", "-suspicious"}, &out)
+	if !strings.Contains(out.String(), "forgot 1") || hpGet(rs.Honey, "192.0.2.1") == nil {
+		t.Fatalf("clear -suspicious keeps seen clients: %s", out.String())
+	}
+	out.Reset()
+	relayHoneypotCmd([]string{"clear"}, &out)
+	if !strings.Contains(out.String(), "forgot 1") || len(rs.Honey.list()) != 0 {
+		t.Fatalf("clear: %s", out.String())
+	}
+}
+
+// Why: the timings are daemon options in milliseconds (flag > environment >
+// default) and the memory budget accepts a share of memory or a size.
+func TestRelayHoneypotOpts(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	for _, e := range relayEnv {
+		t.Setenv(e, "")
+	}
+	o, err := parseRelayOptsErr(nil)
+	if err != nil || o.healthz != time.Second || o.remember != 2*time.Hour || o.block != 15*time.Minute || o.reblock != time.Hour || o.honeyMem != "10%" {
+		t.Fatalf("defaults: %+v %v", o, err)
+	}
+	t.Setenv("KBTOOL_RELAY_HONEYPOT_BLOCK", "60000")
+	t.Setenv("KBTOOL_RELAY_HONEYPOT_MAX_MEMORY", "32MiB")
+	o, err = parseRelayOptsErr([]string{"-healthz-interval", "0", "-honeypot-reblock", "120000", "-honeypot-remember", "500"})
+	if err != nil || o.healthz != 0 || o.block != time.Minute || o.reblock != 2*time.Minute || o.remember != 500*time.Millisecond || o.honeyMem != "32MiB" {
+		t.Fatalf("flags and environment: %+v %v", o, err)
+	}
+	for _, bad := range [][]string{{"-honeypot-block", "0"}, {"-honeypot-remember", "-5"}, {"-honeypot-max-memory", "lots"}} {
+		if _, err := parseRelayOptsErr(bad); err == nil {
+			t.Fatalf("%v must be refused", bad)
+		}
+	}
+	t.Setenv("KBTOOL_RELAY_HONEYPOT_BLOCK", "1.5")
+	if _, err := parseRelayOptsErr(nil); err == nil {
+		t.Fatal("milliseconds are whole numbers")
+	}
+}
+
+// Why: the listing's icons are Apache's own files with stock headers, so a
+// scanner hashing /icons/ sees httpd; fetching them never marks a client.
+func TestRelayHoneypotIcons(t *testing.T) {
+	rs, hp := startTestRelay(t, "", func(rs *relayServer) { rs.Healthz.interval = 0 })
+	plain := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	tlsc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	for _, name := range []string{"blank.gif", "folder.gif", "back.gif"} {
+		want := mustReadFile(t, filepath.Join("honeypot-icons", name))
+		for _, u := range []string{"http://" + hp, "https://" + hp} {
+			c := plain
+			if strings.HasPrefix(u, "https") {
+				c = tlsc
+			}
+			resp, body := hpRequest(t, c, "GET", u+"/icons/"+name)
+			etag := fmt.Sprintf(`"%x-3e9564c23b600"`, len(want))
+			if resp.StatusCode != 200 || body != string(want) || resp.Header.Get("Content-Type") != "image/gif" ||
+				resp.Header.Get("Server") != honeypotServer || resp.Header.Get("ETag") != etag ||
+				resp.Header.Get("Last-Modified") != "Sat, 20 Nov 2004 20:16:24 GMT" || resp.Header.Get("Accept-Ranges") != "bytes" {
+				t.Fatalf("%s%s: %d %v", u, name, resp.StatusCode, resp.Header)
+			}
+			req, _ := http.NewRequest("GET", u+"/icons/"+name, nil)
+			req.Header.Set("If-None-Match", etag)
+			if r2, err := c.Do(req); err != nil || r2.StatusCode != 304 {
+				t.Fatalf("conditional GET: %v %v", err, r2)
+			} else {
+				r2.Body.Close()
+			}
+		}
+	}
+	if resp, body := hpRequest(t, plain, "HEAD", "http://"+hp+"/icons/folder.gif"); resp.StatusCode != 200 || body != "" || resp.ContentLength != 225 {
+		t.Fatalf("HEAD: %d %d %q", resp.StatusCode, resp.ContentLength, body)
+	}
+	for _, p := range []string{"/icons/", "/icons/text.gif", "/icons/../ca.crt", "/icons/x/folder.gif"} {
+		if resp, _ := hpRequest(t, plain, "GET", "http://"+hp+p); resp.StatusCode != 404 {
+			t.Fatalf("%s: %d", p, resp.StatusCode)
+		}
+	}
+	if n := len(rs.Honey.list()); n != 0 {
+		t.Fatalf("icons never mark a client: %d", n)
+	}
+}
+
+// Why: when another program keeps one side of the relay's port (an IDE's
+// port forward on macOS), the relay must say so and not start.
+func TestRelayBindCheck(t *testing.T) {
+	for _, bind := range []string{"127.0.0.1:0", ":0"} {
+		ln, err := net.Listen("tcp", bind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := relayBindCheck(ln, bind); err != nil {
+			t.Fatalf("%s: the relay's own port passes: %v", bind, err)
+		}
+		ln.Close()
+	}
+	other, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	go func() {
+		for {
+			c, err := other.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	port := other.Addr().(*net.TCPAddr).Port
+	ours, err := net.Listen("tcp6", fmt.Sprintf("[::]:%d", port))
+	if err != nil {
+		t.Skipf("no IPv6-only wildcard listener here: %v", err)
+	}
+	defer ours.Close()
+	bind := fmt.Sprintf(":%d", port)
+	err = relayBindCheck(ours, bind)
+	if err == nil || !strings.Contains(err.Error(), "another program answers on 127.0.0.1:") || !strings.Contains(err.Error(), "lsof -nP -iTCP:") {
+		t.Fatalf("a port shared with another program is reported: %v", err)
+	}
+}
+
+// ---------- 51. snapshot-only commands ----------
+
+// Why: releases work through collaboration sessions only; sessionless use,
+// direct networking and hand-made certificates are snapshot-only. Release
+// builds refuse them and leave them out of usage; snapshot and source builds
+// run and list them; a session's own daemon child still starts.
+func TestPreReleaseTools(t *testing.T) {
+	old := preRelease
+	t.Cleanup(func() { preRelease = old })
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	t.Setenv(childEnv, "")
+	var buf bytes.Buffer
+	usageTo(&buf)
+	if old != "true" || refusePreRelease("bench", nil) != nil || !strings.Contains(buf.String(), "kbtool bench") || !strings.Contains(buf.String(), "kbtool mtls") {
+		t.Fatal("source and snapshot builds run and list the snapshot-only commands")
+	}
+	preRelease = "false"
+	refused := [][]string{
+		{"bench"}, {"mtls"}, {"client", "-import", "kb1x"}, {"mcp", "start"}, {"mcp", "serve"},
+		{"daemon", "start"}, {"daemon", "run"}, {"build", "."}, {"build"},
+		{"collaborate", "host", "-ip", "10.0.0.1"}, {"collaborate", "host", "--dns=h.example"},
+		{"collaborate", "attend", "https://h:9876/", "kb1x"}, {"collaborate", "resume", "https://h:9876/", "kb1x"},
+	}
+	for _, c := range refused {
+		if err := refusePreRelease(c[0], c[1:]); err == nil || !strings.Contains(err.Error(), "snapshot builds only") {
+			t.Fatalf("a release build refuses %v: %v", c, err)
+		}
+	}
+	allowed := [][]string{
+		{"query", "x"}, {"terms", "x"}, {"bundle", "a.go:1"}, {"tools"}, {"call", "kb_status"}, {"mcp"},
+		{"status"}, {"help"}, {"daemon", "stop"}, {"daemon", "status"}, {"relay", "self-host", "start"},
+		{"relay", "start"}, {"collaborate", "host", "-yes"}, {"collaborate", "attend", "kb1x"}, {"collaborate", "resume"},
+		{"session", "ls"}, {"board", "dump"}, {"steer", "-m", "x"}, {"kbx", "rekey"},
+	}
+	for _, c := range allowed {
+		if err := refusePreRelease(c[0], c[1:]); err != nil {
+			t.Fatalf("%v runs in release builds: %v", c, err)
+		}
+	}
+	t.Setenv(childEnv, "1")
+	if err := refusePreRelease("daemon", []string{"run"}); err != nil {
+		t.Fatalf("the session's daemon child starts in release builds: %v", err)
+	}
+	memSession(t)
+	if err := refusePreRelease("build", nil); err != nil {
+		t.Fatalf("a bare build reindexes the session in release builds: %v", err)
+	}
+	if err := refusePreRelease("build", []string{"-db-key-env", "K"}); err != nil {
+		t.Fatalf("the key flags are allowed with a session build: %v", err)
+	}
+	if err := refusePreRelease("build", []string{"-git"}); err == nil {
+		t.Fatal("build options are snapshot-only even in a session")
+	}
+	buf.Reset()
+	usageTo(&buf)
+	u := buf.String()
+	for _, hidden := range []string{"kbtool bench", "kbtool mtls", "kbtool client", "mcp serve", "daemon run", "[-ip …] [-dns …]", "https://HOST:PORT/ kb1TOKEN", "Snapshot builds"} {
+		if strings.Contains(u, hidden) {
+			t.Fatalf("release usage leaves %q out:\n%s", hidden, u)
+		}
+	}
+	for _, shown := range []string{"kbtool collaborate host", "kbtool relay self-host", "kbtool query", "kbtool bundle", "kbtool mcp "} {
+		if !strings.Contains(u, shown) {
+			t.Fatalf("release usage lists %q", shown)
+		}
+	}
+	if !strings.Contains(certHint(), "collaborate") || strings.Contains(certHint(), "mtls") || enrollPrefix() != attendPrefix {
+		t.Fatal("release hints name session commands")
+	}
+	if !strings.Contains(string(mustReadFile(t, ".goreleaser.yaml")), "-X main.preRelease={{ .IsSnapshot }}") {
+		t.Fatal("goreleaser sets preRelease from IsSnapshot")
+	}
+}
+
+// Why: a board name is bound to its seed for good, so an agent that forgot
+// it signed up must not take a second name, whatever the call method; a seed
+// the board does not know (another board) must not block a signup.
+func TestSignupGuard(t *testing.T) {
+	tb := newBoardToolbox(t, nil)
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Outside a session: ./.kbtool-seed and this process's signups.
+	ex := withSession(tb)
+	out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "alice"})
+	seed := signupSeed(out)
+	if isErr || seed == "" {
+		t.Fatalf("first signup: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "alice2"}); !isErr || !strings.Contains(out, "already signed up as alice") {
+		t.Fatalf("a second signup in one MCP session must be refused: %s", out)
+	}
+	if err := os.WriteFile(".kbtool-seed", []byte(seed), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, isErr := layerCall(t, withSession(tb), "board_signup", map[string]any{"name": "alice3"}); !isErr || !strings.Contains(out, "already signed up as alice") {
+		t.Fatalf("a valid ./.kbtool-seed must refuse a signup: %s", out)
+	}
+	stale := strings.Repeat("ab", ed25519.SeedSize)
+	if err := os.WriteFile(".kbtool-seed", []byte(stale), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, isErr := layerCall(t, withSession(tb), "board_signup", map[string]any{"name": "carol"}); isErr || !strings.Contains(out, "moved it to .kbtool-seed.unrecognized-") {
+		t.Fatalf("an unrecognized seed is moved aside and the signup goes ahead: %s", out)
+	}
+	if _, err := os.Stat(".kbtool-seed"); err == nil {
+		t.Fatal("the unrecognized seed must be moved away")
+	}
+
+	// In a session: the session seed, the same for MCP and the CLI.
+	sdir := memSession(t)
+	if err := os.WriteFile(filepath.Join(sdir, ".kbtool-seed"), []byte(stale), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ex = withSession(tb)
+	if out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "dave"}); isErr || !strings.Contains(out, "not registered on this board") {
+		t.Fatalf("session: an unrecognized seed is moved aside: %s", out)
+	}
+	if out, isErr := layerCall(t, ex, "board_signup", map[string]any{"name": "dave2"}); !isErr || !strings.Contains(out, "already signed up as dave") {
+		t.Fatalf("session: a valid seed refuses another signup: %s", out)
+	}
+	if out, isErr := layerCall(t, withSession(tb), "board_signup", map[string]any{"name": "dave3"}); !isErr || !strings.Contains(out, "already signed up as dave") {
+		t.Fatalf("session: a new MCP process must be refused too: %s", out)
+	}
+}
+
+// Why: the self-hosted relay's port is drawn once, outside the common service
+// ports and every OS's ephemeral range, and a taken port is an error rather
+// than a silent move (that would break every enrollment line).
+func TestSelfHostPort(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		p, err := pickSelfHostPort()
+		if err != nil || p < selfHostPortMin || p > selfHostPortMax {
+			t.Fatalf("pickSelfHostPort: %d %v", p, err)
+		}
+	}
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if l2, err := listenSelfRelay(ln.Addr().(*net.TCPAddr).Port); err == nil {
+		l2.Close()
+		t.Fatal("a taken self-hosted relay port must be an error")
+	}
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	if err := saveRelayJSON(&relayJSON{Enabled: true, SelfHost: true}); err != nil {
+		t.Fatal(err)
+	}
+	tok, port, err := selfHostSettings()
+	if err != nil || len(tok) != 32 || port < selfHostPortMin {
+		t.Fatalf("selfHostSettings: %q %d %v", tok, port, err)
+	}
+	if tok2, port2, _ := selfHostSettings(); tok2 != tok || port2 != port {
+		t.Fatal("the self-hosted relay's token and port are generated once and kept")
+	}
+}
+
+// TestRelaySelfHostCLI: why — LAN/VPN collaboration through the relay the
+// daemon hosts in memory: the session ignores (and keeps) its remote sticky
+// relay, certificates are reissued for this machine's addresses, clients
+// enroll at any of them, `relay self-host stop|start` acts on the running
+// daemon on the same port, nothing is written for the relay, and stopping
+// self-hosting returns the session to its remote relay.
+func TestRelaySelfHostCLI(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	relayDir, srvDir, cliDir := shortStateDir(t), shortStateDir(t), shortStateDir(t)
+	env := func(dir string) []string {
+		return append(os.Environ(), "KBTOOL_DIR="+dir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=")
+	}
+	run := func(dir string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = env(dir)
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	n := 0
+	spawn := func(dir string, args ...string) (*exec.Cmd, string) {
+		t.Helper()
+		n++
+		logPath := filepath.Join(work, fmt.Sprintf("p%d.log", n))
+		lf, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := exec.Command(bin, args...)
+		c.Env = env(dir)
+		c.Stdout, c.Stderr = lf, lf
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Process.Kill(); _, _ = c.Process.Wait(); lf.Close() })
+		return c, logPath
+	}
+	stop := func(c *exec.Cmd) {
+		_ = c.Process.Signal(syscall.SIGTERM)
+		_, _ = c.Process.Wait()
+	}
+	waitLog := func(path, want string) string {
+		t.Helper()
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if l := string(mustReadFile(t, path)); strings.Contains(l, want) {
+				return l
+			}
+		}
+		t.Fatalf("%q not in log:\n%s", want, mustReadFile(t, path))
+		return ""
+	}
+	cfgOf := func() config {
+		var c config
+		if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "config.json")), &c); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	rjOf := func() relayJSON {
+		var rj relayJSON
+		if err := json.Unmarshal(mustReadFile(t, filepath.Join(srvDir, "relay.json")), &rj); err != nil {
+			t.Fatal(err)
+		}
+		return rj
+	}
+
+	// A session that sticks to a remote relay first.
+	hpA := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	urlA := "https://" + hpA + "/"
+	spawn(relayDir, "relay", "run", "-bind", hpA)
+	for deadline := time.Now().Add(15 * time.Second); !relayHealthy(hpA); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("relay did not come up")
+		}
+	}
+	if out, err := run(srvDir, "relay", "join", urlA); err != nil {
+		t.Fatalf("relay join: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "mtls", "-expire", "1h"); err != nil {
+		t.Fatalf("mtls: %v\n%s", err, out)
+	}
+	sid := cfgOf().RelaySession
+	d1, log1 := spawn(srvDir, "daemon", "run")
+	waitLog(log1, "relay "+hpA+": session "+sid+" registered")
+	stop(d1)
+	if cfgOf().RelayURL != urlA {
+		t.Fatalf("the session sticks to %s: %+v", urlA, cfgOf())
+	}
+
+	// Self-hosting: a random port in range and a token, generated once.
+	out, err := run(srvDir, "relay", "self-host", "start")
+	rj := rjOf()
+	if err != nil || !rj.SelfHost || len(rj.SelfHostToken) != 32 || rj.SelfHostPort < selfHostPortMin || rj.SelfHostPort > selfHostPortMax ||
+		!strings.Contains(out, fmt.Sprintf("port %d", rj.SelfHostPort)) {
+		t.Fatalf("relay self-host start: %v %+v\n%s", err, rj, out)
+	}
+	port := rj.SelfHostPort
+	selfHP := fmt.Sprintf("127.0.0.1:%d", port)
+	if out, err := run(srvDir, "relay", "ls"); err != nil || !strings.Contains(out, "self-hosting") || !strings.Contains(out, "remembers it (unused while self-hosting)") {
+		t.Fatalf("relay ls while self-hosting: %v\n%s", err, out)
+	}
+	// New certificates while self-hosting cover every address of this machine.
+	if out, err := run(srvDir, "mtls", "-expire", "1h"); err != nil || !strings.Contains(out, "on the relay the daemon hosts itself") || !strings.Contains(out, dockerHostName) {
+		t.Fatalf("mtls while self-hosting covers this machine's addresses: %v\n%s", err, out)
+	}
+	sid = cfgOf().RelaySession
+	if cfgOf().RelayURL != urlA {
+		t.Fatalf("self-hosting must keep the remembered remote relay untouched: %+v", cfgOf())
+	}
+
+	d2, log2 := spawn(srvDir, "daemon", "run")
+	waitLog(log2, fmt.Sprintf("self-hosted relay (in memory) listening on :%d", port))
+	logText := waitLog(log2, "relay "+selfHP+": session "+sid+" registered")
+	if strings.Contains(logText, hpA) {
+		t.Fatalf("self-hosting must not try remote relays:\n%s", logText)
+	}
+	time.Sleep(300 * time.Millisecond)
+	lines := regexp.MustCompile(`kbtool client -import (kb1\S+)`).FindAllStringSubmatch(string(mustReadFile(t, log2)), -1)
+	var loopLine string
+	hosts := map[string]bool{}
+	for _, m := range lines {
+		tok, err := parseEnrollToken(m[1])
+		if err != nil || tok.Port != port || tok.Session != sid {
+			t.Fatalf("enrollment line for the self-hosted relay: %+v %v", tok, err)
+		}
+		hosts[tok.Host] = true
+		if tok.Host == "127.0.0.1" {
+			loopLine = m[1]
+		}
+	}
+	if !hosts["127.0.0.1"] || !hosts[dockerHostName] {
+		t.Fatalf("one enrollment line per address of this machine: %v", hosts)
+	}
+	if out, err := run(cliDir, "client", "-import", loopLine, "-yes"); err != nil || !strings.Contains(out, "enrolled") {
+		t.Fatalf("enroll through the self-hosted relay: %v\n%s", err, out)
+	}
+	if out, err := run(cliDir, "status"); err != nil || !strings.Contains(out, "daemon:   reachable") {
+		t.Fatalf("client through the self-hosted relay: %v\n%s", err, out)
+	}
+	if out, err := run(srvDir, "status"); err != nil || !strings.Contains(out, "relay:    session "+sid+" on the self-hosted relay") || !strings.Contains(out, "remembers remote relay "+urlA) {
+		t.Fatalf("status while self-hosting: %v\n%s", err, out)
+	}
+	for _, f := range []string{"relay.pid", "relay.log", "relay.sock"} {
+		if fileExists(filepath.Join(srvDir, f)) {
+			t.Fatalf("the self-hosted relay lives in memory; found %s", f)
+		}
+	}
+
+	// Live control of the running daemon's relay, same port both times.
+	if out, err := run(srvDir, "relay", "self-host", "stop"); err != nil || !strings.Contains(out, "stopped its relay") {
+		t.Fatalf("relay self-host stop (live): %v\n%s", err, out)
+	}
+	if relayHealthy(selfHP) {
+		t.Fatal("the self-hosted relay must stop with self-host stop")
+	}
+	if out, err := run(srvDir, "relay", "self-host", "start"); err != nil || !strings.Contains(out, fmt.Sprintf("hosts the relay on port %d", port)) {
+		t.Fatalf("relay self-host start (live): %v\n%s", err, out)
+	}
+	ok := false
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline) && !ok; time.Sleep(200 * time.Millisecond) {
+		out, err := run(cliDir, "status")
+		ok = err == nil && strings.Contains(out, "daemon:   reachable")
+	}
+	if !ok {
+		t.Fatalf("the old enrollment keeps working after a live restart on the kept port:\n%s", mustReadFile(t, log2))
+	}
+	stop(d2)
+	if relayHealthy(selfHP) {
+		t.Fatal("the self-hosted relay must stop with the daemon")
+	}
+
+	// Self-hosting off: the session returns to its remembered remote relay.
+	if out, err := run(srvDir, "relay", "self-host", "stop"); err != nil || rjOf().SelfHost || rjOf().SelfHostToken != rj.SelfHostToken {
+		t.Fatalf("relay self-host stop keeps the token: %v %+v\n%s", err, rjOf(), out)
+	}
+	_, log3 := spawn(srvDir, "daemon", "run")
+	waitLog(log3, "relay "+hpA+": session "+sid+" registered")
+}
+
+// TestEncryptedLocalAndSelfHostedSessions: why — with encryption on, a local
+// session and a self-hosted one are kept exactly like a remote-relay session:
+// finishing seals everything into one sessions/*.kbx and leaves only the
+// global files in the state dir.
+func TestEncryptedLocalAndSelfHostedSessions(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH; cannot build the binary")
+	}
+	work := t.TempDir()
+	bin := filepath.Join(work, "kbtool")
+	if b, err := exec.Command(goBin, "build", "-o", bin, "kbtool.go").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	hostDir, hostWork := shortStateDir(t), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostWork, "repo", ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestPEM(t, filepath.Join(hostWork, "repo"), "a.go", []byte("package a\nfunc Alpha() {}\n"))
+	run := func(secret string, args ...string) (string, error) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		c := exec.CommandContext(ctx, bin, args...)
+		c.Env = append(os.Environ(), "KBTOOL_DIR="+hostDir, "HOME="+work, "KB_EMBED_URL=", "KBTOOL_SOCKET=", "KBTOOL_RELAY_BIND=", "KBTOOL_RELAY_PORT=",
+			secretEnv+"="+secret, "MYKEY=first key")
+		c.Dir = hostWork
+		out, err := c.CombinedOutput()
+		return string(out), err
+	}
+	t.Cleanup(func() {
+		_, _ = run("first key", "collaborate", "finish")
+		_, _ = run("", "relay", "stop")
+	})
+	// A standalone relay may run in the same state dir and outlives sessions.
+	if out, err := run("", "relay", "start", "-bind", fmt.Sprintf("127.0.0.1:%d", freePort(t))); err != nil {
+		t.Fatalf("relay start beside the daemon's state: %v\n%s", err, out)
+	}
+	sealedOnly := func(want int) {
+		t.Helper()
+		if k := kbxFilesIn(t, hostDir); len(k) != want {
+			t.Fatalf("want %d sealed sessions, got %v", want, k)
+		}
+		ents, _ := os.ReadDir(hostDir)
+		for _, e := range ents {
+			if !collabKeep[e.Name()] {
+				t.Fatalf("finish must leave only %v in the state dir; found %s", collabKeep, e.Name())
+			}
+		}
+		sub, _ := os.ReadDir(filepath.Join(hostDir, "sessions"))
+		for _, e := range sub {
+			if e.IsDir() {
+				t.Fatalf("no plain session dir may remain: %s", e.Name())
+			}
+		}
+	}
+
+	out, err := run("", "collaborate", "host", "-yes", "-encrypt", "-db-key-env", "MYKEY")
+	if err != nil || !strings.Contains(out, "local session") {
+		t.Fatalf("encrypted local session: %v\n%s", err, out)
+	}
+	if out, err := run("first key", "collaborate", "finish"); err != nil {
+		t.Fatalf("finish (local): %v\n%s", err, out)
+	}
+	sealedOnly(1)
+
+	if out, err := run("first key", "relay", "self-host", "start"); err != nil {
+		t.Fatalf("relay self-host start: %v\n%s", err, out)
+	}
+	out, err = run("first key", "collaborate", "host", "-yes")
+	if err != nil || !strings.Contains(out, "kbtool collaborate attend kb1") || !strings.Contains(out, "# via ") {
+		t.Fatalf("encrypted self-hosted session: %v\n%s", err, out)
+	}
+	if doc := string(mustReadFile(t, filepath.Join(hostWork, "AGENTS_COLLABORATION.md"))); !strings.Contains(doc, "through the relay it hosts on this machine") {
+		t.Fatal("the agent's doc names the self-hosted relay")
+	}
+	if out, err := run("first key", "collaborate", "finish"); err != nil {
+		t.Fatalf("finish (self-hosted): %v\n%s", err, out)
+	}
+	sealedOnly(2)
+	if out, err := run("", "relay", "status"); err != nil || !strings.Contains(out, "running") {
+		t.Fatalf("finishing sessions must leave a standalone relay manageable: %v\n%s", err, out)
+	}
 }

@@ -1,9 +1,15 @@
 # kbtool bench — full reference
 
+Applies to snapshot builds only (`make release-snapshot` or `go build`); release builds refuse this command.
+
 In-process query benchmark: load the db once, then run N deterministic
 synthetic queries (1–3 real identifier tokens drawn from the corpus) and
 report min/p50/p95/max latency. This is the honest way to measure pure query
 cost (no process spawn, no socket, no DB reload).
+
+**Pre-release builds only.** `bench` is a development tool. Snapshot builds
+(`make release-snapshot`) and `go build` include it; release binaries refuse
+it and leave it out of `kbtool help`.
 
 ```
 kbtool bench -db PATH [-n N] [-mode M] [-k N] [-seed S]
@@ -42,5 +48,5 @@ kbtool bench -seed 7 -k 16
 ## Related
 
 - Simple example: [bench-simple.md](bench-simple.md)
-- Search modes in detail: [query.md](query.md)
-- Back to [README](../README.md)
+- Search modes in detail: [query.md](../query.md)
+- Back to [README](../../README.md)
