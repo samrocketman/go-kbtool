@@ -1,131 +1,105 @@
 # kbtool daemon — full reference
 
-The background service. Load the pre-built DB, serve it (and the message
-board) on a unix socket, optionally rebuild, optionally serve TCP with mTLS.
+The session's background service. `kbtool collaborate host` (and
+`kbtool collaborate resume` on the host) starts it: it loads the session's
+index, serves it and the message board on a unix socket and, when the session
+goes through a relay, to collaborators over mTLS through that relay.
 
 ```
-kbtool daemon run  [opts] [-live] [repo …]     # foreground (same flags as start)
-kbtool daemon start [opts] [-live] [repo …]    # background (detached, pid file)
-kbtool daemon stop
 kbtool daemon status                            # pid + socket
+kbtool daemon stop                              # stops it and finishes the host's session
 ```
 
-## Options (shared by `run` and `start`)
+There is nothing to start by hand: hosting or resuming a session starts the
+daemon, and finishing it (`kbtool collaborate finish`, or `daemon stop`)
+stops it ([collaborate.md](collaborate.md)).
 
-### Build / store
-
-| Flag | Default | Description |
-|---|---|---|
-| `-src DIR` | config sources | Source dir to build from when no DB exists. |
-| `-build` | off | Force rebuild from sources. |
-| `-dim N` | config, else 1024 | Embedding dimension. |
-| `-chunk N` | config, else 48 | Chunk size (lines). |
-| `-overlap N` | config, else 12 | Chunk overlap (lines). |
-| `-maxkb N` | config, else 512 | Max file size (KB). |
-| `-git` | config | Rebuild with git history + provenance. |
-| `-gitmaxcommits N` | config, else 200 | Per-repo commit cap. |
-| `-gitdiffmaxkb M` | config, else 8000 | Global KB cap on baked diffs. |
-| `-kwpath[=false]` | config, else on | Path-leaf + kind tokens in the keyword index. |
-| `-db PATH` | config, else `<state>/kb.db` | Db file. |
-| `-db-key-env NAME` | — | DB-at-rest key from `$NAME` (encrypted store). |
-| `-db-key-file PATH` | — | DB-at-rest key from file `PATH` (encrypted store). |
-
-### Live repos
-
-| Flag | Description |
-|---|---|
-| `-live` | Boolean: the **positional args after it** are live git repos used by `git_blame` / `git_log` (post-build state). Without `-live`, live repos come from config (recorded by `build -git` or an earlier `daemon start -live …`). |
-
-### Network / mTLS
-
-| Flag | Default | Description |
-|---|---|---|
-| `-http` | config, else **on with mTLS**, off without | Also serve over TCP: `GET /healthz` + `POST /mcp` (JSON-RPC). With mTLS on (`-mtls` or config) HTTP is on by default, on all interfaces (`:9876`); pass `-http=false` for a unix-socket-only mTLS daemon (needed on each start: `config.json` cannot record "off"). With a relay configured (`relay_url`), HTTP is off unless `-http` or config `http: true`. |
-| `-mtls` | off (or config) | Require mTLS on the served socket(s). Requires server + client certs (`kbtool mtls`). With mTLS the protocol is TLS (HTTP/2 via ALPN). |
-| `-http-allow-insecure` | off | Allow cleartext (unauthenticated) HTTP on a **non-loopback** bind. Default: refused — use `-mtls`, or bind `127.0.0.1`. Loudly warned when in effect. |
-| `-bind HOST:PORT` | config, else `:9876` with `-mtls` / `127.0.0.1:9876` without | TCP listen address (IPv6 in brackets). |
-| `-crl FILE` | config, else `<state>/crl.pem` | CRL PEM file with revoked client certs (may not exist — no revocation data). Enforced at the TLS handshake. |
-| `-crlrefresh` | off | Periodically re-load the CRL file. Default (off): the file is **watched** for changes. |
-| `-crlinterval SEC` | 60 | CRL reload period when `-crlrefresh`. |
-
-### Message board
-
-| Flag | Default | Description |
-|---|---|---|
-| `-board-max-memory VALUE` | config `message_board_max_memory`, else `25%` | Memory limit for the whole board (messages + agents + attachments), e.g. `25%` of the memory available at launch or `512MiB`. An invalid value refuses to start. The resolved limit is logged at startup, with a warning if the existing board is already over it. See [client-server-config.md](client-server-config.md). |
-
-> **Shared client certificates are allowed by design.** Many clients may
-> present the same `client.crt`/`client.key` (one enrollment line authorizes a
-> dozen+ concurrent clients) — TLS and the daemon enforce no per-certificate
-> uniqueness. The CRL is the kill switch for a shared identity: revoking the
-> certificate revokes **every** holder of it.
+> **Shared client certificates are allowed by design.** Every attendee who
+> enrolls with the same enrollment line presents the same
+> `client.crt`/`client.key` (one line authorizes a dozen+ concurrent clients)
+> — TLS and the daemon enforce no per-certificate uniqueness. Finishing the
+> session and resuming it once the certificates expire issues new ones;
+> attendees then enroll again with the new line.
 
 ## Behavior
 
-- **Precedence:** explicit flag > `config.json` > default — for every option,
-  including network fields. `kbtool status` shows the resolved values.
-- **Cleartext-HTTP guard:** a non-loopback `-http` bind is refused unless
-  `-mtls` or `-http-allow-insecure`. Default bind is loopback without mTLS
-  (local trust) and dual-stack `:9876` with mTLS. A rejected start leaves no
-  state behind (fails before pid file / socket exist).
-- **At-rest encryption:** with an encrypted store the key resolves from
-  `-db-key-env` > `-db-key-file` > `$KBTOOL_DBKEY` > prompt (hidden input,
-  TTY). `daemon start` passes the key to the detached child via `$KBTOOL_DBKEY`
-  only. A mixed plain/encrypted state is refused before serving.
-- **Message board:** when `message_board: true` in `config.json`, the board
-  is auto-initialized at daemon start (board file + `welcome` thread) and
-  stays searchable (`kind=board`) and live across clients.
-- **Client enrollment (`-http -mtls`):** the TCP port speaks three protocols,
-  split on the first byte of each connection. Plain HTTP serves only
-  `GET /ca.crt`. TLS without a client certificate reaches only
-  `GET /bundle/<id>`: the client bundle, encrypted per request with a key the
-  daemon generates at boot and keeps in memory. Every other route (`/mcp`,
-  `/healthz`) requires a verified client certificate, and the CRL still
-  applies; the unix socket keeps requiring a client certificate at the
-  handshake. At boot the daemon prints one
-  `kbtool client -import https://HOST:PORT/ kb1…`
-  command per server-certificate SAN endpoint, so you can pick the address the
-  client can reach and copy its line. With `start` (or `run` in a terminal)
-  stdout is the log, so the log holds exactly those bare commands, and `start`
-  relays them to the console. When stdout is redirected elsewhere (e.g.
-  `daemon run > enroll.txt`), the log also gets one
-  `enroll a client via HOST:PORT: kbtool client -import …` entry per endpoint. The key (and so the `kb1…`
-  token) changes on every start. If `client.crt`/`client.key` are missing, enrollment is disabled
-  with a warning and the port is mTLS-only. See [client.md](client.md).
-- **Relay mode (`relay_url` in `config.json`):** written by
-  `kbtool mtls -relay` / `kbtool relay establish`. The daemon registers its
-  stored `relay_session` with the relay, re-registers the same ID after every
-  restart or reconnect (it retries forever with jittered backoff, and a
-  bare `daemon start` needs no relay arguments and no reachable relay),
-  receives client streams through it, and sends its CA
-  in the TLS chain (plain HTTP cannot pass the relay). It prints
-  `kbtool client -import kb1…` first; that token carries the relay address and
-  session. It opens
-  no TCP port unless HTTP is asked for, requires mTLS, and refuses to start
-  while a relay runs in the same state dir. See [relay.md](relay.md).
-- **start vs run:** `start` detaches (pid file, logs under the state dir,
-  mode 0600),
-  records explicitly-passed flags into `config.json`. `run` never writes
-  config. Both remove a leftover `client.json`: the host's CLI uses the unix
-  socket only.
-- The unix socket is `<state>/daemon.sock` (`KBTOOL_SOCKET` overrides).
-  `mcp serve/start` is the same engine under `<state>/mcp.sock` — see
-  [mcp.md](mcp.md).
+- **Unix socket:** the daemon always serves `<state>/daemon.sock`. The
+  host's CLI (`query`, `build`, `board`, …) and its agent's `kbtool mcp`
+  talk to it there, never over the network. When the session uses a relay
+  the socket also requires mTLS, with the state dir's `client.crt` /
+  `client.key` and `ca.crt`.
+- **Clients need the daemon:** `query`, `terms`, `bundle`, `call`, `tools`,
+  stdio `mcp` and the `board` verbs all go through a running daemon and fail
+  when none runs; none of them opens the store.
+- **Stopping finishes the host's session:** when the daemon hosts the active
+  session, stopping it gracefully (`daemon stop`, SIGTERM, SIGINT, an
+  operating system shutdown) finishes the session like
+  `kbtool collaborate finish`: in an encrypted state dir the session is
+  sealed before the process exits ([collaborate.md](collaborate.md)).
+  `daemon stop` waits up to two minutes for the daemon to exit. A daemon that
+  dies without that (SIGKILL, a crash, power loss) leaves the session plain;
+  every command except `kbtool session validate` (and `help`/`version`) then
+  refuses until `session validate` has checked and sealed it
+  ([session.md](session.md#after-an-unclean-shutdown)).
+- **Encryption key:** in an encrypted state dir (`kbtool collaborate host
+  -encrypt`, session.json `"encrypt": true`) the session commands resolve the
+  key from `-db-key-env` > `-db-key-file` > `$KBTOOL_SECRET` (prompting only
+  when `-encrypt` turns encryption on) and hand it to the daemon through
+  `$KBTOOL_SECRET` only, never argv or a file. The daemon keeps it in memory,
+  re-seals the store with it (so `kbtool build` and the board need no key)
+  and seals the session with it when it stops. Without a key the daemon does
+  not start. A mixed plain/encrypted state is refused before serving.
+- **Message board:** the board is on in sessions (`collaborate host` turns
+  `message_board` back on), auto-initialized at daemon start (board file +
+  `welcome` thread), and stays searchable (`kind=board`) and live across
+  clients.
+- **Local session:** with no enabled relay the daemon serves only its unix
+  socket and prints no enrollment line: the index and the board are yours and
+  your agent's alone. `kbtool relay disable` has the same effect on a
+  session that has a relay.
+- **Relay mode (`relay_session` in `config.json`):** written by
+  `kbtool collaborate host` (or `collaborate resume`) when relays are enabled
+  and joined (`kbtool relay join`; `relay.json` holds each relay's URL, token
+  and trust) or self-hosted. The session uses its sticky relay
+  (`relay_url`), or on first start the first joined relay, round robin, that
+  accepts it ([relay.md](relay.md#round-robin-and-sticky-relays)). With
+  `selfhost` on in `relay.json` (`kbtool relay self-host start`), the daemon
+  runs its own relay in memory on `selfhost_port` and the session uses it
+  alone, printing one enrollment line per covered address
+  ([relay.md](relay.md#self-hosted-relay-relay-self-host-startstop-daemon-host)).
+  The daemon registers its `relay_session` with the relay, re-registers the
+  same ID after every restart or reconnect (it retries forever with jittered
+  backoff), receives client streams through it, and sends its CA in the TLS
+  chain. It opens no TCP port of its own and refuses to start while a relay
+  service runs in the same state dir. See [relay.md](relay.md).
+- **What attendees reach:** relayed streams end at the daemon as TLS. Without
+  a client certificate a stream reaches only the encrypted enrollment bundle
+  (`GET /bundle/<id>`, encrypted per request with a key the daemon generates
+  at boot and keeps in memory); `POST /mcp` (JSON-RPC, the attendees' CLI and
+  `kbtool mcp`) and `GET /healthz` require a verified client certificate.
+- **Enrollment lines:** at boot a relayed daemon prints one
+  `kbtool collaborate attend kb1…` line per relay address; the token carries
+  the relay address, the session and the boot key, so it changes on every
+  start. `collaborate host`/`resume` relay the lines to the console; the
+  daemon log (mode 0600) holds them too. If `client.crt`/`client.key` are
+  missing, enrollment is disabled with a warning.
+- **Bookkeeping:** the pid file and the log live in the state dir (mode
+  0600). Starting the daemon removes a leftover `client.json`: the host's CLI
+  uses the unix socket only.
 
 ## Examples
 
 ```sh
-kbtool daemon start                          # bare: last build's options
-kbtool daemon start -live /path/to/repoA     # override + re-record
-kbtool daemon run -http -mtls -bind 10.0.0.5:9876
-kbtool daemon stop && kbtool daemon status
+kbtool daemon status          # is the session's daemon up?
+kbtool status                 # the whole picture: session, relay, daemon, board, tools
+kbtool daemon stop            # same as kbtool collaborate finish on the host
+kbtool collaborate resume     # start it again
 ```
 
 ## Related
 
 - Simple example: [daemon-simple.md](daemon-simple.md)
-- mTLS PKI setup: [mtls-simple.md](mtls-simple.md)
-- Daemon behind NAT: [relay.md](relay.md)
-- Client bundle for other machines: [client-simple.md](client-simple.md)
+- Sessions that start and stop it: [collaborate.md](collaborate.md)
+- Collaborators behind NAT, LAN or VPN: [relay.md](relay.md)
 - Server/client config files: [client-server-config.md](client-server-config.md)
 - Back to [README](../README.md)

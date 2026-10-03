@@ -1,74 +1,38 @@
 # kbtool mcp — full reference
 
-The MCP server in three shapes:
+The MCP server for agents, over stdio. The agent's harness spawns it.
 
 ```
-kbtool mcp                                   # stdio server (agent spawns it)
-kbtool mcp serve [opts] [-live] [repo …]     # foreground, unix socket (alias: run)
-kbtool mcp start [opts] [-live] [repo …]     # background (detached)
-kbtool mcp stop
-kbtool mcp status
+kbtool mcp
 ```
 
-## stdio mode: `kbtool mcp`
+## Behavior
 
 - Serves MCP over **stdin/stdout** (newline-delimited JSON-RPC:
   `initialize`, `ping`, `tools/list`, `tools/call`).
-- Loads the db from config (`sources`, dim, chunk, …) and builds it if the db
-  file is missing. No socket, no pid file, no prompt — ideal for agents.
-- **Key flags** (must come before any subcommand; the stdio server never
-  prompts, it fails closed without a key):
-
-| Flag | Description |
-|---|---|
-| `-db-key-env NAME` | DB-at-rest key from `$NAME` (encrypted stores). |
-| `-db-key-file PATH` | DB-at-rest key from file `PATH` (encrypted stores). |
-
+- Proxies every call to the session's running daemon: the unix socket on the
+  session host, the `client.json` endpoint on an attendee (mTLS through the
+  session's relay, `POST /mcp`). It never opens the db, never starts a
+  daemon, and fails at once when none runs. The daemon holds the at-rest
+  key, so no key flags.
+- **Session layer:** while a collaboration session is active, `kbtool mcp`
+  stands between the agent and the board. The session's board seed is
+  supplied by kbtool and never shown to the agent, attachments are packed
+  from the agent's session memory and extracted into it (base64 attachments
+  from the agent are refused), and the session's `memory`, `consensus_files`
+  and `deliverables_files` are extra tools ([collaborate.md](collaborate.md)).
+  Outside a session it only guards `board_signup` (one signup per MCP
+  process).
 - The agent receives the enabled tool list via `tools/list` (disabled tools
   hidden; see [client-server-config.md](client-server-config.md)) and
   `initialize` returns server info + instructions.
-
-## serve / run / start
-
-`mcp serve|run` runs in the **foreground** (like `daemon run`); `mcp start`
-detaches it in the background. All accept the full serving flag set —
-identical to the daemon's (see [daemon.md](daemon.md) for the complete table):
-
-- build options: `-src -build -dim -chunk -overlap -maxkb -git -gitmaxcommits
-  -gitdiffmaxkb -kwpath -db`
-- live repos: `-live repoA repoB …` (positional args after `-live` feed
-  `git_blame` / `git_log`)
-- at-rest key: `-db-key-env NAME | -db-key-file PATH`
-- network: `-http -mtls -http-allow-insecure -bind HOST:PORT -crl FILE
-  -crlrefresh -crlinterval SEC`
-- message board: `-board-max-memory 25%|512MiB` (memory limit for all
-  messages + attachments; default: config `message_board_max_memory`, else
-  `25%`)
-
-Extra `start` behavior:
-
-- Records the flags you explicitly passed into `config.json` (a bare `start`
-  leaves the file untouched), so the next bare start reproduces the setup.
-- Removes a leftover `client.json`: the host's CLI uses the unix socket only.
-
-`stop` terminates the running service; `status` prints pid + socket.
-
-## Behavior notes
-
-- Serves the unix socket `<state>/mcp.sock` (or `$KBTOOL_SOCKET`) by default;
-  `-http` adds TCP (`GET /healthz`, `POST /mcp`); `-mtls` makes it mTLS.
-  Cleartext on a non-loopback bind is refused unless `-mtls` or
-  `-http-allow-insecure` — see [daemon.md](daemon.md) for the rules.
-- If a **daemon** (`daemon.sock`) is already running, one-shot CLI commands
-  (`query`, `call`) may route through either service; run `kbtool status` to
-  see which are up.
-- Encrypted store: the key resolves from flag > `$KBTOOL_DBKEY` > prompt
-  (TTY) for serve/run/start; stdio never prompts.
+- Client commands (`query`, `call`, …) reach the same daemon; run
+  `kbtool status` to see whether it is up.
 
 ## Related
 
 - Simple example: [mcp-simple.md](mcp-simple.md)
-- Background service details: [daemon-simple.md](daemon-simple.md)
-- Network sharing with mTLS: [mtls-simple.md](mtls-simple.md)
+- The daemon it talks to: [daemon.md](daemon.md)
+- Sessions: [collaborate.md](collaborate.md)
 - Register with an agent harness: [mcp-server-config.md](mcp-server-config.md)
 - Back to [README](../README.md)

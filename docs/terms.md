@@ -2,12 +2,11 @@
 
 A complete occurrence census of one exact identifier or string across the
 indexed source, so presence — and especially **absence** — is a citable result
-rather than an inference. Part of the context-bundle feature set
-(`plans/context-bundle-plan.md`); it is also the MCP tool `kb_terms`.
+rather than an inference. Part of the context-bundle feature set, with
+[bundle.md](bundle.md); it is also the MCP tool `kb_terms`.
 
 ```
-kbtool terms <identifier-or-string> [-k N] [-json] [-db PATH]
-             [-db-key-env NAME | -db-key-file PATH]
+kbtool terms <identifier-or-string> [-k N] [-json]
 ```
 
 ## Options
@@ -17,9 +16,6 @@ kbtool terms <identifier-or-string> [-k N] [-json] [-db PATH]
 | `<term>` | — | Exact identifier or string. Case-sensitive substring match over every indexed chunk (identifiers *and* string literals). |
 | `-k N` | 20 | Max files to show. The true total is always reported (`fileCount`), so truncation is visible. |
 | `-json` | off | Machine-readable JSON (see below). |
-| `-db PATH` | config db, else `<state>/kb.db` | Db file, used when the daemon is down. |
-| `-db-key-env NAME` | — | DB-at-rest key from `$NAME` (encrypted stores). |
-| `-db-key-file PATH` | — | DB-at-rest key from file `PATH` (encrypted stores). |
 
 ## Behavior
 
@@ -30,9 +26,8 @@ kbtool terms <identifier-or-string> [-k N] [-json] [-db PATH]
 - **Distinct absence.** Zero hits print the line
   `ABSENT in indexed sources: "<term>" (0 occurrences in 0 files)` and exit
   `3`. That is the feature's reason to exist: absence as evidence.
-- **Access paths.** Daemon socket when the daemon is up (via the `kb_terms`
-  tool), else the direct db. Identical results either way; encrypted stores are
-  read with the usual key flags.
+- **Through the session's daemon.** The census is the daemon's `kb_terms`
+  tool; with no daemon running `terms` fails (exit 1).
 - Board messages are excluded — the census is over indexed *sources*.
 
 ## Exit codes

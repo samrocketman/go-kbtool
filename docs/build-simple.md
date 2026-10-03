@@ -1,25 +1,20 @@
 # kbtool build — quick start
 
-Build the local search index from one or more source directories (each may be
-a git repo) and write it to the default database file.
+Reindex the session's sources after the code changed. Only the session host
+runs it; the running daemon serves the new index at once, no restart.
 
 ```sh
-# One-time install first: a release binary (see README → Install), or from
-# a source checkout:
-#   go build -o /usr/local/bin/kbtool kbtool.go
+# The session indexes the working directory when it starts:
+kbtool collaborate host
 
-# Index one or more directories
-kbtool build /path/to/repoA /path/to/repoB
-
-# Include git history (commit messages + diffs) and per-line provenance
-kbtool build -git /path/to/repoA
+# …later, after pulling or editing code:
+kbtool build
 ```
 
 Typical output:
 
 ```
-built 1 source(s): 1842 chunks -> /home/you/.config/kbtool/kb.db (1520.3 KB)
-config: wrote /home/you/.config/kbtool/config.json (a bare `kbtool daemon start` will use these options)
+built 1 source(s): 1842 chunks -> swapped into the running daemon (unix /home/you/.config/kbtool/daemon.sock, plain); no restart needed
 ```
 
 Now try it:
@@ -31,10 +26,12 @@ kbtool status
 
 Notes:
 
-- With no directory arguments, `kbtool build` indexes the current directory (`.`).
-- Every build records its options in `config.json`, so a later bare
-  `kbtool daemon start` / `kbtool mcp` reproduces the same index. A `-git`
-  build also records the repos as *live*, enabling `git_blame` / `git_log`.
+- `kbtool build` takes no sources and no options: it rebuilds what
+  `kbtool collaborate host` indexed, with the same options.
+- With the message board on, each build posts a short summary (sources by
+  name, git commit, clean or dirty) in the board's `system` thread.
+- In an encrypted state dir the running daemon holds the key, so `build`
+  needs none.
 - Indexing is local: no network calls, no external embedding service.
 
-Full reference with every option: [build.md](build.md) · back to [README](../README.md)
+Full reference: [build.md](build.md) · back to [README](../README.md)

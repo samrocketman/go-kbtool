@@ -13,6 +13,7 @@ deliberately a **one-file, zero-dependency** program.
 ```
 kbtool.go          ALL production code (package main, ~8k lines)
 message_board.gohtml  html/template for `kbtool board dump`, embedded via //go:embed
+collaboration.md.gotmpl  text/template for AGENTS_COLLABORATION.md (`kbtool collaborate`), embedded via //go:embed
 kbtool_test.go     ALL tests (package main, ~4.3k lines, 200+ tests)
 .goreleaser.yaml   cross-compile + release packaging (linux/darwin only)
 .github/workflows/ ci.yml (PR gate) + release.yml (auto semver tag + publish)
@@ -31,14 +32,18 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
    directory, never vendor code. Enforced by
    `TestSingleFilePackage` / `TestSingleCommandBuild`.
 
-   **Exception: `message_board.gohtml`** is the one allowed additional
-   build input. It is not Go code; it is compiled into the binary with
-   `//go:embed` from `kbtool.go` and must never be read from disk at runtime
-   or shipped as a separate release asset. It must sit next to `kbtool.go`
-   so the single build command still works, and it must stay covered by a
-   test that runs the built binary from a directory without the template.
-   Do not add other embedded or non-`.go` build inputs without the owner's
-   approval.
+   **Exceptions: `message_board.gohtml` and `collaboration.md.gotmpl`** are
+   the only allowed additional build inputs. `message_board.gohtml` is the
+   `html/template` for `kbtool board dump`; `collaboration.md.gotmpl` is the
+   `text/template` that `kbtool collaborate` renders into
+   AGENTS_COLLABORATION.md (converted from the collaborative planning
+   workspace's AGENTS.md). Neither is Go code; both are compiled into the
+   binary with `//go:embed` from `kbtool.go` and must never be read from
+   disk at runtime or shipped as separate release assets. They must sit next
+   to `kbtool.go` so the single build command still works, and each must
+   stay covered by a test that runs the binary built with that command from
+   a directory without the template. Do not add other embedded or non-`.go`
+   build inputs without the owner's approval.
 2. **Go standard library only.** No third-party modules, no `go.sum`.
    `go.mod` must remain dependency-free. If a feature seems to need an
    external library, inline a minimal stdlib implementation instead (as was
@@ -68,13 +73,14 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
   keep user-facing command output testable that way when adding features.
 - Backwards compatibility is **NOT** a constraint — even after release. The
   databases are meant to be short-lived and are rebuilt before any complex
-  task, so on-disk formats, flags, and options may evolve freely (document
-  any breaking change in the plan).
+  task, so on-disk formats, flags, and options may evolve freely. This is an
+  alpha tool: write no migration code, no format compatibility shims and no
+  deprecation warnings.
 
 ### Tests
 - Append to `kbtool_test.go` under a **new numbered group** with a
   `// ---------- N. <name> ----------` header, and add the group to the
-  numbered list in the file's header comment (groups 1–24 currently).
+  numbered list in the file's header comment (groups 1–51 currently).
 - Every test should have a comment explaining *why* it exists (what
   regression it pins). This repo's owner may rewrite tests later from those
   notes.
@@ -85,6 +91,16 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
   Keep that true when adding subcommands or docs.
 
 ### Documentation & plans
+- README, `docs/` and the CLI help text describe **only the current
+  behavior**. When a change alters behavior, rewrite the affected text as if
+  it had always worked this way:
+  - no "breaking change", "migration", "previously", "no longer", "was
+    renamed" or "removed in" notes, and no instructions for upgrading old
+    setups;
+  - no references to `plans/` (plans are internal implementation history,
+    not user documentation);
+  - update every page that mentions the changed command, flag, file or
+    config field in the same change, simple and full pages alike.
 - Before implementing a feature, write `plans/<feature>-plan.md` describing
   goals, files touched, design decisions, and a verification section.
 - Before committing, update that plan with a **Summary** and a **Test

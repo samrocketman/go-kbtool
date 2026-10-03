@@ -1,7 +1,13 @@
 # kbtool bench — quick start
 
+Applies to snapshot builds only (`make release-snapshot` or `go build`); release builds refuse this command.
+
 Run a deterministic in-process query benchmark against an existing index and
 report min/p50/p95/max latency.
+
+**Pre-release builds only.** `bench` is a development tool. Snapshot builds
+(`make release-snapshot`) and `go build` include it; release binaries refuse
+it and leave it out of `kbtool help`.
 
 ```sh
 # After building:
@@ -24,4 +30,4 @@ Notes:
 - The query pool is derived from real identifier tokens in your corpus and is
   deterministic for a given `-seed`.
 
-Full reference with every option: [bench.md](bench.md) · back to [README](../README.md)
+Full reference with every option: [bench.md](bench.md) · back to [README](../../README.md)

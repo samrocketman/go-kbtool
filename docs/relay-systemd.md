@@ -23,13 +23,17 @@ and almost no state (only its pid file).
   | `KBTOOL_RELAY_PORT` | `9876` | Listen port on all interfaces. |
   | `KBTOOL_RELAY_BIND` | — | Full listen address `HOST:PORT`, e.g. `10.0.0.5:9876`. Wins over `KBTOOL_RELAY_PORT`. |
   | `KBTOOL_RELAY_TOKEN` | — (open) | Daemons must present this token to register. Keep it in the environment file, not on the command line. |
-  | `KBTOOL_RELAY_ROTATE` | `12h` | How often the in-memory CA is replaced (Go duration). |
-  | `KBTOOL_RELAY_CA_TTL` | `24h` | How long each CA is valid. Must be longer than the rotation interval. |
+  | `KBTOOL_RELAY_ROTATE` | `12h` | How often the in-memory CA and its keys are replaced (Go duration). |
   | `KBTOOL_RELAY_MAX_SESSIONS` | `5000` | Most daemon sessions registered at once; more registrations get 503. Also config `relay_max_sessions`. |
   | `KBTOOL_RELAY_CONN_RATE` | `20` | New connections per second per source IP (burst 5×). `0` turns the limit off. |
   | `KBTOOL_RELAY_REGISTER_RATE` | `30` | Registrations per minute per source IP (burst 10). `0` turns the limit off. |
   | `KBTOOL_RELAY_CERT` | — | Serve this certificate chain (PEM) instead of the in-memory CA. Needs `KBTOOL_RELAY_KEY`. |
   | `KBTOOL_RELAY_KEY` | — | Private key (PEM) for `KBTOOL_RELAY_CERT`. |
+  | `KBTOOL_RELAY_HEALTHZ_INTERVAL` | `1000` | Milliseconds between answered `/healthz` requests, whoever asks. `0` turns the limit off. |
+  | `KBTOOL_RELAY_HONEYPOT_REMEMBER` | `7200000` | Milliseconds a seen or suspicious client is remembered after its last answered request ([honeypot](relay.md#honeypot)). |
+  | `KBTOOL_RELAY_HONEYPOT_BLOCK` | `900000` | Milliseconds a client is dropped when it first turns suspicious. |
+  | `KBTOOL_RELAY_HONEYPOT_REBLOCK` | `3600000` | Milliseconds an already suspicious client is dropped on each further honeypot request. |
+  | `KBTOOL_RELAY_HONEYPOT_MAX_MEMORY` | `10%` | Memory for remembered honeypot clients (share of available memory, or a size like `64MiB`); the oldest are forgotten first. |
   | `KBTOOL_DIR` | `~/.config/kbtool` | State dir; only the pid file is written there. |
 
   An invalid value stops the relay at startup with the variable named.
@@ -63,12 +67,18 @@ KBTOOL_RELAY_TOKEN=change-me
 
 # CA rotation (defaults shown).
 #KBTOOL_RELAY_ROTATE=12h
-#KBTOOL_RELAY_CA_TTL=24h
 
 # Abuse limits (defaults shown; 0 turns a rate limit off).
 #KBTOOL_RELAY_MAX_SESSIONS=5000
 #KBTOOL_RELAY_CONN_RATE=20
 #KBTOOL_RELAY_REGISTER_RATE=30
+#KBTOOL_RELAY_HEALTHZ_INTERVAL=1000
+
+# Honeypot (milliseconds; defaults shown).
+#KBTOOL_RELAY_HONEYPOT_REMEMBER=7200000
+#KBTOOL_RELAY_HONEYPOT_BLOCK=900000
+#KBTOOL_RELAY_HONEYPOT_REBLOCK=3600000
+#KBTOOL_RELAY_HONEYPOT_MAX_MEMORY=10%
 ```
 
 systemd reads this file as root before dropping privileges, so the service
@@ -145,8 +155,8 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ### An operator certificate (optional)
 
 On the internet, give the relay a real certificate (for example from your
-ACME client) so daemons can verify it with `relay establish … -relay-ca
-system` instead of trusting `/ca.crt`. The service user is dynamic, so hand
+ACME client) so daemon hosts can verify it with `relay join … -relay-ca
+system` instead of trusting whatever certificate is presented. The service user is dynamic, so hand
 the files over as credentials in a drop-in:
 
 ```ini
@@ -159,7 +169,7 @@ Environment=KBTOOL_RELAY_KEY=%d/relay.key
 
 After renewing the certificate, `sudo systemctl restart kbtool-relay`
 (credentials are copied at start). With an operator certificate there is no
-rotation, and `KBTOOL_RELAY_ROTATE` / `KBTOOL_RELAY_CA_TTL` must stay unset.
+rotation, and `KBTOOL_RELAY_ROTATE` must stay unset.
 
 ## 4. Start it
 
@@ -182,8 +192,8 @@ Open the port in the firewall, e.g. `sudo ufw allow 9876/tcp`.
 | Logs | `journalctl -u kbtool-relay` |
 
 A restart, a reload or a scheduled rotation creates a new relay CA. Daemons
-fetch the CA again on their own (at every registration, and after a failed
-certificate check), so nothing needs to be redistributed. Established client
+in the default trust mode accept the certificate the relay presents, so
+nothing needs to be redistributed. Established client
 connections survive a rotation, and a restart only interrupts traffic for the
 moment the relay is down. Daemons reconnect with jittered backoff and keep their
 session ID, so enrolled clients keep working.

@@ -1,19 +1,22 @@
 # Configuring your agent to use the kbtool MCP server
 
-kbtool exposes its tools in three ways; pick the one your harness supports.
+kbtool exposes its tools in two ways; pick the one your harness supports.
 
 1. **MCP over stdio** — the agent spawns `kbtool mcp` and talks to it on
    stdin/stdout. Works with any MCP-capable harness (Claude, LM Studio,
    etc.).
-2. **MCP over HTTP** — a running daemon serves `POST /mcp` (JSON-RPC) and
-   `GET /healthz`, optionally with mandatory mTLS. For clients that speak
-   MCP over HTTP, or any raw JSON-RPC client.
-3. **OpenAI-compatible function calling** — `kbtool tools -qwen` prints the
+2. **OpenAI-compatible function calling** — `kbtool tools -qwen` prints the
    exact `tools` array for harnesses that do their own tool dispatch (LM
    Studio / Qwen / OpenAI-compatible chat endpoints).
 
 The tool set is the same everywhere (after applying the `disable_tools` /
 `git_tools` / `message_board` rules — see [client-server-config.md](client-server-config.md)).
+
+Both need the session's daemon: host or join a session first
+(`kbtool collaborate host` / `kbtool collaborate attend kb1…`) and start the
+harness in the session's working directory, where
+`AGENTS_COLLABORATION.md` teaches the agent the tools
+([collaborate.md](collaborate.md)).
 
 ## 1a. Claude Code / Claude Desktop style (`mcpServers`)
 
@@ -30,23 +33,12 @@ stdio — the harness spawns the process:
 }
 ```
 
-For an **encrypted** store, pass the key via environment (the stdio server
-never prompts — it fails closed without a key):
-
-```json
-{
-  "mcpServers": {
-    "kbtool": {
-      "command": "/usr/local/bin/kbtool",
-      "args": ["mcp", "-db-key-file", "/run/keys/kbtool.key"]
-    }
-  }
-}
-```
-
-You can also inject the key through the environment — e.g. set
-`KBTOOL_DBKEY` in `env` — precedence is
-`-db-key-env` > `-db-key-file` > `$KBTOOL_DBKEY`.
+`kbtool mcp` proxies to the session's running daemon: the unix socket on the
+session host, or the `client.json` endpoint (the host's daemon over mTLS
+through the session's relay) on an attendee. Without a running daemon the
+stdio server exits at once. The daemon holds the key of an encrypted store,
+and kbtool supplies the session's board seed, so the agent's config needs
+neither.
 
 ## 1b. Generic MCP stdio config (any harness)
 
@@ -65,42 +57,19 @@ newline-delimited JSON-RPC on stdio.
 Protocol: MCP `2024-11-05`; methods `initialize`, `ping`, `tools/list`,
 `tools/call`; responses are `content: [{type:"text",text:"…"}]` + `isError`.
 
-## 2. MCP over HTTP (daemon with `-http`, or `-http -mtls`)
+If the harness lets you set the working directory, point it at the session's
+working directory (the directory holding `AGENTS_COLLABORATION.md`).
 
-One JSON-RPC message per `POST /mcp` request (16 MiB body cap).
-
-```sh
-# Health check (mTLS: --cacert + --cert/--key required)
-curl --cacert ~/.config/kbtool/ca.crt \
-     --cert   ~/.config/kbtool/client.crt \
-     --key    ~/.config/kbtool/client.key \
-     https://kb.example.net:9876/healthz
-
-# tools/list
-curl --cacert ~/.config/kbtool/ca.crt \
-     --cert   ~/.config/kbtool/client.crt \
-     --key    ~/.config/kbtool/client.key \
-     -H 'Content-Type: application/json' \
-     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-     https://kb.example.net:9876/mcp
-
-# tools/call
-curl … -d '{"jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"search_codebase","arguments":{"q":"how do we parse config","k":5}}}' \
-     https://kb.example.net:9876/mcp
-```
-
-Loopback cleartext (local-only daemon, no mTLS) is plain `http://127.0.0.1:9876`.
-
-## 3. OpenAI-compatible / LM Studio function calling
+## 2. OpenAI-compatible / LM Studio function calling
 
 `kbtool tools -qwen` prints a ready-to-use `tools` array. Embed it in a
-`chat/completions` request and dispatch `tool_calls` yourself against the
-daemon (e.g. via the `POST /mcp` calls above, or `kbtool call`):
+`chat/completions` request and dispatch `tool_calls` yourself with
+`kbtool call` (run from the session's working directory):
 
 ```sh
 kbtool tools -qwen > /tmp/kbtool-tools.json
 # then:  "tools": $(cat /tmp/kbtool-tools.json)   in your chat/completions body
+# each tool call:  kbtool call <name> '<arguments json>'
 ```
 
 Works with LM Studio, Qwen (local or API), or any OpenAI-compatible endpoint.
@@ -108,13 +77,14 @@ Works with LM Studio, Qwen (local or API), or any OpenAI-compatible endpoint.
 ## Getting the right tool set
 
 Tools are only listed/served when enabled (group option on AND not in
-`disable_tools`). Typical setup for a full local dev agent:
+`disable_tools`). The session host's `config.json` decides for everyone in
+the session. Typical setup for a full dev agent:
 
 ```json
-// ~/.config/kbtool/config.json
+// ~/.config/kbtool/config.json (session host)
 {
   "git_tools": true,
-  "message_board": false,
+  "message_board": true,
   "disable_tools": []
 }
 ```

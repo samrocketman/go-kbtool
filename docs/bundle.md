@@ -4,7 +4,7 @@ Context-bundle expansion for search: for a known location (or the top hits of a
 query), emit one consolidated "read pack" that follows the code's own *written*
 pointers — its neighbors, the strings/identifiers it carries (searched
 tree-wide), its imports (with honest verdicts), and its test files. Part of the
-context-bundle feature set (`plans/context-bundle-plan.md`).
+context-bundle feature set, with [terms.md](terms.md).
 
 Three equivalent entry points:
 
@@ -14,9 +14,8 @@ kbtool bundle -q "query text" [-k N]           expand a query's top hits
 kbtool query "query text" -bundle [-k N]       the same, as a flag on query
 ```
 
-All three also take `[-db PATH] [-db-key-env NAME | -db-key-file PATH]` and go
-through the daemon socket when the daemon is up (MCP tool: `kb_bundle`, args
-`target` or `q` plus `k`). Results are identical across access paths.
+All three go through the session's daemon (MCP tool: `kb_bundle`, args `target`
+or `q` plus `k`) and fail when none runs.
 
 ## The four components
 

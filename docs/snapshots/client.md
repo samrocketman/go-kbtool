@@ -1,5 +1,7 @@
 # kbtool client — full reference
 
+Applies to snapshot builds only (`make release-snapshot` or `go build`); release builds refuse this command.
+
 Enroll this machine with an mTLS daemon in one line. The daemon prints the
 line at boot; the client downloads an encrypted client bundle, checks the
 daemon against the CA inside it, and from then on talks to the daemon over
@@ -22,7 +24,7 @@ line whose token already names the relay.
 | Option | Default | Description |
 |---|---|---|
 | `-import URL TOKEN` | — | The daemon URL, `https://HOST[:PORT][/]` only (port defaults to 9876), followed by its direct token. |
-| `-import TOKEN` | — | A relay token alone: relay host, port and session are inside it ([relay.md](relay.md)). |
+| `-import TOKEN` | — | A relay token alone: relay host, port and session are inside it ([relay.md](../relay.md)). |
 | `-yes` | off | Replace existing client files in the state dir that differ from the bundle. |
 
 The long forms (`-bundle`, `-fingerprint`, `-key`, `-session`) and file
@@ -72,7 +74,9 @@ fingerprint is carried: the encrypted bundle authenticates the CA.
 **Through a relay (relay token):** the client opens TLS to the relay with
 SNI = session; the relay splices it to the daemon without terminating it.
 The same steps run through the relay, the server certificate is checked for
-the relay host, and `client.json` records the relay host, port and `session`.
+the relay host. `client.json` records the `session` and that relay
+(`relay`, the client's only relay), and `relay.json` gets `"enabled": true`
+(any joined relays in it are kept).
 
 ## Bundle contents
 
@@ -80,7 +84,7 @@ the relay host, and `client.json` records the relay host, port and `session`.
 |---|---|
 | `ca.crt` | CA the client trusts (vouches for the daemon). |
 | `client.crt` / `client.key` | The client certificate/key to present at the mTLS handshake. |
-| `client.json` | Endpoint config; rewritten on import to the imported host and port, `tls: true`. |
+| `client.json` | Endpoint config; rewritten on import to the imported host and port (relay token: only the session), `tls: true`. |
 
 ## Security notes
 
@@ -102,6 +106,6 @@ the relay host, and `client.json` records the relay host, port and `session`.
 - Simple example: [client-simple.md](client-simple.md)
 - Creating the PKI first: [mtls-simple.md](mtls-simple.md)
 - Daemon options: [daemon.md](daemon.md)
-- Enrolling through a relay: [relay.md](relay.md)
-- Endpoint config file reference: [client-server-config.md](client-server-config.md)
-- Back to [README](../README.md)
+- Enrolling through a relay: [relay.md](../relay.md)
+- Endpoint config file reference: [client-server-config.md](../client-server-config.md)
+- Back to [README](../../README.md)

@@ -1,5 +1,7 @@
 # kbtool mtls — quick start
 
+Applies to snapshot builds only (`make release-snapshot` or `go build`); release builds refuse this command.
+
 Generate the local mTLS PKI (CA + server + client certificates) so the daemon
 can be shared over the network with mutual TLS, and point the local CLI at
 the new setup.
@@ -25,8 +27,10 @@ kbtool mtls -dns kb.example.net -expire 720h
 # Now serve with it:
 kbtool daemon start -http -mtls
 
-# Daemon behind NAT: certificates for a relay instead (see relay-simple.md):
-kbtool mtls -relay https://relay.example.net:9876/
+# Daemon behind NAT: join a relay first; mtls then issues relay-mode
+# certificates (see relay-simple.md):
+kbtool relay join https://relay.example.net:9876/
+kbtool mtls
 ```
 
 Many clients may share one client certificate (e.g. a dozen friends importing
@@ -45,4 +49,4 @@ What it does:
   prints a one-line `kbtool client -import …` for other machines — see
   [client-simple.md](client-simple.md).
 
-Full reference: [mtls.md](mtls.md) · back to [README](../README.md)
+Full reference: [mtls.md](mtls.md) · back to [README](../../README.md)

@@ -20,14 +20,16 @@ kbtool tools [-qwen]
 | core | `search_codebase`, `get_chunk`, `list_files` | always (unless individually disabled) |
 | core | `kb_status` | disabled by default (seeded `disable_tools`) |
 | git | `git_blame`, `git_log` | `git_tools: true` in `config.json` |
-| message board | `board_signup`, `board_whoami`, `board_sign`, `board_post`, `board_read`, `board_fetch`, `board_threads`, `board_search`, `board_confirm` | `message_board: true` in `config.json` |
+| message board | `board_signup`, `board_whoami`, `board_sign`, `board_post`, `board_read`, `board_fetch`, `board_threads`, `board_search`, `board_confirm` | on by default (`message_board: false` in `config.json` turns them off) |
 
 The per-tool `disable_tools` list always wins over the group options. Full
 rules: [client-server-config.md](client-server-config.md).
 
 ## Behavior
 
-- No arguments, no network. Output is pretty-printed JSON on stdout.
+- No arguments. Output is pretty-printed JSON on stdout. The list comes from
+  the session's running daemon (stderr notes `(via daemon: …)`), so an
+  attendee sees the session host's tool set.
 - The list is computed with the same precedence as the server: `disable_tools`
   (or the seeded default `["kb_status", "board_sign"]`) ∪ group options.
 - Use `-qwen` to drop the exact schemas into an OpenAI-compatible

@@ -1,29 +1,25 @@
 # kbtool mcp — quick start
 
-Run the MCP server. Two common modes:
-
-**1. stdio — your agent spawns it (simplest, local development):**
+Everything goes through the session's daemon; host or join a session first,
+from the working directory holding the code:
 
 ```sh
-# Point your agent's MCP config at:
+kbtool collaborate host        # or: kbtool collaborate attend kb1…
+kbtool status                  # see the daemon running
+kbtool query "how do we parse config"   # the CLI talks to the daemon
+```
+
+Then point your agent's MCP config at the stdio server:
+
+```sh
 #   command: kbtool
 #   args:    ["mcp"]
 ```
 
-`kbtool mcp` loads the index from your last `kbtool build` and speaks MCP
-(newline-delimited JSON-RPC) over stdin/stdout. No socket, no port, no daemon.
+`kbtool mcp` speaks MCP (newline-delimited JSON-RPC) over stdin/stdout and
+forwards every call to the session's daemon: its unix socket on the host, or
+the host's daemon through the session's relay on an attendee. In a session it
+also supplies the agent's board seed and the session memory tools. Without a
+daemon it exits with an error. `kbtool collaborate finish` ends the session.
 
-**2. background service — share one instance across many clients:**
-
-```sh
-kbtool daemon start            # or: kbtool mcp start
-kbtool status                  # see it running
-kbtool query "how do we parse config"   # CLI now talks to the service
-kbtool daemon stop
-```
-
-**Which one to pick:** stdio for a single local agent; `daemon`/`mcp start`
-when you want one long-lived service (optionally over mTLS TCP — see
-[mtls-simple.md](mtls-simple.md)) shared by several agents or machines.
-
-Full reference with every option: [mcp.md](mcp.md) · back to [README](../README.md)
+Full reference: [mcp.md](mcp.md) · back to [README](../README.md)
