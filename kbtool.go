@@ -143,6 +143,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"slices"
@@ -3482,24 +3483,13 @@ func boardTTL() time.Duration {
 }
 
 // boardLock serializes read-modify-write board operations across processes using an
-// exclusive flock on a STABLE lock file (the board file itself is atomically replaced
-// via tmp+rename, so locking it directly would race on inodes — see plan §5).
+// exclusive osCompatLockFile on a SEPARATE lock file (the board file itself is atomically
+// replaced via tmp+rename, so locking it directly would race on inodes — see plan §5).
 func boardLock(path string) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return nil, err
 	}
-	lf, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
-		lf.Close()
-		return nil, err
-	}
-	return func() {
-		_ = syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
-		lf.Close()
-	}, nil
+	return osCompatLockFile(path + ".lock")
 }
 
 func newBoard() *Board {
@@ -10322,6 +10312,374 @@ func reportDaemonFailure(connErr error) {
 	}
 }
 
+// ---------- OS compatibility (osCompat*) ----------
+//
+// kbtool is one file, so platform code cannot be split with build tags: every
+// osCompat function compiles on every GOOS and dispatches on runtime.GOOS.
+// osCompat<Name> is the entry point; osCompatLinux*, osCompatMacos* and
+// osCompatWindows* hold what differs per OS; osCompatUnix* is the one native
+// implementation Linux and macOS share, driven by their osCompatUnixABI. Linux
+// and macOS make the same kernel calls as syscall.Flock/Umask/Kill and the
+// termios ioctls; Windows is the only portable implementation.
+
+// osCompatSupportedPlatform is the release matrix (.goreleaser.yaml).
+const osCompatSupportedPlatform = clientPlatform == "linux/amd64" || clientPlatform == "linux/386" ||
+	clientPlatform == "linux/arm" || clientPlatform == "linux/arm64" ||
+	clientPlatform == "darwin/amd64" || clientPlatform == "darwin/arm64" ||
+	clientPlatform == "windows/amd64" || clientPlatform == "windows/386" || clientPlatform == "windows/arm64"
+
+// Duplicate constant map keys do not compile, so any GOOS/GOARCH outside
+// osCompatSupportedPlatform fails the build here ("duplicate key false")
+// instead of producing a binary without equivalent locking, process and
+// terminal support.
+var _ = map[bool]string{
+	false:                     "unsupported GOOS/GOARCH: add it to osCompatSupportedPlatform with its osCompat implementation",
+	osCompatSupportedPlatform: "supported",
+}
+
+// osCompatSyscall is syscall.Syscall on Linux and macOS. Windows' Syscall takes
+// an extra argument count, so the assertion fails there and it stays nil; only
+// the non-Windows branches call it.
+var osCompatSyscall, _ = any(syscall.Syscall).(func(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err syscall.Errno))
+
+// osCompatUnixABI is the kernel ABI of one Linux/macOS GOOS/GOARCH, as in Go's
+// own zsysnum_*/zerrors_*/ztypes_* tables.
+type osCompatUnixABI struct {
+	sysIoctl, sysFlock, sysKill, sysUmask uintptr
+	oNoFollow                             int
+	tcGetAttr, tcSetAttr                  uintptr // TCGETS/TCSETS, TIOCGETA/TIOCSETA
+	termiosSize, lflagOffset, lflagSize   int
+}
+
+const (
+	osCompatLockEx = 2   // LOCK_EX
+	osCompatLockUn = 8   // LOCK_UN
+	osCompatEcho   = 0x8 // ECHO in termios c_lflag
+)
+
+func osCompatLinuxABI() osCompatUnixABI {
+	abi := osCompatUnixABI{tcGetAttr: 0x5401, tcSetAttr: 0x5402, termiosSize: 60, lflagOffset: 12, lflagSize: 4}
+	switch runtime.GOARCH {
+	case "amd64":
+		abi.sysIoctl, abi.sysFlock, abi.sysKill, abi.sysUmask, abi.oNoFollow = 16, 73, 62, 95, 0x20000
+	case "386":
+		abi.sysIoctl, abi.sysFlock, abi.sysKill, abi.sysUmask, abi.oNoFollow = 54, 143, 37, 60, 0x20000
+	case "arm":
+		abi.sysIoctl, abi.sysFlock, abi.sysKill, abi.sysUmask, abi.oNoFollow = 54, 143, 37, 60, 0x8000
+	case "arm64":
+		abi.sysIoctl, abi.sysFlock, abi.sysKill, abi.sysUmask, abi.oNoFollow = 29, 32, 129, 166, 0x8000
+	}
+	return abi
+}
+
+func osCompatMacosABI() osCompatUnixABI {
+	return osCompatUnixABI{sysIoctl: 54, sysFlock: 131, sysKill: 37, sysUmask: 60, oNoFollow: 0x100,
+		tcGetAttr: 0x40487413, tcSetAttr: 0x80487414, termiosSize: 72, lflagOffset: 24, lflagSize: 8}
+}
+
+func osCompatNativeABI() osCompatUnixABI {
+	if runtime.GOOS == "darwin" {
+		return osCompatMacosABI()
+	}
+	return osCompatLinuxABI()
+}
+
+func osCompatUnixErr(errno syscall.Errno) error {
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+// osCompatLockFile takes an exclusive lock on path, waiting while another holder
+// (in this or another process) has it; the returned func releases it.
+func osCompatLockFile(path string) (func(), error) {
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsLockFile(path)
+	}
+	return osCompatUnixLockFile(osCompatNativeABI(), path)
+}
+
+func osCompatUnixLockFile(abi osCompatUnixABI, path string) (func(), error) {
+	lf, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, errno := osCompatSyscall(abi.sysFlock, lf.Fd(), osCompatLockEx, 0); errno != 0 {
+		lf.Close()
+		return nil, errno
+	}
+	return func() {
+		osCompatSyscall(abi.sysFlock, lf.Fd(), osCompatLockUn, 0)
+		lf.Close()
+	}, nil
+}
+
+// osCompatWindowsLocks serializes this process's waiters per path; the O_EXCL
+// lock file only arbitrates between processes.
+var osCompatWindowsLocks sync.Map
+
+// osCompatWindowsLockFile emulates flock: the lock file exists while held and
+// names its owner's pid. Unlike flock it is not released by the kernel when the
+// owner dies, so a lock whose owner is gone (or that stayed empty for 5s) is
+// taken over.
+func osCompatWindowsLockFile(path string) (func(), error) {
+	v, _ := osCompatWindowsLocks.LoadOrStore(path, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	for {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			_, werr := fmt.Fprintf(f, "%d\n", os.Getpid())
+			if cerr := f.Close(); werr == nil {
+				werr = cerr
+			}
+			if werr != nil {
+				os.Remove(path)
+				mu.Unlock()
+				return nil, werr
+			}
+			return func() { os.Remove(path); mu.Unlock() }, nil
+		}
+		if !os.IsExist(err) {
+			mu.Unlock()
+			return nil, err
+		}
+		if b, rerr := os.ReadFile(path); rerr == nil {
+			pid, perr := strconv.Atoi(strings.TrimSpace(string(b)))
+			fi, serr := os.Stat(path)
+			if (perr == nil && !osCompatWindowsProcessAlive(pid)) || (perr != nil && serr == nil && time.Since(fi.ModTime()) > 5*time.Second) {
+				os.Remove(path)
+				continue
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// osCompatProcessAlive reports whether pid is a live process this user may signal.
+func osCompatProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsProcessAlive(pid)
+	}
+	return osCompatUnixKill(osCompatNativeABI(), pid, 0) == nil
+}
+
+func osCompatUnixKill(abi osCompatUnixABI, pid int, sig syscall.Signal) error {
+	_, _, errno := osCompatSyscall(abi.sysKill, uintptr(pid), uintptr(sig), 0)
+	return osCompatUnixErr(errno)
+}
+
+// osCompatWindowsProcessAlive: OpenProcess (inside os.FindProcess) fails for a pid
+// with no process behind it.
+func osCompatWindowsProcessAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	_ = p.Release()
+	return true
+}
+
+// osCompatStopProcess asks service name (running as pid) to shut down cleanly
+// (SIGTERM), or kills it outright when force is set (SIGKILL).
+func osCompatStopProcess(name string, pid int, force bool) {
+	if runtime.GOOS == "windows" {
+		osCompatWindowsStopProcess(name, pid, force)
+		return
+	}
+	sig := syscall.SIGTERM
+	if force {
+		sig = syscall.SIGKILL
+	}
+	_ = osCompatUnixKill(osCompatNativeABI(), pid, sig)
+}
+
+// osCompatWindowsStopProcess: Windows has no SIGTERM, and TerminateProcess skips
+// the service's shutdown (board notice, session encryption), so a clean stop
+// writes the stop-request file osCompatWindowsWatchStop polls for.
+func osCompatWindowsStopProcess(name string, pid int, force bool) {
+	if !force {
+		_ = os.WriteFile(osCompatWindowsStopPath(name), []byte(strconv.Itoa(pid)+"\n"), 0600)
+		return
+	}
+	if p, err := os.FindProcess(pid); err == nil {
+		_ = p.Kill()
+		_ = p.Release()
+	}
+}
+
+func osCompatWindowsStopPath(name string) string { return filepath.Join(stateDir(), name+".stop") }
+
+// osCompatStopRequest is the os.Signal osCompatWatchStop delivers for a
+// stop-request file.
+type osCompatStopRequest struct{}
+
+func (osCompatStopRequest) String() string { return "stop request" }
+func (osCompatStopRequest) Signal()        {}
+
+// osCompatWatchStop delivers clean-shutdown requests for service name on sig, on
+// top of the os/signal notifications the caller registers. Linux and macOS
+// need nothing more: osCompatStopProcess sends SIGTERM.
+func osCompatWatchStop(name string, sig chan<- os.Signal) {
+	if runtime.GOOS == "windows" {
+		go osCompatWindowsWatchStop(name, sig)
+	}
+}
+
+// osCompatWindowsWatchStop waits for a stop-request file naming this process; a
+// leftover file naming another pid is ignored.
+func osCompatWindowsWatchStop(name string, sig chan<- os.Signal) {
+	path := osCompatWindowsStopPath(name)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for range tick.C {
+		b, err := os.ReadFile(path)
+		if err != nil || strings.TrimSpace(string(b)) != strconv.Itoa(os.Getpid()) {
+			continue
+		}
+		os.Remove(path)
+		sig <- osCompatStopRequest{}
+		return
+	}
+}
+
+// osCompatDetach makes cmd outlive the CLI and its terminal: a new session
+// (setsid) on Linux/macOS, a detached process group on Windows. SysProcAttr's
+// fields differ per GOOS, so they are set by name.
+func osCompatDetach(cmd *exec.Cmd) {
+	attr := &syscall.SysProcAttr{}
+	v := reflect.ValueOf(attr).Elem()
+	if runtime.GOOS == "windows" {
+		osCompatWindowsDetach(v)
+	} else {
+		v.FieldByName("Setsid").SetBool(true)
+	}
+	cmd.SysProcAttr = attr
+}
+
+func osCompatWindowsDetach(attr reflect.Value) {
+	const createNewProcessGroup, detachedProcess = 0x00000200, 0x00000008
+	attr.FieldByName("CreationFlags").SetUint(createNewProcessGroup | detachedProcess)
+	attr.FieldByName("HideWindow").SetBool(true)
+}
+
+// osCompatUmask sets the process umask to mask; the returned func restores it.
+func osCompatUmask(mask int) func() {
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsUmask()
+	}
+	abi := osCompatNativeABI()
+	old, _, _ := osCompatSyscall(abi.sysUmask, uintptr(mask), 0, 0)
+	return func() { osCompatSyscall(abi.sysUmask, old, 0, 0) }
+}
+
+// osCompatWindowsUmask: Windows has no umask. Files and unix sockets inherit the
+// ACL of their directory, and the state dir lives in the user's profile.
+func osCompatWindowsUmask() func() { return func() {} }
+
+// osCompatOpenNoFollow opens path like os.OpenFile but refuses to follow a
+// symlink in its last element (O_NOFOLLOW).
+func osCompatOpenNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsOpenNoFollow(path, flag, perm)
+	}
+	return os.OpenFile(path, flag|osCompatNativeABI().oNoFollow, perm)
+}
+
+// osCompatWindowsOpenNoFollow: Windows has no O_NOFOLLOW, so the last element is
+// checked with Lstat first.
+func osCompatWindowsOpenNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	if fi, err := os.Lstat(path); err == nil && !fi.Mode().IsRegular() {
+		return nil, &os.PathError{Op: "open", Path: path, Err: errors.New("not a regular file (symlinks are not followed)")}
+	}
+	return os.OpenFile(path, flag, perm)
+}
+
+// osCompatIsTerminal reports whether f is an interactive terminal.
+func osCompatIsTerminal(f *os.File) bool {
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsIsTerminal(f)
+	}
+	_, ok := osCompatUnixTermios(osCompatNativeABI(), f.Fd())
+	return ok
+}
+
+func osCompatWindowsIsTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// osCompatUnixTermios reads f's terminal attributes (the termios struct as raw
+// bytes); ok is false when fd is not a terminal.
+func osCompatUnixTermios(abi osCompatUnixABI, fd uintptr) ([]byte, bool) {
+	t := make([]byte, abi.termiosSize)
+	_, _, errno := osCompatSyscall(abi.sysIoctl, fd, abi.tcGetAttr, uintptr(unsafe.Pointer(&t[0])))
+	runtime.KeepAlive(t)
+	return t, errno == 0
+}
+
+func osCompatUnixSetTermios(abi osCompatUnixABI, fd uintptr, t []byte) bool {
+	_, _, errno := osCompatSyscall(abi.sysIoctl, fd, abi.tcSetAttr, uintptr(unsafe.Pointer(&t[0])))
+	runtime.KeepAlive(t)
+	return errno == 0
+}
+
+// osCompatReadSecretLine reads one line from f without echoing it when f is a
+// terminal; otherwise (or if hiding fails) it reads the line as typed.
+func osCompatReadSecretLine(f *os.File) (string, error) {
+	if runtime.GOOS == "windows" {
+		return osCompatWindowsReadSecretLine(f)
+	}
+	return osCompatUnixReadSecretLine(osCompatNativeABI(), f)
+}
+
+func osCompatUnixReadSecretLine(abi osCompatUnixABI, f *os.File) (string, error) {
+	fd := f.Fd()
+	old, hidden := osCompatUnixTermios(abi, fd)
+	if hidden {
+		now := append([]byte(nil), old...)
+		lflag := now[abi.lflagOffset : abi.lflagOffset+abi.lflagSize]
+		if abi.lflagSize == 8 {
+			binary.NativeEndian.PutUint64(lflag, binary.NativeEndian.Uint64(lflag)&^osCompatEcho)
+		} else {
+			binary.NativeEndian.PutUint32(lflag, binary.NativeEndian.Uint32(lflag)&^osCompatEcho)
+		}
+		hidden = osCompatUnixSetTermios(abi, fd, now)
+	}
+	if hidden {
+		fmt.Fprint(os.Stderr, "(hidden) ")
+	}
+	line, err := readLineTrim(f)
+	if hidden {
+		// restore the terminal, and print a newline (the user's Enter was swallowed)
+		osCompatUnixSetTermios(abi, fd, old)
+		fmt.Fprintln(os.Stderr)
+	}
+	return line, err
+}
+
+// osCompatWindowsReadSecretLine reads through PowerShell's Read-Host
+// -AsSecureString (stdlib Go cannot reach the console mode API on Windows),
+// falling back to a visible read when f is not a console or PowerShell fails.
+func osCompatWindowsReadSecretLine(f *os.File) (string, error) {
+	if osCompatWindowsIsTerminal(f) {
+		const script = `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $s = Read-Host -AsSecureString; ` +
+			`[Console]::Out.Write([Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)))`
+		cmd := exec.Command("powershell.exe", "-NoProfile", "-Command", script)
+		cmd.Stdin, cmd.Stderr = f, os.Stderr
+		fmt.Fprint(os.Stderr, "(hidden) ")
+		if out, err := cmd.Output(); err == nil {
+			return strings.TrimSpace(string(out)), nil
+		}
+		fmt.Fprint(os.Stderr, "\n(hiding failed; input is visible) ")
+	}
+	return readLineTrim(f)
+}
+
 // ---------- state / process management ----------
 
 func stateDir() string {
@@ -10361,12 +10719,7 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
-}
+func pidAlive(pid int) bool { return osCompatProcessAlive(pid) }
 
 func writePidFile(name string) {
 	_ = os.MkdirAll(stateDir(), 0755)
@@ -11454,9 +11807,9 @@ func daemonRun(name string, args []string) {
 	// (plans/next-security-features.md §6/§12): set umask 0177 so the socket is
 	// created srw------- (0600), then restore the prior umask immediately so
 	// no other file creation is affected.
-	umask := syscall.Umask(0177)
+	restoreUmask := osCompatUmask(0177)
 	ul, err := net.Listen("unix", socket)
-	syscall.Umask(umask)
+	restoreUmask()
 	if err != nil {
 		os.Remove(socket)
 		removePidFile(name)
@@ -11686,6 +12039,7 @@ func daemonRun(name string, args []string) {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	osCompatWatchStop(name, sig)
 	stopReason := "shut down"
 	select {
 	case s := <-sig:
@@ -11825,7 +12179,7 @@ func bgStart(name string, args []string) error {
 	cmd.Env = append(os.Environ(), childEnv+"=1")
 	cmd.Stdout = logf
 	cmd.Stderr = logf
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	osCompatDetach(cmd)
 	// At-rest key hand-off (encrypt-at-rest plan §Design): the detached child needs
 	// the key to decrypt an encrypted store. Precedence:
 	//   1. -db-key-env / -db-key-file in args  -> the child resolves them itself
@@ -11906,7 +12260,8 @@ func argsHaveKeySource(args []string) bool {
 	return false
 }
 
-// bgStop terminates the service (SIGTERM then SIGKILL) and cleans up.
+// bgStop asks the service to shut down cleanly, kills it if it is still up after
+// two minutes, and cleans up.
 func bgStop(name string) error {
 	socket := socketPath(name)
 	pid := pidFromPidfile(name)
@@ -11916,7 +12271,7 @@ func bgStop(name string) error {
 		fmt.Printf("%s %s not running (cleaned up stale files)\n", appName, name)
 		return nil
 	}
-	_ = syscall.Kill(pid, syscall.SIGTERM)
+	osCompatStopProcess(name, pid, false)
 	for i := 0; i < 1200; i++ { // up to 2 minutes: a host daemon finishes (encrypts) its session
 
 		if !pidAlive(pid) {
@@ -11925,7 +12280,7 @@ func bgStop(name string) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if pidAlive(pid) {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		osCompatStopProcess(name, pid, true)
 	}
 	os.Remove(socket)
 	removePidFile(name)
@@ -13796,9 +14151,9 @@ func relayRun(a []string) {
 	}
 	ctlPath := relayControlPath()
 	_ = os.Remove(ctlPath)
-	old := syscall.Umask(0o077)
+	restoreUmask := osCompatUmask(0o077)
 	ctl, err := net.Listen("unix", ctlPath)
-	syscall.Umask(old)
+	restoreUmask()
 	if err != nil {
 		fatal(fmt.Errorf("relay: control socket %s: %v", ctlPath, err))
 	}
@@ -13822,6 +14177,7 @@ func relayRun(a []string) {
 	sdNotify("READY=1\nSTATUS=" + relayStatusText(bound, rs.currentPKI()))
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	osCompatWatchStop("relay", sig)
 	tick := time.NewTicker(o.rotate)
 	defer tick.Stop()
 	tickC := tick.C
@@ -13987,7 +14343,7 @@ func relayStart(a []string) {
 	}
 	cmd := exec.Command(exe, child...)
 	cmd.Stdout, cmd.Stderr = logf, logf
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	osCompatDetach(cmd)
 	if err := cmd.Start(); err != nil {
 		logf.Close()
 		fatal(err)
@@ -16227,11 +16583,11 @@ func attachExtract(data []byte, dest string, overwrite bool) ([]string, error) {
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return written, err
 		}
-		flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC | syscall.O_NOFOLLOW
+		flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 		if !overwrite {
 			flags |= os.O_EXCL
 		}
-		out, err := os.OpenFile(target, flags, 0644)
+		out, err := osCompatOpenNoFollow(target, flags, 0644)
 		if err != nil {
 			return written, err
 		}
@@ -16353,30 +16709,11 @@ const secretEnv = "KBTOOL_SECRET"
 
 // promptSecret reads one line from the controlling terminal with echo disabled, so a
 // passphrase typed for -encrypt / daemon startup is not visible on the screen or in the
-// shell scrollback. It uses raw ioctl (TCGETS/TCSETS) — stdlib only, Linux, matching the
-// project's existing syscall usage. If the input is not a tty (or the ioctl fails) it
-// falls back to a plain read so non-interactive use still works.
+// shell scrollback (osCompatReadSecretLine). If the input is not a tty (or hiding fails)
+// it falls back to a plain read so non-interactive use still works.
 func promptSecret(label string) ([]byte, error) {
 	fmt.Fprint(os.Stderr, label)
-	fd := int(os.Stdin.Fd())
-	var old syscall.Termios
-	hidden := false
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5401 /* TCGETS */, uintptr(unsafe.Pointer(&old))); errno == 0 {
-		now := old
-		now.Lflag &^= syscall.ECHO
-		if _, _, errno2 := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5402 /* TCSETS */, uintptr(unsafe.Pointer(&now))); errno2 == 0 {
-			hidden = true
-		}
-	}
-	if hidden {
-		fmt.Fprint(os.Stderr, "(hidden) ")
-	}
-	line, err := readLineTrim(os.Stdin)
-	if hidden {
-		// restore the terminal, and print a newline (the user's Enter was swallowed)
-		syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), 0x5402, uintptr(unsafe.Pointer(&old)))
-		fmt.Fprintln(os.Stderr)
-	}
+	line, err := osCompatReadSecretLine(os.Stdin)
 	if err != nil {
 		return nil, err
 	}
@@ -18532,11 +18869,7 @@ func collabDocState(dir string) (exists, ours bool) {
 }
 
 // stdinTTY reports whether confirmations can be asked interactively.
-var stdinTTY = func() bool {
-	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdin.Fd(), 0x5401 /* TCGETS */, uintptr(unsafe.Pointer(&t)))
-	return errno == 0
-}
+var stdinTTY = func() bool { return osCompatIsTerminal(os.Stdin) }
 
 // confirmCollab explains reasons and asks to continue: -yes confirms; without
 // a terminal the answer is no.
