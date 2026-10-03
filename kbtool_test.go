@@ -67,6 +67,8 @@ package main
 //     agent tag, signup platform (plans/session-memory-attachments-plan.md)
 //  50. relay honeypot, /healthz rate limit (plans/relay-honeypot-plan.md)
 //  51. pre-release tools: bench only in snapshot and source builds
+//  52. OS compatibility (osCompat*): native Linux/macOS calls, portable
+//     Windows paths, supported-platform compile guard
 //
 // All tests use only the standard library and run hermetically (temp dirs,
 // no network). Git-dependent tests are skipped when git is absent.
@@ -112,6 +114,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // ---------- shared helpers ----------
@@ -12107,7 +12110,7 @@ func TestEncryptedCollaborateCLI(t *testing.T) {
 	if pid <= 0 {
 		t.Fatal("no daemon pid")
 	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
+	osCompatStopProcess("daemon", pid, true)
 	for deadline := time.Now().Add(10 * time.Second); pidAlive(pid) && time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 	}
 	for _, args := range [][]string{{"daemon", "start"}, {"collaborate", "resume"}, {"session", "ls"}} {
@@ -14454,5 +14457,326 @@ func TestEncryptedLocalAndSelfHostedSessions(t *testing.T) {
 	sealedOnly(2)
 	if out, err := run("", "relay", "status"); err != nil || !strings.Contains(out, "running") {
 		t.Fatalf("finishing sessions must leave a standalone relay manageable: %v\n%s", err, out)
+	}
+}
+
+// ---------- 52. OS compatibility (osCompat*) ----------
+
+func osCompatSkipWindows(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native Linux/macOS path")
+	}
+}
+
+// osCompatAssertExclusive checks that lock blocks a second holder until the
+// first releases it.
+func osCompatAssertExclusive(t *testing.T, lock func(string) (func(), error), path string) {
+	t.Helper()
+	unlock, err := lock(path)
+	if err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	got := make(chan func(), 1)
+	go func() {
+		u, err := lock(path)
+		if err != nil {
+			t.Errorf("second lock: %v", err)
+			u = func() {}
+		}
+		got <- u
+	}()
+	select {
+	case <-got:
+		t.Fatal("a second holder must wait while the lock is held")
+	case <-time.After(150 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case u := <-got:
+		u()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second holder must get the lock once it is released")
+	}
+}
+
+// TestOSCompatLockFileExclusive: board and store writes rely on this lock; the
+// native flock (raw syscall numbers per GOARCH) must really exclude.
+func TestOSCompatLockFileExclusive(t *testing.T) {
+	osCompatAssertExclusive(t, osCompatLockFile, filepath.Join(t.TempDir(), "x.lock"))
+}
+
+// TestOSCompatWindowsLockFile: the Windows lock-file emulation is portable code,
+// so its exclusion and its takeover of an abandoned (empty, stale) lock are
+// pinned on every platform.
+func TestOSCompatWindowsLockFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.lock")
+	osCompatAssertExclusive(t, osCompatWindowsLockFile, path)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("an unlocked Windows lock file must be gone: %v", err)
+	}
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Minute)
+	_ = os.Chtimes(path, old, old)
+	done := make(chan struct{})
+	go func() {
+		if u, err := osCompatWindowsLockFile(path); err == nil {
+			u()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stale empty lock file must be taken over")
+	}
+}
+
+// TestOSCompatUmask: the daemon and relay sockets are owner-only only because of
+// this umask; it must apply and restore the previous mask.
+func TestOSCompatUmask(t *testing.T) {
+	osCompatSkipWindows(t)
+	dir := t.TempDir()
+	create := func(name string) os.FileMode {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, nil, 0666); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	outer := osCompatUmask(022)
+	defer outer()
+	inner := osCompatUmask(0177)
+	got := create("a")
+	inner()
+	if got != 0600 {
+		t.Fatalf("umask 0177 must create 0600, got %v", got)
+	}
+	if got := create("b"); got != 0644 {
+		t.Fatalf("the previous umask 022 must be restored (0644), got %v", got)
+	}
+}
+
+// TestOSCompatProcessLifecycle: pidAlive, bgStop's SIGTERM and the forced kill
+// go through osCompat; a stopped child must read as dead afterwards.
+func TestOSCompatProcessLifecycle(t *testing.T) {
+	osCompatSkipWindows(t)
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not on PATH")
+	}
+	if !osCompatProcessAlive(os.Getpid()) {
+		t.Fatal("this process must be alive")
+	}
+	if osCompatProcessAlive(0) || osCompatProcessAlive(-1) {
+		t.Fatal("non-positive pids are never alive")
+	}
+	for _, force := range []bool{false, true} {
+		c := exec.Command(sleep, "30")
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		osCompatStopProcess("test", c.Process.Pid, force)
+		_ = c.Wait()
+		if osCompatProcessAlive(c.Process.Pid) {
+			t.Fatalf("force=%v: the stopped child must be dead", force)
+		}
+	}
+}
+
+// TestOSCompatDetach: background services must start in their own session
+// (Setsid) so they survive the terminal; the field is set by reflection.
+func TestOSCompatDetach(t *testing.T) {
+	cmd := exec.Command("true")
+	osCompatDetach(cmd)
+	v := reflect.ValueOf(cmd.SysProcAttr).Elem()
+	if runtime.GOOS == "windows" {
+		if v.FieldByName("CreationFlags").Uint() == 0 {
+			t.Fatal("windows: detach must set CreationFlags")
+		}
+		return
+	}
+	if !v.FieldByName("Setsid").Bool() {
+		t.Fatal("detach must set Setsid")
+	}
+}
+
+// TestOSCompatOpenNoFollow: attachment extraction must never write through a
+// symlink; both the native O_NOFOLLOW and the Windows Lstat path refuse.
+func TestOSCompatOpenNoFollow(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	for name, open := range map[string]func(string, int, os.FileMode) (*os.File, error){
+		"osCompatOpenNoFollow": osCompatOpenNoFollow, "osCompatWindowsOpenNoFollow": osCompatWindowsOpenNoFollow,
+	} {
+		if f, err := open(link, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); err == nil {
+			f.Close()
+			t.Fatalf("%s must refuse a symlink", name)
+		}
+		f, err := open(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			t.Fatalf("%s must create a regular file: %v", name, err)
+		}
+		f.Close()
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+		t.Fatal("the symlink target must be untouched")
+	}
+}
+
+// TestOSCompatIsTerminal: stdinTTY gates interactive prompts; files and
+// /dev/null are not terminals (a plain char-device check would accept /dev/null).
+func TestOSCompatIsTerminal(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if osCompatIsTerminal(f) || osCompatWindowsIsTerminal(f) {
+		t.Fatal("a regular file is not a terminal")
+	}
+	if runtime.GOOS != "windows" {
+		n, err := os.Open(os.DevNull)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n.Close()
+		if osCompatIsTerminal(n) {
+			t.Fatal("/dev/null is not a terminal")
+		}
+	}
+}
+
+// TestOSCompatReadSecretLineNonTTY: piped input (scripts, tests) must still be
+// read when echo cannot be hidden.
+func TestOSCompatReadSecretLineNonTTY(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	go func() { fmt.Fprint(w, "  s3cret \nnext\n"); w.Close() }()
+	line, err := osCompatReadSecretLine(r)
+	if err != nil || line != "s3cret" {
+		t.Fatalf("got %q, %v", line, err)
+	}
+}
+
+// TestOSCompatEchoOffOnPTY: the termios layout (size, c_lflag offset and width)
+// is hard-coded per OS; on a real Linux pseudo-terminal clearing ECHO must show
+// up in the attributes read back, and restoring must bring it back.
+func TestOSCompatEchoOffOnPTY(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("pty setup below is Linux-specific")
+	}
+	abi := osCompatLinuxABI()
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR, 0)
+	if err != nil {
+		t.Skip("no /dev/ptmx")
+	}
+	defer ptmx.Close()
+	var unlock, n uint32
+	const tiocsptlck, tiocgptn = 0x40045431, 0x80045430
+	if _, _, e := osCompatSyscall(abi.sysIoctl, ptmx.Fd(), tiocsptlck, uintptr(unsafe.Pointer(&unlock))); e != 0 {
+		t.Skipf("unlockpt: %v", e)
+	}
+	if _, _, e := osCompatSyscall(abi.sysIoctl, ptmx.Fd(), tiocgptn, uintptr(unsafe.Pointer(&n))); e != 0 {
+		t.Skipf("ptsname: %v", e)
+	}
+	pts, err := os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("open pts: %v", err)
+	}
+	defer pts.Close()
+	if !osCompatIsTerminal(pts) {
+		t.Fatal("a pty slave is a terminal")
+	}
+	lflag := func() uint32 {
+		b, ok := osCompatUnixTermios(abi, pts.Fd())
+		if !ok {
+			t.Fatal("TCGETS failed")
+		}
+		return binary.NativeEndian.Uint32(b[abi.lflagOffset:])
+	}
+	old, _ := osCompatUnixTermios(abi, pts.Fd())
+	if lflag()&osCompatEcho == 0 {
+		t.Skip("pty starts without ECHO")
+	}
+	now := append([]byte(nil), old...)
+	binary.NativeEndian.PutUint32(now[abi.lflagOffset:], binary.NativeEndian.Uint32(now[abi.lflagOffset:])&^osCompatEcho)
+	if !osCompatUnixSetTermios(abi, pts.Fd(), now) || lflag()&osCompatEcho != 0 {
+		t.Fatal("ECHO must be cleared")
+	}
+	if !osCompatUnixSetTermios(abi, pts.Fd(), old) || lflag()&osCompatEcho == 0 {
+		t.Fatal("ECHO must be restored")
+	}
+}
+
+// TestOSCompatWindowsStopRequest: Windows stops services with a stop-request
+// file instead of SIGTERM; it must reach the named pid only, so a leftover file
+// from an earlier instance never stops a new one.
+func TestOSCompatWindowsStopRequest(t *testing.T) {
+	t.Setenv("KBTOOL_DIR", t.TempDir())
+	sig := make(chan os.Signal, 1)
+	osCompatWindowsStopProcess("svc", os.Getpid()+1, false)
+	go osCompatWindowsWatchStop("svc", sig)
+	select {
+	case <-sig:
+		t.Fatal("a stop request for another pid must be ignored")
+	case <-time.After(500 * time.Millisecond):
+	}
+	osCompatWindowsStopProcess("svc", os.Getpid(), false)
+	select {
+	case s := <-sig:
+		if s.String() != "stop request" {
+			t.Fatalf("got %v", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stop request must be delivered")
+	}
+	if _, err := os.Stat(osCompatWindowsStopPath("svc")); !os.IsNotExist(err) {
+		t.Fatal("a delivered stop request must be removed")
+	}
+}
+
+// TestOSCompatPlatformMatrix: every release target must compile and anything
+// else must fail at the osCompatSupportedPlatform guard; .goreleaser.yaml must
+// ship Windows.
+func TestOSCompatPlatformMatrix(t *testing.T) {
+	if !osCompatSupportedPlatform {
+		t.Fatal("the test platform must be supported")
+	}
+	if y := string(mustReadFile(t, ".goreleaser.yaml")); !strings.Contains(y, "- windows") {
+		t.Fatal(".goreleaser.yaml must build windows")
+	}
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go not on PATH")
+	}
+	build := func(goos, goarch string) ([]byte, error) {
+		c := exec.Command(goBin, "build", "-o", filepath.Join(t.TempDir(), "kbtool"), "kbtool.go")
+		c.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+goos, "GOARCH="+goarch)
+		return c.CombinedOutput()
+	}
+	for _, p := range [][2]string{{"windows", "amd64"}, {"darwin", "arm64"}, {"linux", "arm"}} {
+		if out, err := build(p[0], p[1]); err != nil {
+			t.Fatalf("%s/%s must compile:\n%s", p[0], p[1], out)
+		}
+	}
+	if out, err := build("linux", "riscv64"); err == nil || !strings.Contains(string(out), "duplicate key false") {
+		t.Fatalf("an unsupported platform must fail at the guard: %v\n%s", err, out)
 	}
 }

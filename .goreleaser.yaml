@@ -6,11 +6,12 @@ builds:
     binary: kbtool
     env:
       - CGO_ENABLED=0
-    # NOTE: no windows — kbtool.go uses Unix-only syscalls (syscall.Flock,
-    # Setsid, Umask, Kill); GOOS=windows fails to compile.
+    # Must match osCompatSupportedPlatform in kbtool.go: any other
+    # GOOS/GOARCH fails to compile.
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - 386
       - amd64
@@ -23,6 +24,8 @@ builds:
       - goos: darwin
         goarch: 386
       - goos: darwin
+        goarch: arm
+      - goos: windows
         goarch: arm
     ldflags:
       # -s -w: strip symbols/DWARF.

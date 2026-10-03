@@ -15,7 +15,7 @@ kbtool.go          ALL production code (package main, ~8k lines)
 message_board.gohtml  html/template for `kbtool board dump`, embedded via //go:embed
 collaboration.md.gotmpl  text/template for AGENTS_COLLABORATION.md (`kbtool collaborate`), embedded via //go:embed
 kbtool_test.go     ALL tests (package main, ~4.3k lines, 200+ tests)
-.goreleaser.yaml   cross-compile + release packaging (linux/darwin only)
+.goreleaser.yaml   cross-compile + release packaging (linux/darwin/windows)
 .github/workflows/ ci.yml (PR gate) + release.yml (auto semver tag + publish)
 Makefile           lint / test / release / release-snapshot targets
 docs/              per-subcommand docs: <cmd>-simple.md ↔ <cmd>.md pairs
@@ -52,17 +52,42 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
    only — no separate `*_test.go` files, no shell-based test scripts.
    Tests are hermetic: temp dirs, no network, no global state; tests that
    need an external tool (`git`, `go`) skip when it is absent.
-4. **Unix-only.** The tool uses Unix syscalls (`syscall.Flock`, `Setsid`,
-   `Umask`, `Kill`) and does NOT build for `GOOS=windows`. Do not add
-   Windows to the goreleaser matrix or workflows, and do not use Windows-only
-   APIs. Supported targets: linux/darwin × amd64/arm64/arm(6,7)/386
-   (darwin 386/arm excluded).
+4. **Supported platforms only.** Targets: linux × amd64/386/arm(6,7)/arm64,
+   darwin × amd64/arm64, windows × amd64/386/arm64. `osCompatSupportedPlatform`
+   lists exactly this matrix, and a compile-time guard makes every other
+   GOOS/GOARCH fail to build ("duplicate key false in map literal"), so nobody
+   ships a binary without equivalent support. Adding a platform means adding
+   it to that constant, its `osCompat*` implementation (kernel constants
+   checked against Go's `zsysnum_*`/`zerrors_*`/`ztypes_*` tables) and
+   `.goreleaser.yaml` together. All platform-specific code follows the
+   `osCompat*` rules under Conventions.
 
 ## Conventions
 
 ### Code
 - `gofmt -l .` must output nothing; `go vet ./...` must pass. Run both before
   committing.
+- **Function prefixes.** Two families of functions are named by what they do:
+  - `crypto*`: functions whose job is cryptography — key derivation,
+    signing and verification, AEAD, certificate and CA generation, CRLs, TLS
+    configs, and the encrypted bundle and tar helpers (e.g.
+    `cryptoDeriveSeed`, `cryptoServerTLSConfig`, `cryptoEncryptBundle`).
+  - `osCompat*`: everything that differs by operating system. Build tags
+    would break the single-file rule, so every `osCompat` function compiles
+    on every platform and branches on `runtime.GOOS`:
+    - `osCompat<Name>` is the entry point the rest of the code calls;
+    - `osCompatLinux*`, `osCompatMacos*` and `osCompatWindows*` hold what
+      differs per OS;
+    - `osCompatUnix*` is the single native implementation Linux and macOS
+      share, driven by their `osCompatUnixABI` (`osCompatLinuxABI` /
+      `osCompatMacosABI`).
+
+    Linux and macOS make the native kernel calls (`flock`, `umask`, `kill`,
+    termios ioctls, `O_NOFOLLOW`) through `osCompatSyscall`. Windows is the
+    only portable implementation, used only when explicitly chosen. Never use
+    a platform-specific `syscall` symbol (`syscall.Flock`, `Setsid`,
+    `Termios`, …) outside `osCompat*`. Any such symbol breaks the build for
+    the other platforms.
 - `appVer` (the CLI version) is a **`var`**, not a const — it must stay
   injectable via `-ldflags "-X main.appVer=<version>"` (GoReleaser does this
   for every release). It must be plain `MAJOR.MINOR.PATCH` (no `v` prefix,
@@ -91,6 +116,11 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
   Keep that true when adding subcommands or docs.
 
 ### Documentation & plans
+- README, `docs/` and the CLI help text are written for **macOS and Linux**.
+  Leave Windows quirks out of them (stop-request files instead of signals,
+  PowerShell passphrase prompts, lock-file emulation, missing `SIGHUP`, path
+  or shell differences). Windows behavior is documented only in the
+  `osCompatWindows*` code comments.
 - README, `docs/` and the CLI help text describe **only the current
   behavior**. When a change alters behavior, rewrite the affected text as if
   it had always worked this way:
@@ -111,7 +141,7 @@ go.mod             `module kbtool`, go 1.21 — NO dependencies, ever
   into future plans — do not implement from it.
 
 ### Release pipeline (do not regress)
-- `.goreleaser.yaml`: `CGO_ENABLED=0`, matrix per §Hard requirement 4,
+- `.goreleaser.yaml`: `CGO_ENABLED=0`, matrix exactly per §Hard requirement 4,
   ldflags `-s -w -X main.appVer={{ .Version }}`, binary-format archives
   named `kbtool-<os>-<arch>` (i386/armvN aliases), `checksums.txt`,
   `prerelease: auto`, changelog excludes `^docs:`/`^test:`.
